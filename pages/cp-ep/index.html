@@ -1,0 +1,892 @@
+<!doctype html>
+<html lang="zh-CN" data-sec="dist-train">
+<head>
+<!-- v4u:head -->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="icon" href="data:,">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700&family=Inter+Tight:wght@700&family=JetBrains+Mono:wght@400;700&family=Noto+Sans+SC:wght@400;700&display=swap">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<link rel="stylesheet" href="../../assets/v4u.css?v=691854ab">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
+<script src="../../assets/v4u.js?v=d6640e00"></script>
+<!-- /v4u:head -->
+<title>长序列与 MoE 并行，及多维组合 · Vis4Und</title>
+<meta name="description" content="上下文并行（Ring Attention、zigzag 负载均衡、Ulysses、USP），MoE 的路由与负载均衡、专家并行的两次 all-to-all、ETP 与 parallel folding、限节点路由与 DeepEP，以及 DP×TP×PP×CP×EP 的 device mesh 与配置估算。">
+<style>
+.viz-stage canvas{touch-action:pan-y}
+#cv-mesh{cursor:pointer}
+@media (max-width:760px){.tbl table.wide{min-width:640px}}
+</style>
+</head>
+<body>
+<!-- v4u:nav -->
+<nav class="v4u-nav" aria-label="站点导航"><div class="v4u-nav-in"><span class="v4u-crumb"><a href="../../"><b>Vis4Und</b></a><span class="v4u-sep">/</span><a href="../../#dist-train">(4) 分布式训练</a></span><span class="v4u-links"><a href="../gpu-memory-flops/">(i) 显存与算力</a><a href="../numerics/">(ii) 数值精度</a><a href="../collectives/">(iii) 集合通信</a><a href="../optimizers/">(iv) 优化器</a><a href="../data-parallel/">(v) DP / ZeRO / FSDP</a><a href="../flash-attention/">(vi) FlashAttention</a><a href="../tp-pp/">(vii) TP / SP / PP</a><a href="../cp-ep/" aria-current="page">(viii) CP / EP / 组合</a><button type="button" class="v4u-theme" aria-label="切换深浅色">深色</button></span></div></nav>
+<!-- /v4u:nav -->
+
+<header class="hero"><div class="wrap">
+  <p class="kicker">(4) 分布式训练 · (viii)</p>
+  <h1>长序列与 MoE 并行，及多维组合</h1>
+  <p class="lede">序列一长，一条样本的激活单卡就放不下；模型换成 MoE，参数大头都在专家里。这一页讲沿序列切的上下文并行（Ring Attention、Ulysses）、沿专家切的专家并行（EP、ETP），最后把 DP / TP / PP / CP / EP 排进同一个集群，估一个配置放不放得下。TP、SP、PP 见<a href="../tp-pp/">上一篇</a>。</p>
+  <p class="asks-h">读完能回答</p>
+  <ul class="asks">
+    <li>Ring Attention 每一步传什么？块多长时通信能完全藏在计算后面？</li>
+    <li>因果掩码下为什么要用 zigzag 切序列？连续切慢多少？</li>
+    <li>Ulysses 的 all-to-all 把什么换成了什么？并行度上限是多少？</li>
+    <li>MoE 的 token 怎样经两次 all-to-all 到专家再回来？负载不均怎么治？</li>
+    <li>TP、CP、EP、DP、PP 各该放在哪一层网络上？一个配置放不放得下怎么估？</li>
+  </ul>
+</div></header>
+
+<div class="wrap layout">
+<nav class="toc" id="toc" aria-label="本页目录"></nav>
+<main>
+
+<section id="cp">
+  <h2 data-toc="上下文并行 / Ring">上下文并行：Ring Attention</h2>
+  <p class="def"><b>上下文并行</b>（context parallelism，CP）把一条序列按 token 切成 $p$ 段分给 $p$ 张卡，每张卡只存自己那段的激活。线性层、MLP、LayerNorm 都是逐 token 的，各算各的；只有注意力要用到全部 token 的 K、V，于是 K、V 在卡之间传。</p>
+  <p>激活显存与序列长 $s$ 成正比（<a href="../gpu-memory-flops/#memory">显存账</a>）。TP + SP 也能把激活切 $p_\text{tp}$ 份（<a href="../tp-pp/#sp">序列并行</a>），但 $p_\text{tp}$ 受头数和节点内卡数限制；128K 以上的序列还要再沿序列切一维，这一维就是 CP。</p>
+
+  <table class="notation">
+    <caption>记号</caption>
+    <thead><tr><th>符号</th><th>含义</th><th>形状 / 单位</th></tr></thead>
+    <tbody>
+      <tr><td>$p$</td><td>CP 组的卡数</td><td>标量</td></tr>
+      <tr><td>$s,\ c=s/p$</td><td>序列长；每卡的 token 数（块长）</td><td>token</td></tr>
+      <tr><td>$a,\ a_{kv},\ d$</td><td>Q 头数、K/V 头数（GQA 时 $a_{kv}&lt;a$）、每头维度</td><td>标量</td></tr>
+      <tr><td>$h=a d,\ h_{kv}=a_{kv}d$</td><td>Q 的隐藏维、K/V 的隐藏维</td><td>标量</td></tr>
+      <tr><td>$Q_r,\ K_r,\ V_r$</td><td>卡 $r$ 本地那段的 Q、K、V（下面推导按单头写）</td><td>$c\times d$</td></tr>
+      <tr><td>$O,\ m,\ \ell$</td><td>卡 $r$ 累积的未归一化输出、每行最大值、每行指数和</td><td>$c\times d,\ c,\ c$</td></tr>
+      <tr><td>$F,\ B$</td><td>卡的有效算力；卡间单向带宽</td><td>FLOP/s；byte/s</td></tr>
+    </tbody>
+  </table>
+
+  <h3>分块注意力怎么合并</h3>
+  <ol class="derive">
+    <li><p>卡 $r$ 要算 $\mathrm{softmax}(Q_rK^\top/\sqrt d)\,V$。把 $K,V$ 按卡分成 $p$ 块，每块单独算分数：</p>$$S_{rj}=Q_rK_j^\top/\sqrt d,\qquad j=0,\dots,p-1$$</li>
+    <li><p>每来一块，用 online softmax 更新行最大值和指数和（推导见 <a href="../flash-attention/#online-softmax">FlashAttention 一页</a>）：</p>$$m'=\max\!\big(m,\ \mathrm{rowmax}\,S_{rj}\big),\qquad \ell'=e^{m-m'}\ell+\mathrm{rowsum}\,e^{S_{rj}-m'}$$</li>
+    <li><p>输出也先把旧值按新的最大值缩放，再加上新块的贡献：</p>$$O'=e^{m-m'}O+e^{S_{rj}-m'}V_j$$</li>
+    <li><p>所有块处理完再归一化。合并与块到达的顺序无关，所以 K/V 块可以按任意顺序来：</p>$$\mathrm{Attn}_r=\mathrm{diag}(\ell)^{-1}O$$</li>
+  </ol>
+  <p><b>Ring Attention</b>（Liu et al. 2023）把 $p$ 张卡连成环：第 $t$ 步卡 $r$ 用手上的 $K_{(r-t)\bmod p},V_{(r-t)\bmod p}$ 计算，同时把这块发给卡 $r+1$、从卡 $r-1$ 收下一块。$p$ 步后每张卡见过全部 K/V，每卡只多一到两块 K/V 的缓冲。反向同理，$\mathrm{d}K,\mathrm{d}V$ 跟着 K/V 一起绕环回到原主。</p>
+
+  <figure class="viz" id="viz-ring">
+    <div class="viz-h"><b>K/V 绕环，Q 不动：每一步每张卡算哪几块</b><span>工作量单位：一个 (s/2p)² 块</span></div>
+    <div class="viz-stage"><canvas id="cv-ring" aria-label="2p 乘 2p 的注意力分块矩阵，按步高亮各卡正在计算的块，旁边是各卡本步的工作量条"></canvas></div>
+    <div class="viz-ctrl">
+      <div class="seg" id="seg-split"><button type="button" data-v="contig" aria-pressed="true">连续切分</button><button type="button" data-v="zigzag">zigzag 切分</button></div>
+      <label for="sl-ringp">卡数 p <input type="range" id="sl-ringp" min="2" max="6" step="1" value="4"><output id="o-ringp">4</output></label>
+      <label for="sl-ringt">步 t <input type="range" id="sl-ringt" min="0" max="3" step="1" value="1"><output id="o-ringt">1</output></label>
+      <button type="button" class="btn ghost" id="bt-ring">播放</button>
+    </div>
+    <div class="viz-read" id="rd-ring"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>卡 0</li><li><i style="background:var(--c2)"></i>卡 1</li><li><i style="background:var(--c3)"></i>卡 2</li><li><i style="background:var(--c4)"></i>卡 3</li><li><i style="background:var(--c5)"></i>卡 4</li><li><i style="background:var(--c6)"></i>卡 5</li><li><i style="background:var(--surface-2);border:1px solid var(--line-2)"></i>被因果掩码掉</li></ul>
+    <figcaption>行是 Q 块（左侧色条 = 哪张卡持有，固定不动），列是 K/V 块（上方色条 = 这一步 K/V 在哪张卡手里，每步右移一张卡）。深色块是本步正在算的，浅色块是之前几步算过的。右侧（手机上在下方）条形是各卡本步的工作量，虚线是最大值，也就是这一步的耗时。</figcaption>
+  </figure>
+
+  <h3>因果掩码下的负载</h3>
+  <p>因果掩码下 Q 块 $i$ 只看 K/V 块 $j\le i$。按连续段切时，卡 0 只有半块要算，最后一张卡要算满。环上每一步都要等最慢的卡，所以总耗时是「每步最大值」之和。把序列切成 $2p$ 小块，记一个小块对的计算量为 1、对角块为 $\tfrac12$：</p>
+  <ol class="derive">
+    <li><p>Q 小块 $i$ 的总计算量：</p>$$w_i=\sum_{j\lt i}1+\tfrac12=i+\tfrac12$$</li>
+    <li><p>连续切：卡 $r$ 拿小块 $2r,2r+1$。第 $t\ge1$ 步卡 $r\ge t$ 拿到的 K/V 全在左下方，四个小块对全要算；卡 $r\lt t$ 拿到的全被掩掉。每步最大值是 4，第 0 步是 2：</p>$$T_\text{连续}=2+4(p-1)=4p-2$$</li>
+    <li><p>zigzag：卡 $r$ 拿小块 $r$ 和 $2p-1-r$（首尾配对）。收到卡 $j\ne r$ 的 K/V（小块 $j,\ 2p-1-j$）时，四个小块对的计算量是：</p>$$[\,j\lt r\,]+0+1+[\,j\gt r\,]=2$$<p>第 0 步是 $\tfrac12+0+1+\tfrac12=2$。每步每卡都恰好是 2。</p></li>
+    <li><p>理想耗时是总量平均到 $p$ 张卡：$\sum_r(4r+2)/p=2p$。zigzag 正好达到，连续切是它的</p>$$\frac{4p-2}{2p}=2-\frac1p\ \text{倍}$$</li>
+  </ol>
+  <div class="note"><b>实现</b><p>Megatron-Core 的 CP 用的就是首尾配对，通信走环形 P2P，也可以用 <code>--cp-comm-type</code> 换成 all-gather、all-to-all（即下一节的 Ulysses）或两者分层组合。Llama 3 的 CP 同样切 $2p$ 块首尾配对，但不绕环，而是先 all-gather 整条 K/V 再算本地的 Q：GQA 下 K/V 只有 Q 的 $a_{kv}/a$ 那么大，一次收齐也不贵。Striped Attention（Brandon et al. 2023）用另一种均衡：按 token 轮流分（卡 $r$ 拿第 $r,\ r+p,\ r+2p,\dots$ 个 token）。</p></div>
+
+  <h3>通信能不能藏起来</h3>
+  <ol class="derive">
+    <li><p>每一步每卡算一个 $c\times c$ 块的 $QK^\top$ 和 $PV$，各 $2c^2h$ FLOPs：</p>$$t_\text{comp}=\frac{4c^2h}{F}$$</li>
+    <li><p>同时发出一块 K 和 V（BF16，每元素 2 字节）：</p>$$t_\text{comm}=\frac{2\cdot 2\,c\,h_{kv}}{B}=\frac{4c\,h_{kv}}{B}$$</li>
+    <li><p>$t_\text{comp}\ge t_\text{comm}$ 时通信被完全重叠：</p>$$c\ \ge\ \frac{F}{B}\cdot\frac{h_{kv}}{h}$$</li>
+  </ol>
+  <p>计算随 $c^2$ 涨，通信随 $c$ 涨，块够长就藏得住。MHA 时 $h_{kv}=h$，条件就是原文的 $c\ge F/B$。跨节点 IB 每卡约 50 GB/s，比节点内 NVLink 慢近一个数量级，阈值也大近一个数量级。</p>
+
+  <figure class="viz" id="viz-ovl">
+    <div class="viz-h"><b>Ring 的四步时间线：通信藏在计算后面了吗</b><span>h = 8192，单层前向</span></div>
+    <div class="viz-stage"><canvas id="cv-ovl" aria-label="计算和通信两条时间线，显示每一步是否因等 K/V 而空转"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="sl-c">每卡 token 数 c <input type="range" id="sl-c" min="8" max="16" step="1" value="10"><output id="o-c">1024</output></label>
+      <label for="sl-F">有效算力 <input type="range" id="sl-F" min="200" max="900" step="50" value="500"><output id="o-F">500</output></label>
+      <div class="seg" id="seg-link"><button type="button" data-v="nvl">NVLink 450 GB/s</button><button type="button" data-v="ib" aria-pressed="true">IB 50 GB/s</button></div>
+      <div class="seg" id="seg-kv"><button type="button" data-v="mha">MHA</button><button type="button" data-v="gqa" aria-pressed="true">GQA a/a_kv = 8</button></div>
+    </div>
+    <div class="viz-read" id="rd-ovl"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>注意力计算</li><li><i style="background:var(--c3)"></i>K/V 发往下一张卡</li><li><i style="background:var(--bad)"></i>等 K/V 的空转</li></ul>
+    <figcaption>有效算力单位 TFLOPS（H100 的 BF16 稠密峰值约 989，注意力 kernel 实际能到一半左右）。第 $k$ 步计算的同时传第 $k+1$ 步要用的 K/V；通信比计算慢时，下一步只能等。没算因果掩码（会让一半块的计算减半），也没算反向。</figcaption>
+  </figure>
+</section>
+
+<section id="ulysses">
+  <h2 data-toc="Ulysses 与 USP">DeepSpeed-Ulysses 与 USP</h2>
+  <p class="def"><b>Ulysses</b>（Jacobs et al. 2023）也沿序列切，但在注意力前用一次 all-to-all 把「每卡 $s/p$ 个 token、全部 $a$ 个头」换成「每卡全部 $s$ 个 token、$a/p$ 个头」，各卡独立做完整的注意力，再用一次 all-to-all 换回来。</p>
+  <p>注意力在头与头之间互不相干，换成按头切以后，每张卡上就是一次普通的单卡注意力：直接调用 FlashAttention，掩码、变长都不用改。all-to-all 的语义见 <a href="../collectives/#primitives">集合通信</a>。</p>
+
+  <figure class="viz" id="viz-a2a">
+    <div class="viz-h"><b>all-to-all：从按序列切到按头切</b><span>8 个头</span></div>
+    <div class="viz-stage"><canvas id="cv-a2a" aria-label="每张卡一个面板，格子是（序列段，头）；all-to-all 让格子从行条带移动到列条带"></canvas></div>
+    <div class="viz-ctrl">
+      <div class="seg" id="seg-a2ap"><button type="button" data-v="2">p = 2</button><button type="button" data-v="4" aria-pressed="true">p = 4</button></div>
+      <label for="sl-a2a">进度 <input type="range" id="sl-a2a" min="0" max="1" step="0.01" value="0"><output id="o-a2a">0.00</output></label>
+      <button type="button" class="btn ghost" id="bt-a2a">执行 all-to-all</button>
+    </div>
+    <div class="viz-read" id="rd-a2a"></div>
+    <ul class="chips" id="ch-a2a"></ul>
+    <figcaption>每个面板是一张卡，面板里的格子位置固定表示（行 = 序列段，列 = 头）。注意力前每张卡持有一行（自己那段序列的全部头）；all-to-all 后持有一列条带（全部序列、$a/p$ 个头）。格子颜色表示它来自哪段序列；没动的格子就是每卡留给自己的 $1/p$。</figcaption>
+  </figure>
+
+  <ol class="derive">
+    <li><p>每卡持有 Q、K、V 各 $\frac{s}{p}\times h$，换完是 $s\times\frac{h}{p}$。每卡留下 $1/p$，其余发给另外 $p-1$ 张卡：</p>$$\text{每卡发送}=\frac{p-1}{p}\cdot\frac{3sh}{p}$$</li>
+    <li><p>注意力输出再换回来，又是 $\frac{p-1}{p}\cdot\frac{sh}{p}$。每层前向合计约：</p>$$\frac{4sh}{p}\qquad(\text{GQA 时为 } (2h+2h_{kv})\,s/p)$$</li>
+    <li><p>对比 Megatron-SP：每层前向 2 次 all-gather 加 2 次 reduce-scatter，每次每卡约 $\frac{p-1}{p}sh$，合计约 $4sh$，不随 $p$ 减少。原文分别记作每条链路 $4Nh/P$ 和 $4Nh$（$N$ 为序列长）：$s$ 与 $p$ 同比增大时，Ulysses 的通信量不变。</p></li>
+  </ol>
+  <div class="note pit"><b>并行度上限</b><p>Ulysses 按头切，$p$ 不能超过头数且要整除头数。GQA 下 K/V 只有 $a_{kv}$ 个头（常见为 8），$p\gt a_{kv}$ 时 K/V 头要复制。all-to-all 在注意力前后各一次，处在关键路径上，难以和计算重叠，组内需要全连通的高带宽，跨节点后掉得快。</p></div>
+
+  <h3>USP：两种合起来</h3>
+  <p>USP（Fang &amp; Zhao 2024）把序列并行组排成 $p_u\times p_r$ 两维，$p=p_u\,p_r$：$p_u$ 那一维走 Ulysses，放在节点内；$p_r$ 那一维走 Ring，可以跨节点。Ulysses 受头数限制但通信量随 $p$ 下降，Ring 不受头数限制但要靠块长掩盖通信，两者互补。</p>
+  <div class="tbl"><table class="wide">
+    <thead><tr><th></th><th>Ring Attention</th><th>Ulysses</th><th>USP</th></tr></thead>
+    <tbody>
+      <tr><td>注意力时怎么切</td><td>仍按序列切，K/V 绕环</td><td>换成按头切</td><td>两维：节点内按头，节点间按序列</td></tr>
+      <tr><td>每卡每层前向通信</td><td class="num">≈ 2·s·h_kv（P2P，可与计算重叠）</td><td class="num">≈ (2h+2h_kv)·s/p（all-to-all）</td><td>两部分按 $p_u,\ p_r$ 分摊</td></tr>
+      <tr><td>并行度上限</td><td>无硬上限（块不能太短）</td><td>$\le$ 头数</td><td>$p_u\le$ 头数</td></tr>
+      <tr><td>因果掩码</td><td>要做负载均衡</td><td>不受影响</td><td>Ring 那一维要均衡</td></tr>
+      <tr><td>适合的网络</td><td>节点内外都行</td><td>节点内</td><td>Ulysses 节点内，Ring 跨节点</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="moe">
+  <h2 data-toc="MoE 回顾">MoE 回顾：路由与负载均衡</h2>
+  <p class="def"><b>混合专家层</b>（mixture of experts，MoE）把 FFN 换成 $E$ 个结构相同的专家 FFN 和一个路由器；每个 token 只送进得分最高的 $k$ 个专家。参数量随 $E$ 涨，每个 token 的计算量只随 $k$ 涨。</p>
+  <table class="notation">
+    <caption>记号</caption>
+    <thead><tr><th>符号</th><th>含义</th><th>形状</th></tr></thead>
+    <tbody>
+      <tr><td>$E,\ k$</td><td>路由专家数；每个 token 激活的专家数</td><td>标量</td></tr>
+      <tr><td>$\mathbf u_t$</td><td>第 $t$ 个 token 进入 MoE 层的隐状态</td><td>$\mathbb R^{h}$</td></tr>
+      <tr><td>$\mathbf e_i$</td><td>专家 $i$ 的路由向量</td><td>$\mathbb R^{h}$</td></tr>
+      <tr><td>$s_{i,t},\ g_{i,t}$</td><td>亲和度；门控权重（没选中为 0）</td><td>标量</td></tr>
+      <tr><td>$T,\ n_i,\ \bar n$</td><td>一批 token 数；分到专家 $i$ 的 token 数；均值 $kT/E$</td><td>标量</td></tr>
+      <tr><td>$b_i$</td><td>专家 $i$ 的路由偏置，只在选专家时用</td><td>标量</td></tr>
+      <tr><td>$h_e$</td><td>专家 FFN 的中间维</td><td>标量</td></tr>
+    </tbody>
+  </table>
+  <ol class="derive">
+    <li><p>亲和度：Switch、Mixtral 用 softmax，DeepSeek-V3 用 sigmoid：</p>$$s_{i,t}=\sigma(\mathbf u_t^\top\mathbf e_i)$$</li>
+    <li><p>取前 $k$ 个，权重在选中的专家里归一化：</p>$$g_{i,t}=\frac{s_{i,t}\,[\,i\in\mathrm{TopK}_t\,]}{\sum_{j\in\mathrm{TopK}_t}s_{j,t}}$$</li>
+    <li><p>输出是专家输出的加权和，加残差（有共享专家时再加共享专家的输出）：</p>$$\mathbf h_t=\mathbf u_t+\sum_{i=1}^{E}g_{i,t}\,\mathrm{FFN}_i(\mathbf u_t)$$</li>
+    <li><p>固定形状的实现给每个专家一个容量，容量因子 $\mathrm{CF}\ge1$ 留余量；超出容量的 token 被丢弃，只走残差。不设容量的叫 dropless：</p>$$C=\mathrm{CF}\cdot\frac{kT}{E}$$</li>
+  </ol>
+  <p>路由器会自我强化：被选得多的专家学得更好、得分更高、更常被选。负载不均有两个代价：容量满了丢 token；在专家并行下，收 token 最多的那张卡决定整层的耗时。</p>
+
+  <h3>辅助损失</h3>
+  <p>Switch Transformer（Fedus et al. 2021，$k=1$）加一项</p>
+  <div class="eq">$$\mathcal L_\text{aux}=\alpha\,E\sum_{i=1}^{E}f_i\,P_i,\qquad f_i=\frac{n_i}{T},\quad P_i=\frac1T\sum_{t}s_{i,t}$$</div>
+  <p>$f_i$ 不可导，梯度经 $P_i$ 把概率从热门专家上推开；完全均匀时取最小值 $\alpha$。原文 $\alpha=10^{-2}$。系数大了会和语言模型损失抢梯度，小了压不住。</p>
+
+  <h3>无辅助损失：只调偏置</h3>
+  <p>Wang et al.（2024）和 DeepSeek-V3 给每个专家一个偏置 $b_i$，只在选专家时加上，门控权重仍用原来的 $s_{i,t}$：</p>
+  <div class="eq">$$\mathrm{TopK}_t=\operatorname*{TopK}_i\,\big(s_{i,t}+b_i\big),\qquad b_i\leftarrow b_i+\gamma\,\mathrm{sign}\big(\bar n-n_i\big)$$</div>
+  <p>每步结束后，超载专家的偏置减 $\gamma$，欠载的加 $\gamma$。偏置不产生梯度，不和主损失争方向。DeepSeek-V3 另外保留了一个系数很小的序列级平衡损失，防止单条序列内部极端不均。</p>
+
+  <figure class="viz" id="viz-bias">
+    <div class="viz-h"><b>偏置一步步把负载拉平</b><span>E = 8，k = 2，每步 256 个 token</span></div>
+    <div class="viz-stage"><canvas id="cv-bias" aria-label="左边是各专家的负载柱和偏置柱，右边是最大超载比例随步数的曲线"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="sl-skew">路由偏好强度 <input type="range" id="sl-skew" min="0" max="2" step="0.1" value="1.2"><output id="o-skew">1.2</output></label>
+      <label for="sl-gam">γ <input type="range" id="sl-gam" min="0.002" max="0.05" step="0.002" value="0.01"><output id="o-gam">0.010</output></label>
+      <button type="button" class="btn ghost" id="bt-bias">播放</button>
+      <button type="button" class="btn ghost" id="bt-bias0">重置</button>
+    </div>
+    <div class="viz-read" id="rd-bias"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>本步各专家收到的 token 数</li><li><i style="background:var(--ink-2)"></i>均值 n̄ = kT/E = 64</li><li><i style="background:var(--c2)"></i>偏置 b_i</li><li><i style="background:var(--c4)"></i>MaxVio = max n_i / n̄ − 1</li></ul>
+    <figcaption>亲和度是 $\sigma(z+\mu_i)$，$z$ 每个 token 随机，$\mu_i$ 是各专家固定的偏好（滑块调强度）。每步按 $s+b$ 选专家、计数、更新偏置；打开页面时已经跑了 120 步，「重置」回到第 0 步。γ 大收敛快但会来回抖，γ 小收敛慢；原论文的消融选了 0.001。</figcaption>
+  </figure>
+</section>
+
+<section id="ep">
+  <h2 data-toc="专家并行 EP">专家并行：两次 all-to-all</h2>
+  <p class="def"><b>专家并行</b>（expert parallelism，EP）把 $E$ 个专家分到 EP 组的 $p$ 张卡上，每卡存 $E/p$ 个。注意力等其余部分照常按数据并行，token 分散在各卡上；MoE 层前用 all-to-all 把 token 送到选中专家所在的卡（dispatch），算完再用 all-to-all 送回（combine）。</p>
+  <ol>
+    <li><b>路由</b>：每卡对本地 $T$ 个 token 算 TopK。</li>
+    <li><b>重排</b>（permute）：按目标卡把 token 复制 $k$ 份、排成连续段；各卡先交换「我要发给你几个」的计数。</li>
+    <li><b>dispatch</b>：all-to-all 发出 token 的隐状态。</li>
+    <li><b>专家计算</b>：本卡各专家收到的 token 数不同，用 grouped GEMM 一次算完。</li>
+    <li><b>combine</b>：all-to-all 把输出送回原卡，按 $g_{i,t}$ 加权求和、还原顺序。</li>
+  </ol>
+
+  <figure class="viz" id="viz-route">
+    <div class="viz-h"><b>dispatch：token 从哪张卡发到哪个专家</b><span>E = 8，每卡 12 个 token</span></div>
+    <div class="viz-stage"><canvas id="cv-route" aria-label="上排是各卡的 token，下排是各卡上的专家负载柱和容量线，旁边是卡到卡的流量矩阵"></canvas></div>
+    <div class="viz-ctrl">
+      <div class="seg" id="seg-rp"><button type="button" data-v="2">EP = 2</button><button type="button" data-v="4" aria-pressed="true">EP = 4</button><button type="button" data-v="8">EP = 8</button></div>
+      <div class="seg" id="seg-rk"><button type="button" data-v="1">k = 1</button><button type="button" data-v="2" aria-pressed="true">k = 2</button></div>
+      <label for="sl-rskew">路由偏好 <input type="range" id="sl-rskew" min="0" max="2" step="0.1" value="0.5"><output id="o-rskew">0.5</output></label>
+      <label for="sl-cf">容量因子 <input type="range" id="sl-cf" min="1" max="2.5" step="0.25" value="1.25"><output id="o-cf">1.25</output></label>
+      <button type="button" class="btn ghost" id="bt-route">重新采样</button>
+    </div>
+    <div class="viz-read" id="rd-route"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>…<i style="background:var(--c6)"></i>来源卡</li><li><i style="background:var(--bad)"></i>超出容量被丢弃</li><li><i style="background:var(--ink-2)"></i>容量线 C</li></ul>
+    <figcaption>上排每张卡的点是本地 token，连线指向选中的专家；下排柱子按来源卡着色堆叠。流量矩阵第 $i$ 行第 $j$ 列是卡 $i$ 发给卡 $j$ 的 token 副本数，对角线是不出卡的部分。EP 越大，出卡的比例越接近 $(p-1)/p$。</figcaption>
+  </figure>
+
+  <h3>通信量与计算量</h3>
+  <ol class="derive">
+    <li><p>均匀路由时每个 token 的 $k$ 份副本有 $(p-1)/p$ 要出卡。每卡 dispatch 发送：</p>$$V_\text{disp}=\frac{p-1}{p}\,k\,T\,h\ \ \text{个元素}$$</li>
+    <li><p>combine 一样多；反向再各来一次。每层每个训练步共 $4V_\text{disp}$。</p></li>
+    <li><p>专家是 SwiGLU（三个 $h\times h_e$ 矩阵），每个 token 副本的前向计算 $6h\,h_e$ FLOPs。前向的计算时间比 dispatch 时间（BF16，忽略 $(p-1)/p$）：</p>$$\frac{6kTh\,h_e/F}{2kTh/B}=\frac{3\,h_e\,B}{F}$$</li>
+  </ol>
+  <p>这个比值与 $k$、$T$ 都无关，只看专家多宽、网络多快。细粒度专家的 $h_e$ 小：DeepSeek-V3 的 $h_e=2048$，按 H800 的 BF16 稠密峰值约 989 TFLOPS、IB 每卡约 50 GB/s 算，比值约 0.3，通信时间是计算的 3 倍以上。这就是下面那些通信优化的由来。</p>
+  <p>EP 外面还有一维：专家参数在 $\text{world}/(p_\text{etp}\,p_\text{ep}\,p_\text{pp})$ 张卡之间复制，叫专家数据并行（EDP），专家的梯度在这一组里同步，非专家参数照常在 DP 组里同步（<a href="../data-parallel/#dp">数据并行</a>）。</p>
+</section>
+
+<section id="etp">
+  <h2 data-toc="ETP 与 folding">专家张量并行与 parallel folding</h2>
+  <p class="def"><b>专家张量并行</b>（expert tensor parallelism，ETP）在 EP 之外，再把每个专家的 FFN 按 Megatron 的列切 / 行切分到 $p_\text{etp}$ 张卡上（<a href="../tp-pp/#tp">张量并行</a>），代价是专家里多一次 all-reduce 或 reduce-scatter。</p>
+  <p>专家越细，ETP 越不划算：$h_e=2048$ 切 8 份后每卡只剩 256 列，GEMM 效率低，还多一次集合通信。Megatron-Core 的 MoE 指南建议专家层优先用 EP 而不是 TP（例：Mixtral 8×7B 上 EP8×TP1 快于 EP4×TP2）；EP 等于专家数时，本地连重排都省了。</p>
+
+  <h3>parallel folding</h3>
+  <p>以前常见的做法是 EP 组从 DP 维里划出来，专家层沿用注意力层的 TP。MoE Parallel Folding（Liu et al. 2025，Megatron-Core）把两类层的切法解耦：注意力层用 $\text{TP}\times\text{CP}\times\text{DP}\times\text{PP}$，MoE 层用 $\text{ETP}\times\text{EP}\times\text{EDP}\times\text{PP}$，只要求两者的 PP 相同、总卡数相同：</p>
+  <div class="eq">$$p_\text{tp}\,p_\text{cp}\,p_\text{dp}=p_\text{etp}\,p_\text{ep}\,p_\text{edp}$$</div>
+  <p>EP 可以「折叠」到注意力层 TP、CP 维所占的那些卡上，所以 EP 组能整个落在一个 NVLink 域里。原文附录的例子：注意力层 TP2·CP2·DP2，MoE 层 ETP1·EP8·EDP1，8 张卡每张一个专家。下面 <a href="#compose">多维组合</a> 一节的图可以切换两种层看同一批卡的分组。</p>
+</section>
+
+<section id="ep-comm">
+  <h2 data-toc="EP 通信优化">EP 的通信：限节点路由、DeepEP 与重叠</h2>
+  <p>跨节点的 all-to-all 走 IB / RoCE，每卡约 50 GB/s；节点内 NVLink 快几倍（<a href="../collectives/#topology">拓扑</a>）。DeepSeek-V3 从三个方向压这部分开销。</p>
+
+  <h3>限节点路由</h3>
+  <p>每个 token 最多发往 $M$ 个节点：先按「每个节点上得分最高的 $k/M$ 个专家的亲和度之和」挑出 $M$ 个节点，再只在这些节点的专家里取 TopK。DeepSeek-V3 每层 256 个路由专家分在 8 个节点上，$k=8$，$M=4$。token 经 IB 到达目标节点后再用 NVLink 转给节点内各目标卡，同一节点上的多个专家只走一次 IB。</p>
+
+  <figure class="viz" id="viz-node">
+    <div class="viz-h"><b>一个 token 的路由：不限节点 vs 最多 M 个节点</b><span>8 节点 × 32 专家，k = 8</span></div>
+    <div class="viz-stage"><canvas id="cv-node" aria-label="8 行 32 列的亲和度热图，标出选中的 8 个专家和允许的节点"></canvas></div>
+    <div class="viz-ctrl">
+      <div class="seg" id="seg-M"><button type="button" data-v="1">M = 1</button><button type="button" data-v="2">M = 2</button><button type="button" data-v="4" aria-pressed="true">M = 4</button><button type="button" data-v="8">不限</button></div>
+      <button type="button" class="btn ghost" id="bt-node">换一个 token</button>
+    </div>
+    <div class="viz-read" id="rd-node"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>亲和度（越深越高）</li><li><i style="background:var(--c2)"></i>选中的专家</li><li><i style="background:var(--surface-2);border:1px solid var(--line-2)"></i>未被选中的节点</li></ul>
+    <figcaption>亲和度在这里是随机生成的，真实路由器的得分有相关性，触达节点数会少一些。平均值用 2000 个随机 token 统计；「得分保留」是限节点后选中专家的亲和度之和占不限时的比例。</figcaption>
+  </figure>
+  <p>原文按带宽算了一笔账：IB 与 NVLink 约为 50 : 160 GB/s，一个 token 平均在每个节点内选 3.2 个专家时 NVLink 转发不会成为瓶颈，所以同样的通信代价下最多可以选 $4\times3.2\approx13$ 个专家，而实际只用了 8 个。</p>
+
+  <h3>DeepEP</h3>
+  <p>DeepEP 是 DeepSeek 2025 年开源的 dispatch / combine 通信库。normal 内核面向训练和推理 prefill，节点内走 NVLink、节点间走 RDMA，追求吞吐；low-latency 内核面向解码，只用 RDMA，并提供基于 hook 的通信计算重叠，不占用 SM。</p>
+
+  <h3>计算通信重叠</h3>
+  <p>dispatch / combine 很难和本层计算重叠：专家要等 token 到齐才能算。DeepSeek-V3 的 DualPipe 让两个方向的微批交错，一个微批的 all-to-all 与另一个微批的计算同时进行（<a href="../tp-pp/#zb">Zero Bubble 与 DualPipe</a>）。DeepSeek-V3 的训练配置：2048 张 H800，PP16、EP64（跨 8 个节点）、ZeRO-1 数据并行，没有用 TP。</p>
+</section>
+
+<section id="compose">
+  <h2 data-toc="多维组合">多维组合：把各维排进集群</h2>
+  <p class="def"><b>device mesh</b> 把 world 张卡排成一个多维数组，每一维对应一种并行；沿某一维变化、其余坐标都固定的那些卡，就是这一维的一个通信组。</p>
+  <p>维度的顺序决定谁和谁相邻。rank 号连续的 8 张卡通常在同一个节点上，所以排在最内层（变化最快）的维度落在 NVLink 里。Megatron-Core 默认顺序是 <code>tp-cp-ep-dp-pp</code>，tp 变化最快。注意力层的网格（EP 维为 1）对应</p>
+  <div class="eq">$$\text{rank}=i_\text{tp}+p_\text{tp}\Big(i_\text{cp}+p_\text{cp}\big(i_\text{dp}+p_\text{dp}\,i_\text{pp}\big)\Big)$$</div>
+  <p>MoE 层的网格把 $(i_\text{tp},i_\text{cp},i_\text{dp})$ 换成 $(i_\text{etp},i_\text{ep},i_\text{edp})$，PP 维相同。排序依据是每一维的通信有多大、多频繁、能不能藏：</p>
+  <div class="tbl"><table class="wide">
+    <thead><tr><th>维度</th><th>通信</th><th>频率与能否重叠</th><th>放在哪</th></tr></thead>
+    <tbody>
+      <tr><td>TP / SP</td><td>激活的 all-reduce 或 reduce-scatter + all-gather</td><td>每层前反向各数次，在关键路径上</td><td>最内层，节点内</td></tr>
+      <tr><td>CP</td><td>K/V 的环形 P2P 或 all-gather；Ulysses 是 all-to-all</td><td>每层一次，Ring 可与注意力重叠</td><td>节点内，或紧挨着 TP</td></tr>
+      <tr><td>EP</td><td>token 的两次 all-to-all</td><td>每个 MoE 层前后各一次，难重叠</td><td>尽量节点内；跨节点要限节点路由等优化</td></tr>
+      <tr><td>DP / FSDP</td><td>梯度 all-reduce 或 reduce-scatter（FSDP 还有参数 all-gather）</td><td>每步一次（FSDP 每层），可与反向重叠</td><td>跨节点</td></tr>
+      <tr><td>PP</td><td>相邻 stage 之间 P2P 传激活</td><td>量小</td><td>最外层，跨节点</td></tr>
+    </tbody>
+  </table></div>
+
+  <figure class="viz" id="viz-mesh">
+    <div class="viz-h"><b>同一批卡，按不同的维分组</b><span>每节点 8 卡，点一张卡看它所在的组</span></div>
+    <div class="viz-stage"><canvas id="cv-mesh" aria-label="节点方框里的 GPU 方块，按所选并行维的通信组着色"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="se-nodes">节点 <select id="se-nodes"><option>1</option><option selected>2</option><option>4</option></select></label>
+      <div class="seg" id="seg-layer"><button type="button" data-v="attn" aria-pressed="true">注意力层</button><button type="button" data-v="moe">MoE 层</button></div>
+      <div class="seg" id="seg-dim"><button type="button" data-v="0" aria-pressed="true">TP</button><button type="button" data-v="1">CP</button><button type="button" data-v="2">DP</button><button type="button" data-v="3">PP</button></div>
+    </div>
+    <div class="viz-ctrl">
+      <label for="se-tp">TP <select id="se-tp"><option>1</option><option selected>2</option><option>4</option><option>8</option></select></label>
+      <label for="se-cp">CP <select id="se-cp"><option>1</option><option selected>2</option><option>4</option></select></label>
+      <label for="se-pp">PP <select id="se-pp"><option>1</option><option selected>2</option><option>4</option></select></label>
+      <label for="se-etp">ETP <select id="se-etp"><option selected>1</option><option>2</option><option>4</option></select></label>
+      <label for="se-ep">EP <select id="se-ep"><option>1</option><option>2</option><option>4</option><option selected>8</option><option>16</option></select></label>
+    </div>
+    <div class="viz-read" id="rd-mesh"></div>
+    <figcaption>顺序按 Megatron-Core 默认：注意力层 tp-cp-dp-pp，MoE 层 etp-ep-edp-pp，前面的维变化最快；DP 和 EDP 由总卡数除出来。每张卡上的数字是全局 rank，下方是它在所选维里的序号；同色为同一组（颜色循环使用），粗框是选中卡所在的组。默认就是 parallel folding 原文的例子再乘 PP2：注意力 TP2·CP2·DP2，MoE 层 EP8。</figcaption>
+  </figure>
+
+  <p>PyTorch 里用 <code>DeviceMesh</code> 描述同一件事。<code>init_device_mesh</code> 按行优先排列，最后一维变化最快，所以 tp 写在最后：</p>
+<pre><code>from torch.distributed.device_mesh import init_device_mesh
+mesh = init_device_mesh("cuda", (2, 2, 2, 2), mesh_dim_names=("pp", "dp", "cp", "tp"))
+tp_group = mesh["tp"]        # 本卡所在的 TP 子网格
+dp_cp = mesh["dp", "cp"]     # 取两维的子网格，例如交给 FSDP 一起切</code></pre>
+  <p>TorchTitan（Liang et al. 2024）就是在 DeviceMesh 和 DTensor 上组合 FSDP2、TP、PP、CP 的参考实现。</p>
+</section>
+
+<section id="config">
+  <h2>怎么选配置</h2>
+  <ol>
+    <li><b>先让一层放得下</b>：一个微批的激活或一层的权重单卡放不下时开 TP，最多到节点内卡数，且整除头数。</li>
+    <li><b>再让模型状态放得下</b>：开 PP（层数整除 PP），或用 ZeRO-3 / FSDP 把参数也切掉（<a href="../data-parallel/#zero">ZeRO</a>）。</li>
+    <li><b>序列太长开 CP，MoE 开 EP</b>：EP 尽量放在节点内，跨节点时配合限节点路由和重叠。</li>
+    <li><b>剩下的卡全给 DP</b>，配 ZeRO-1（分布式优化器）；全局 batch 要能被 DP 整除。</li>
+    <li><b>有 PP 时看气泡</b>：每条流水线的微批数 $m$ 至少是 $p_\text{pp}$ 的几倍，气泡占比 $\frac{p_\text{pp}-1}{m+p_\text{pp}-1}$ 才小（<a href="../tp-pp/#pp">流水线并行</a>）。</li>
+  </ol>
+
+  <h3>每卡显存估算</h3>
+  <table class="notation">
+    <caption>记号</caption>
+    <thead><tr><th>符号</th><th>含义</th><th>单位</th></tr></thead>
+    <tbody>
+      <tr><td>$N,\ L$</td><td>参数量；层数</td><td>个；层</td></tr>
+      <tr><td>$s,\ b,\ h$</td><td>序列长；微批大小；隐藏维</td><td>token；条；标量</td></tr>
+      <tr><td>$p_\text{tp},p_\text{cp},p_\text{pp},p_\text{dp}$</td><td>各维并行度，乘积为总卡数</td><td>标量</td></tr>
+      <tr><td>$m$</td><td>每条流水线每步的微批数 = 全局 batch $/(p_\text{dp}\,b)$</td><td>标量</td></tr>
+    </tbody>
+  </table>
+  <ol class="derive">
+    <li><p>模型状态：TP 和 PP 把参数切成 $p_\text{tp}p_\text{pp}$ 份；BF16 参数与梯度每参数 4 字节；FP32 主权重和 Adam 的 $m,v$ 共 12 字节，分布式优化器在 DP×CP 组里再切（CP 各卡持有同样的参数）：</p>$$M_\text{state}=\frac{N}{p_\text{tp}\,p_\text{pp}}\Big(4+\frac{12}{p_\text{dp}\,p_\text{cp}}\Big)$$</li>
+    <li><p>每层每个微批的激活：开 TP + SP 与选择性重计算时约 $34\,sbh$ 字节（Korthikanti et al.，标准 GPT 块），TP 和 CP 各切一刀：</p>$$a_\text{layer}=\frac{34\,s\,b\,h}{p_\text{tp}\,p_\text{cp}}$$</li>
+    <li><p>1F1B 下第一个 stage 同时存着 $\min(p_\text{pp},m)$ 个微批的激活，每个微批覆盖 $L/p_\text{pp}$ 层：</p>$$M_\text{act}=\frac{L}{p_\text{pp}}\cdot\min(p_\text{pp},m)\cdot a_\text{layer}$$</li>
+  </ol>
+
+  <figure class="viz" id="viz-cfg">
+    <div class="viz-h"><b>配置估算：每卡显存和流水线气泡</b><span>GB = 10⁹ 字节，卡按 80 GB 算</span></div>
+    <div class="viz-stage"><canvas id="cv-cfg" aria-label="每卡显存的堆叠条，含模型状态、优化器状态、激活三段和 80 GB 线"></canvas></div>
+    <div class="viz-ctrl">
+      <div class="seg" id="seg-model"><button type="button" data-v="8">8B</button><button type="button" data-v="70" aria-pressed="true">70B</button><button type="button" data-v="405">405B</button></div>
+      <div class="seg" id="seg-seq"><button type="button" data-v="8192" aria-pressed="true">8K</button><button type="button" data-v="32768">32K</button><button type="button" data-v="131072">128K</button></div>
+      <label for="se-world">总卡数 <select id="se-world"><option>8</option><option>16</option><option>32</option><option selected>64</option><option>128</option><option>256</option><option>512</option><option>1024</option><option>2048</option><option>4096</option><option>8192</option><option>16384</option></select></label>
+    </div>
+    <div class="viz-ctrl">
+      <label for="se-ctp">TP <select id="se-ctp"><option>1</option><option>2</option><option>4</option><option selected>8</option></select></label>
+      <label for="se-ccp">CP <select id="se-ccp"><option selected>1</option><option>2</option><option>4</option><option>8</option><option>16</option></select></label>
+      <label for="se-cpp">PP <select id="se-cpp"><option>1</option><option>2</option><option selected>4</option><option>8</option><option>16</option></select></label>
+      <label for="se-gb">全局 batch <select id="se-gb"><option value="4">4M token</option><option value="16">16M token</option></select></label>
+    </div>
+    <div class="viz-read" id="rd-cfg"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>BF16 参数 + 梯度</li><li><i style="background:var(--c4)"></i>FP32 主权重 + Adam 状态</li><li><i style="background:var(--c2)"></i>激活</li><li><i style="background:var(--bad)"></i>80 GB</li></ul>
+    <figcaption>三个模型按 Llama 3 的层数和隐藏维（8B：32 层、h 4096；70B：80 层、h 8192；405B：126 层、h 16384），$b=1$。激活用标准 GPT 块的 34sbh，SwiGLU、GQA 的实际数字会有出入；没算词表、通信缓冲和碎片，实际要留 10–20% 余量。</figcaption>
+  </figure>
+
+  <h3>两个真实配置</h3>
+  <div class="tbl"><table class="wide">
+    <thead><tr><th>模型</th><th>卡</th><th>并行配置</th><th>备注</th></tr></thead>
+    <tbody>
+      <tr><td>Llama 3 405B，8K 序列</td><td class="num">8192 / 16384 H100</td><td>TP8 · PP16 · DP64 / DP128（DP 是 FSDP）</td><td>BF16 MFU 43% / 41%；DP 翻倍时每组 batch 减半，MFU 略降</td></tr>
+      <tr><td>Llama 3 405B，128K 序列</td><td class="num">16384 H100</td><td>TP8 · CP16 · PP16</td><td>CP 切 2p 块首尾配对，all-gather K/V</td></tr>
+      <tr><td>DeepSeek-V3（671B 总参数，37B 激活）</td><td class="num">2048 H800</td><td>PP16 · EP64（跨 8 节点）· ZeRO-1 DP，不用 TP</td><td>限节点路由 M = 4，DualPipe 重叠 all-to-all</td></tr>
+    </tbody>
+  </table></div>
+  <p>Llama 3 的分组顺序是 [TP, CP, PP, DP]，TP 最内层。DeepSeek-V3 报告靠一系列省显存的做法（重算 RMSNorm 与 MLA 的上投影等）免掉了 TP，EP 则靠限节点路由和 DualPipe 撑到 64 路。</p>
+</section>
+
+<section id="quiz">
+  <h2>自测</h2>
+  <details class="q"><summary>因果掩码下 Ring Attention 用连续切分，为什么总耗时接近理想值的 2 倍？</summary><div><p>第 $t\ge1$ 步总有一部分卡拿到的 K/V 全被掩掉、另一部分卡要算满，每步耗时由算满的卡决定。总耗时 $4p-2$ 个单位，理想值 $2p$。zigzag 让每卡拿一前一后两段，每步每卡恰好算一半，正好是理想值。</p></div></details>
+  <details class="q"><summary>H100 上每卡 1024 个 token、GQA（$a/a_{kv}=8$）、跨节点 IB，Ring 的通信藏得住吗？</summary><div><p>阈值 $c^\ast=\frac{F}{B}\cdot\frac{h_{kv}}{h}$。取 $F=500$ TFLOPS、$B=50$ GB/s，$c^\ast=10^4/8=1250&gt;1024$，藏不住，每步会等 K/V。换成 NVLink 或把块加长到 2048 以上就藏得住。</p></div></details>
+  <details class="q"><summary>Ulysses 的并行度为什么有上限？64 个 Q 头、8 个 K/V 头时怎么办？</summary><div><p>它在注意力时按头切，$p$ 不能超过头数。Q 有 64 头，但 K/V 只有 8 头，$p\gt8$ 时 K/V 头得复制到多张卡。再要扩展就用 USP：节点内 Ulysses、节点间 Ring。</p></div></details>
+  <details class="q"><summary>为什么说 Ulysses 的通信量随 $p$ 下降，而 Megatron-SP 不会？</summary><div><p>all-to-all 中每卡只发出自己那 $1/p$ 的数据的 $(p-1)/p$，每层约 $4sh/p$。Megatron-SP 的 all-gather / reduce-scatter 每卡要收发整个激活的 $(p-1)/p$，约 $4sh$，与 $p$ 无关。</p></div></details>
+  <details class="q"><summary>无辅助损失的偏置为什么不影响模型输出的「质量」梯度？</summary><div><p>偏置只用来决定选哪 $k$ 个专家，门控权重仍用原始亲和度 $s_{i,t}$，偏置本身也不靠梯度更新，而是按负载符号调整，所以不会给主损失添一个互相拉扯的梯度项。</p></div></details>
+  <details class="q"><summary>专家并行的 dispatch 为什么用 all-to-all，而不是 all-gather？</summary><div><p>每个 token 只需要去 $k$ 个专家所在的卡，各卡发给各卡的数据不同；all-gather 会把所有 token 发给所有卡，通信量放大约 $p/k$ 倍。</p></div></details>
+  <details class="q"><summary>细粒度 MoE（$h_e=2048$）为什么倾向 EP 而不是 ETP？</summary><div><p>ETP 把本来就窄的专家矩阵再切成更窄的 GEMM，效率低，还给每个专家加一次集合通信。EP 让每个专家完整地留在一张卡上，代价只是 all-to-all。</p></div></details>
+  <details class="q"><summary>为什么 TP 放最内层、PP 放最外层？</summary><div><p>TP 每层前反向都要对激活做集合通信，且在关键路径上，只有 NVLink 撑得住；PP 只在相邻 stage 之间传一个微批的激活，量小，跨节点也无妨。</p></div></details>
+</section>
+
+<section id="refs">
+  <h2>延伸阅读</h2>
+  <ol class="refs">
+    <li><b>Liu, Zaharia, Abbeel, Ring Attention with Blockwise Transformers for Near-Infinite Context</b>, ICLR 2024. <a href="https://arxiv.org/abs/2310.01889">arXiv:2310.01889</a></li>
+    <li><b>Brandon et al., Striped Attention: Faster Ring Attention for Causal Transformers</b>, 2023. <a href="https://arxiv.org/abs/2311.09431">arXiv:2311.09431</a></li>
+    <li><b>Jacobs et al., DeepSpeed Ulysses: System Optimizations for Enabling Training of Extreme Long Sequence Transformer Models</b>, 2023. <a href="https://arxiv.org/abs/2309.14509">arXiv:2309.14509</a></li>
+    <li><b>Fang, Zhao, USP: A Unified Sequence Parallelism Approach for Long Context Generative AI</b>, 2024. <a href="https://arxiv.org/abs/2405.07719">arXiv:2405.07719</a>，代码 <a href="https://github.com/feifeibear/long-context-attention">feifeibear/long-context-attention</a></li>
+    <li><b>Llama Team, The Llama 3 Herd of Models</b>, 2024.（4D 并行与 CP）<a href="https://arxiv.org/abs/2407.21783">arXiv:2407.21783</a></li>
+    <li><b>Shazeer et al., Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer</b>, ICLR 2017. <a href="https://arxiv.org/abs/1701.06538">arXiv:1701.06538</a></li>
+    <li><b>Lepikhin et al., GShard: Scaling Giant Models with Conditional Computation and Automatic Sharding</b>, ICLR 2021. <a href="https://arxiv.org/abs/2006.16668">arXiv:2006.16668</a></li>
+    <li><b>Fedus, Zoph, Shazeer, Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity</b>, JMLR 2022. <a href="https://arxiv.org/abs/2101.03961">arXiv:2101.03961</a></li>
+    <li><b>Wang et al., Auxiliary-Loss-Free Load Balancing Strategy for Mixture-of-Experts</b>, 2024. <a href="https://arxiv.org/abs/2408.15664">arXiv:2408.15664</a></li>
+    <li><b>DeepSeek-AI, DeepSeek-V3 Technical Report</b>, 2024. <a href="https://arxiv.org/abs/2412.19437">arXiv:2412.19437</a></li>
+    <li><b>DeepSeek-AI, DeepEP</b>, 2025. <a href="https://github.com/deepseek-ai/DeepEP">github.com/deepseek-ai/DeepEP</a></li>
+    <li><b>Liu et al., MoE Parallel Folding: Heterogeneous Parallelism Mappings for Efficient Large-Scale MoE Model Training with Megatron Core</b>, 2025. <a href="https://arxiv.org/abs/2504.14960">arXiv:2504.14960</a></li>
+    <li><b>NVIDIA, Scalable Training of Mixture-of-Experts Models with Megatron Core</b>, 2026. <a href="https://arxiv.org/abs/2603.07685">arXiv:2603.07685</a></li>
+    <li><b>Narayanan et al., Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM</b>, SC 2021. <a href="https://arxiv.org/abs/2104.04473">arXiv:2104.04473</a></li>
+    <li><b>Korthikanti et al., Reducing Activation Recomputation in Large Transformer Models</b>, MLSys 2023. <a href="https://arxiv.org/abs/2205.05198">arXiv:2205.05198</a></li>
+    <li><b>Liang et al., TorchTitan: One-stop PyTorch Native Solution for Production Ready LLM Pre-training</b>, ICLR 2025. <a href="https://arxiv.org/abs/2410.06511">arXiv:2410.06511</a>，代码 <a href="https://github.com/pytorch/torchtitan">pytorch/torchtitan</a></li>
+    <li><b>NVIDIA, Megatron-LM / Megatron-Core</b>. <a href="https://github.com/NVIDIA/Megatron-LM">github.com/NVIDIA/Megatron-LM</a></li>
+  </ol>
+</section>
+
+</main>
+</div>
+
+<!-- v4u:foot -->
+<footer class="v4u-foot"><div class="v4u-foot-in"><a class="pv" href="../tp-pp/"><span>上一篇</span>张量并行与流水线并行</a></div></footer>
+<!-- /v4u:foot -->
+
+<script>
+V4U.ready(() => {
+  const $ = (id) => document.getElementById(id);
+  const C = (n) => V4U.css(n);
+  const rc = (r) => C('--c' + ((r % 6) + 1));
+  const rcs = (r) => C('--c' + ((r % 6) + 1) + 's');
+  const mono = (px) => px + 'px ' + C('--f-mono');
+  const mkRng = (seed) => () => { seed = (seed + 0x6D2B79F5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  const gauss = (R) => { let u = 0; while (u === 0) u = R(); const v = R(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
+  const sig = (x) => 1 / (1 + Math.exp(-x));
+  const dash = (ctx, on) => ctx.setLineDash(on ? [4, 4] : []);
+  const RM = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  /* ---------- 1. Ring attention ---------- */
+  (() => {
+    const cv = $('cv-ring'), slp = $('sl-ringp'), slt = $('sl-ringt'), rd = $('rd-ring');
+    let mode = 'contig';
+    const mod = (x, p) => ((x % p) + p) % p;
+    const own = (i, p) => (mode === 'contig' ? Math.floor(i / 2) : i < p ? i : 2 * p - 1 - i);
+    const wgt = (i, j) => (j < i ? 1 : j === i ? 0.5 : 0);
+    const work = (r, q, p) => { let s = 0; for (let i = 0; i < 2 * p; i++) if (own(i, p) === r) for (let j = 0; j < 2 * p; j++) if (own(j, p) === q) s += wgt(i, j); return s; };
+    const stepMax = (t, p) => { let m = 0; for (let r = 0; r < p; r++) m = Math.max(m, work(r, mod(r - t, p), p)); return m; };
+    const wide = (w) => w >= 600;
+    const redraw = V4U.canvas(cv, (w) => { const p = +slp.value; return wide(w) ? 330 : Math.min(w, 380) + 58 + 30 * p; }, (ctx, w, h) => {
+      const p = +slp.value, t = Math.min(+slt.value, p - 1), n = 2 * p, W = wide(w);
+      const M = W ? Math.min(h - 40, w * 0.46) : Math.min(w, 380) - 40;
+      const mx = W ? 26 : (w - M) / 2 + 8, my = 30, cs = M / n;
+      // matrix cells
+      for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) {
+        const x = mx + j * cs, y = my + i * cs;
+        if (j > i) { ctx.fillStyle = C('--surface-2'); ctx.fillRect(x + 1, y + 1, cs - 2, cs - 2); continue; }
+        const r = own(i, p), q = own(j, p), tc = mod(r - q, p);
+        const col = tc === t ? rc(r) : tc < t ? rcs(r) : null;
+        ctx.beginPath();
+        if (i === j) { ctx.moveTo(x + 1, y + 1); ctx.lineTo(x + 1, y + cs - 1); ctx.lineTo(x + cs - 1, y + cs - 1); ctx.closePath(); }
+        else ctx.rect(x + 1, y + 1, cs - 2, cs - 2);
+        if (col) { ctx.fillStyle = col; ctx.fill(); }
+        ctx.strokeStyle = C('--line-2'); ctx.lineWidth = 1; ctx.stroke();
+        if (i === j) { ctx.beginPath(); ctx.moveTo(x + 2, y + 1); ctx.lineTo(x + cs - 1, y + 1); ctx.lineTo(x + cs - 1, y + cs - 2); ctx.closePath(); ctx.fillStyle = C('--surface-2'); ctx.fill(); }
+      }
+      // owner strips: rows = Q owner (fixed), columns = current K/V holder
+      for (let i = 0; i < n; i++) {
+        ctx.fillStyle = rc(own(i, p)); ctx.fillRect(mx - 11, my + i * cs + 1, 7, cs - 2);
+        ctx.fillStyle = rc(mod(own(i, p) + t, p)); ctx.fillRect(mx + i * cs + 1, my - 11, cs - 2, 7);
+      }
+      ctx.font = mono(11); ctx.fillStyle = C('--muted'); ctx.textBaseline = 'alphabetic';
+      ctx.fillText('K/V', mx, my - 16);
+      ctx.fillText('Q', mx - 12, my + M + 14);
+      // bars
+      const bx = W ? mx + M + 44 : 16, by = W ? my + 18 : my + M + 46, bw = W ? w - bx - 16 : w - 32;
+      const lab = 92, scale = (bw - lab - 40) / 4, rowH = W ? Math.min(34, (h - by - 10) / p) : 30;
+      let mx4 = 0; const ws = [];
+      for (let r = 0; r < p; r++) { const q = mod(r - t, p); const v = work(r, q, p); ws.push([q, v]); mx4 = Math.max(mx4, v); }
+      ctx.font = mono(11); ctx.fillStyle = C('--muted'); ctx.fillText('本步工作量', bx, by - 8);
+      for (let r = 0; r < p; r++) {
+        const y = by + r * rowH, [q, v] = ws[r];
+        ctx.fillStyle = rc(r); ctx.fillRect(bx, y + 4, 10, rowH - 12);
+        ctx.fillStyle = C('--ink-2'); ctx.font = mono(11); ctx.fillText(`卡${r} ←卡${q}`, bx + 14, y + rowH / 2 + 2);
+        ctx.fillStyle = C('--surface-2'); ctx.fillRect(bx + lab, y + 4, 4 * scale, rowH - 12);
+        ctx.fillStyle = rc(r); ctx.fillRect(bx + lab, y + 4, v * scale, rowH - 12);
+        ctx.fillStyle = C('--ink'); ctx.fillText(V4U.fmt(v, 1), bx + lab + 4 * scale + 8, y + rowH / 2 + 2);
+      }
+      ctx.strokeStyle = C('--ink'); ctx.lineWidth = 1.5; dash(ctx, true);
+      ctx.beginPath(); ctx.moveTo(bx + lab + mx4 * scale, by - 2); ctx.lineTo(bx + lab + mx4 * scale, by + p * rowH - 4); ctx.stroke(); dash(ctx, false);
+      let acc = 0; for (let k = 0; k <= t; k++) acc += stepMax(k, p);
+      let tot = 0; for (let k = 0; k < p; k++) tot += stepMax(k, p);
+      $('o-ringp').textContent = p; $('o-ringt').textContent = t;
+      rd.innerHTML = `<span>第 <b>${t}</b> 步耗时 <b>${V4U.fmt(mx4, 1)}</b></span><span>累计 <b>${V4U.fmt(acc, 1)}</b></span><span>${p} 步总耗时 <b>${V4U.fmt(tot, 1)}</b></span><span>理想 <b>${2 * p}</b></span>`;
+    });
+    const sync = () => { slt.max = +slp.value - 1; if (+slt.value > +slt.max) slt.value = slt.max; redraw(); };
+    slp.addEventListener('input', sync); slt.addEventListener('input', redraw);
+    V4U.seg($('seg-split'), (v) => { mode = v; redraw(); });
+    let anim = null, acc = 0;
+    $('bt-ring').addEventListener('click', (e) => {
+      if (anim) { anim.stop(); anim = null; e.target.textContent = '播放'; return; }
+      e.target.textContent = '暂停'; acc = 0;
+      anim = V4U.loop(cv, (t, dt) => { acc += dt; if (acc > 0.9) { acc = 0; slt.value = (+slt.value + 1) % +slp.value; redraw(); } });
+    });
+  })();
+
+  /* ---------- 2. Ring overlap timeline ---------- */
+  (() => {
+    const cv = $('cv-ovl'), sl = $('sl-c'), sf = $('sl-F'), rd = $('rd-ovl');
+    let link = 'nvl', kv = 'gqa';
+    const H = 8192;
+    const ft = (s) => (s >= 1e-3 ? V4U.fmt(s * 1e3, 2) + ' ms' : V4U.fmt(s * 1e6, 0) + ' μs');
+    const redraw = V4U.canvas(cv, 150, (ctx, w, h) => {
+      const c = 2 ** +sl.value, F = +sf.value * 1e12, B = link === 'nvl' ? 450e9 : 50e9, hkv = kv === 'mha' ? H : H / 8;
+      const tc = (4 * c * c * H) / F, tm = (4 * c * hkv) / B, st = Math.max(tc, tm), steps = 4;
+      const x0 = 46, x1 = w - 10, sx = (x1 - x0) / (steps * st);
+      const yC = 30, yM = 76, lh = 26;
+      ctx.font = mono(12); ctx.fillStyle = C('--ink-2'); ctx.textBaseline = 'middle';
+      ctx.fillText('计算', 4, yC + lh / 2); ctx.fillText('通信', 4, yM + lh / 2);
+      for (let k = 0; k < steps; k++) {
+        const S = k * st;
+        ctx.fillStyle = C('--c1'); ctx.fillRect(x0 + S * sx, yC, Math.max(1, tc * sx - 2), lh);
+        if (tm > tc && k < steps - 1) { ctx.fillStyle = C('--bad'); ctx.globalAlpha = 0.35; ctx.fillRect(x0 + (S + tc) * sx, yC, (st - tc) * sx - 2, lh); ctx.globalAlpha = 1; }
+        if (k < steps - 1) { ctx.fillStyle = C('--c3'); ctx.fillRect(x0 + S * sx, yM, Math.max(1, tm * sx - 2), lh); }
+        ctx.fillStyle = C('--muted'); ctx.font = mono(11); ctx.fillText('步' + k, x0 + S * sx + 3, yC - 10);
+        ctx.strokeStyle = C('--line-2'); ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(x0 + S * sx + 0.5, yC - 4); ctx.lineTo(x0 + S * sx + 0.5, yM + lh + 4); ctx.stroke();
+      }
+      ctx.fillStyle = C('--muted'); ctx.font = mono(11); ctx.textBaseline = 'alphabetic';
+      ctx.fillText('0', x0, h - 8); const tt = ft(steps * st); ctx.fillText(tt, x1 - ctx.measureText(tt).width, h - 8);
+      const cstar = (F / B) * (hkv / H);
+      $('o-c').textContent = c; $('o-F').textContent = sf.value;
+      rd.innerHTML = `<span>t_comp <b>${ft(tc)}</b></span><span>t_comm <b>${ft(tm)}</b></span><span>阈值 c* <b>${Math.round(cstar)}</b></span><span>${tm <= tc ? '<b>通信全部重叠</b>' : '每步空转 <b>' + ft(tm - tc) + '</b>'}</span>`;
+    });
+    sl.addEventListener('input', redraw); sf.addEventListener('input', redraw);
+    V4U.seg($('seg-link'), (v) => { link = v; redraw(); });
+    V4U.seg($('seg-kv'), (v) => { kv = v; redraw(); });
+  })();
+
+  /* ---------- 3. Ulysses all-to-all ---------- */
+  (() => {
+    const cv = $('cv-a2a'), sl = $('sl-a2a'), rd = $('rd-a2a'), bt = $('bt-a2a');
+    let p = 4; const H = 8;
+    const ease = (x) => (x < 0.5 ? 2 * x * x : 1 - (-2 * x + 2) ** 2 / 2);
+    const lay = (w) => { const cols = w >= 640 ? p : 2, gap = 14, pw = (w - gap * (cols - 1)) / cols, cs = Math.min(24, (pw - 16) / H), ph = p * cs + 46; return { cols, gap, pw, cs, ph }; };
+    const redraw = V4U.canvas(cv, (w) => { const L = lay(w); return Math.ceil(p / L.cols) * L.ph + 4; }, (ctx, w) => {
+      const tau = ease(+sl.value), { cols, gap, pw, cs, ph } = lay(w);
+      const org = (k) => [(k % cols) * (pw + gap), Math.floor(k / cols) * ph];
+      const gx = (pw - H * cs) / 2, gy = 28;
+      for (let k = 0; k < p; k++) {
+        const [x, y] = org(k);
+        ctx.fillStyle = C('--ink-2'); ctx.font = mono(12); ctx.textBaseline = 'alphabetic'; ctx.fillText('卡 ' + k, x + 2, y + 14);
+        ctx.strokeStyle = C('--line'); ctx.lineWidth = 1;
+        ctx.strokeRect(x + 0.5, y + 20.5, pw - 1, p * cs + 16);
+        for (let i = 0; i < p; i++) for (let j = 0; j < H; j++) ctx.strokeRect(x + gx + j * cs + 0.5, y + gy + i * cs + 0.5, cs - 1, cs - 1);
+        // head-group bracket for the post-all-to-all owner
+        ctx.fillStyle = rc(k); ctx.globalAlpha = 0.35 + 0.65 * tau;
+        ctx.fillRect(x + gx + k * (H / p) * cs, y + gy + p * cs + 3, (H / p) * cs - 1, 3); ctx.globalAlpha = 1;
+      }
+      for (let i = 0; i < p; i++) for (let j = 0; j < H; j++) {
+        const dst = Math.floor(j / (H / p)), [x0, y0] = org(i), [x1, y1] = org(dst);
+        const x = V4U.lerp(x0, x1, tau) + gx + j * cs, y = V4U.lerp(y0, y1, tau) + gy + i * cs;
+        ctx.fillStyle = rc(i); ctx.fillRect(x + 2, y + 2, cs - 4, cs - 4);
+      }
+      const v = +sl.value;
+      $('o-a2a').textContent = V4U.fmt(v);
+      rd.innerHTML = v < 0.5
+        ? `<span>每卡持有 <b>s/${p}</b> 个 token × <b>全部 ${H}</b> 个头</span><span>要发出 <b>${p - 1}/${p}</b> 的本地 Q/K/V</span>`
+        : `<span>每卡持有 <b>全部 s</b> 个 token × <b>${H / p}</b> 个头</span><span>注意力在本卡独立完成</span>`;
+    });
+    const chips = () => { $('ch-a2a').innerHTML = Array.from({ length: p }, (_, i) => `<li><i style="background:var(--c${i + 1})"></i>序列段 ${i}（原在卡 ${i}）</li>`).join(''); };
+    sl.addEventListener('input', redraw);
+    V4U.seg($('seg-a2ap'), (v) => { p = +v; chips(); redraw(); });
+    let anim = null;
+    bt.addEventListener('click', () => {
+      if (anim) { anim.stop(); anim = null; }
+      const target = +sl.value < 0.5 ? 1 : 0;
+      bt.textContent = target ? '换回来' : '执行 all-to-all';
+      anim = V4U.loop(cv, (t, dt) => {
+        let v = +sl.value; v += (target ? 1 : -1) * dt * 0.9;
+        if (RM) v = target;
+        v = V4U.clamp(v, 0, 1); sl.value = v; redraw();
+        if (v === target && anim) { anim.stop(); anim = null; }
+      });
+    });
+  })();
+
+  /* ---------- 4. Aux-loss-free bias ---------- */
+  (() => {
+    const cv = $('cv-bias'), ssk = $('sl-skew'), sg = $('sl-gam'), rd = $('rd-bias'), bt = $('bt-bias');
+    const E = 8, K = 2, T = 256, nbar = (K * T) / E, MAXS = 300;
+    const pref = [0.4, 1.0, -0.4, 0.1, -1.0, 0.7, -0.1, -0.7];
+    let b, hist, load, R, step;
+    const route = () => {
+      const n = new Array(E).fill(0), mu = pref.map((x) => x * +ssk.value);
+      for (let t = 0; t < T; t++) {
+        const s = mu.map((m) => sig(gauss(R) + m)), sc = s.map((x, i) => [x + b[i], i]).sort((a, c) => c[0] - a[0]);
+        for (let k = 0; k < K; k++) n[sc[k][1]]++;
+      }
+      return n;
+    };
+    const reset = () => { b = new Array(E).fill(0); R = mkRng(11); step = 0; load = route(); hist = [Math.max(...load) / nbar - 1]; };
+    const advance = () => { const g = +sg.value; for (let i = 0; i < E; i++) b[i] += g * Math.sign(nbar - load[i]); step++; load = route(); hist.push(Math.max(...load) / nbar - 1); };
+    reset(); while (step < 120) advance();
+    const wide = (w) => w >= 600;
+    const redraw = V4U.canvas(cv, (w) => (wide(w) ? 250 : 400), (ctx, w, h) => {
+      const W = wide(w), lw = W ? w * 0.52 : w, x0 = 30;
+      const barTop = 16, barH = W ? 150 : 150, colW = (lw - x0 - 10) / E;
+      const ymax = Math.max(nbar * 2.2, ...load);
+      const Y = (v) => barTop + barH - (v / ymax) * barH;
+      ctx.font = mono(11); ctx.textBaseline = 'alphabetic';
+      for (let i = 0; i < E; i++) {
+        const x = x0 + i * colW;
+        ctx.fillStyle = C('--c1'); ctx.fillRect(x + 4, Y(load[i]), colW - 8, barTop + barH - Y(load[i]));
+        ctx.fillStyle = C('--ink-2'); ctx.fillText(String(load[i]), x + 4, Y(load[i]) - 3);
+      }
+      ctx.strokeStyle = C('--ink-2'); ctx.lineWidth = 1.5; dash(ctx, true);
+      ctx.beginPath(); ctx.moveTo(x0, Y(nbar)); ctx.lineTo(lw - 10, Y(nbar)); ctx.stroke(); dash(ctx, false);
+      ctx.strokeStyle = C('--line-2'); ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(x0, barTop + barH + 0.5); ctx.lineTo(lw - 10, barTop + barH + 0.5); ctx.stroke();
+      // bias bars
+      const bTop = barTop + barH + 24, bH = 56, bmax = Math.max(0.2, ...b.map(Math.abs)), mid = bTop + bH / 2;
+      ctx.strokeStyle = C('--line-2'); ctx.beginPath(); ctx.moveTo(x0, mid + 0.5); ctx.lineTo(lw - 10, mid + 0.5); ctx.stroke();
+      ctx.fillStyle = C('--muted'); ctx.fillText('b', 8, mid + 4);
+      for (let i = 0; i < E; i++) {
+        const x = x0 + i * colW, v = (b[i] / bmax) * (bH / 2);
+        ctx.fillStyle = C('--c2'); ctx.fillRect(x + 4, Math.min(mid, mid - v), colW - 8, Math.max(1, Math.abs(v)));
+        ctx.fillStyle = C('--muted'); ctx.fillText('E' + i, x + 4, bTop + bH + 14);
+      }
+      ctx.fillText('n', 8, barTop + 10);
+      // MaxVio curve
+      const cx0 = W ? lw + 40 : x0, cx1 = w - 12, cy0 = W ? 24 : bTop + bH + 40, cy1 = h - 22;
+      const vmax = Math.max(1, ...hist);
+      ctx.strokeStyle = C('--line-2'); ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(cx0, cy0); ctx.lineTo(cx0, cy1); ctx.lineTo(cx1, cy1); ctx.stroke();
+      ctx.fillStyle = C('--muted'); ctx.fillText(V4U.fmt(vmax, 1), cx0 - 28, cy0 + 8); ctx.fillText('0', cx0 - 12, cy1);
+      ctx.fillText('步 ' + MAXS, cx1 - 44, cy1 + 15); ctx.fillText('MaxVio', cx0 + 6, cy0 + 8);
+      ctx.strokeStyle = C('--c4'); ctx.lineWidth = 2; ctx.beginPath();
+      hist.forEach((v, k) => { const x = cx0 + (k / MAXS) * (cx1 - cx0), y = cy1 - (v / vmax) * (cy1 - cy0 - 4); k ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+      ctx.stroke();
+      $('o-skew').textContent = V4U.fmt(+ssk.value, 1); $('o-gam').textContent = V4U.fmt(+sg.value, 3);
+      rd.innerHTML = `<span>步 <b>${step}</b></span><span>MaxVio <b>${V4U.fmt(hist[hist.length - 1], 2)}</b></span><span>最忙专家 <b>${Math.max(...load)}</b> / 均值 <b>${nbar}</b></span><span>偏置范围 <b>${V4U.fmt(Math.min(...b), 2)} … ${V4U.fmt(Math.max(...b), 2)}</b></span>`;
+    });
+    let anim = null, acc = 0;
+    const stop = () => { if (anim) { anim.stop(); anim = null; } bt.textContent = '播放'; };
+    bt.addEventListener('click', () => {
+      if (anim) { stop(); return; }
+      if (step >= MAXS) { reset(); }
+      bt.textContent = '暂停'; acc = 0;
+      anim = V4U.loop(cv, (t, dt) => {
+        if (RM) { const end = Math.min(MAXS, step + 60); while (step < end) advance(); redraw(); stop(); return; }
+        acc += dt; while (acc > 1 / 20 && step < MAXS) { acc -= 1 / 20; advance(); }
+        redraw(); if (step >= MAXS) stop();
+      });
+    });
+    $('bt-bias0').addEventListener('click', () => { stop(); reset(); redraw(); });
+    ssk.addEventListener('input', () => { stop(); reset(); redraw(); });
+    sg.addEventListener('input', () => { $('o-gam').textContent = V4U.fmt(+sg.value, 3); });
+  })();
+
+  /* ---------- 5. EP dispatch ---------- */
+  (() => {
+    const cv = $('cv-route'), ssk = $('sl-rskew'), scf = $('sl-cf'), rd = $('rd-route');
+    const E = 8, T = 12, pop = [0.9, -0.3, 0.2, -0.8, 1.2, -0.5, 0, -0.6];
+    let p = 4, k = 2, seed = 5, A = null;
+    const gen = () => {
+      const R = mkRng(seed), as = [];
+      for (let r = 0; r < p; r++) for (let t = 0; t < T; t++) {
+        const z = pop.map((m) => gauss(R) + m * +ssk.value).map((v, i) => [v, i]).sort((a, b) => b[0] - a[0]);
+        for (let q = 0; q < k; q++) as.push({ r, t, e: z[q][1] });
+      }
+      const cap = Math.ceil((+scf.value * k * p * T) / E), cnt = new Array(E).fill(0);
+      as.forEach((a) => { a.slot = cnt[a.e]++; a.drop = a.slot >= cap; a.dst = Math.floor(a.e / (E / p)); });
+      A = { as, cap, cnt };
+    };
+    const lay = (w) => {
+      const W = w >= 640, Wm = W ? w * 0.66 : w, gap = 6, bw = (Wm - gap * (p - 1)) / p;
+      const cols = Math.max(1, Math.floor((bw - 6) / 10)), rows = Math.ceil(T / cols), boxH = rows * 10 + 8;
+      const barH = 110, top = 18, dstY = top + boxH + 70, mat = W ? Math.min(w - Wm - 40, 210) : Math.min(w - 60, 220);
+      const hMain = dstY + barH + 22;
+      return { W, Wm, gap, bw, cols, boxH, barH, top, dstY, mat, h: W ? Math.max(hMain, mat + 50) : hMain + mat + 36 };
+    };
+    const redraw = V4U.canvas(cv, (w) => lay(w).h, (ctx, w) => {
+      if (!A) gen();
+      const L = lay(w), { as, cap, cnt } = A, per = E / p, ew = (L.bw - 6) / per;
+      const bx = (r) => r * (L.bw + L.gap);
+      const dot = (r, t) => [bx(r) + 8 + (t % L.cols) * 10, L.top + 8 + Math.floor(t / L.cols) * 10];
+      const maxC = Math.max(cap, ...cnt), uh = Math.min(6, L.barH / maxC);
+      const ex = (e) => bx(Math.floor(e / per)) + 3 + (e % per) * ew;
+      ctx.font = mono(11); ctx.textBaseline = 'alphabetic';
+      // boxes
+      for (let r = 0; r < p; r++) {
+        ctx.strokeStyle = C('--line-2'); ctx.lineWidth = 1;
+        ctx.strokeRect(bx(r) + 0.5, L.top + 0.5, L.bw - 1, L.boxH);
+        ctx.strokeRect(bx(r) + 0.5, L.dstY - 4.5, L.bw - 1, L.barH + 8);
+        ctx.fillStyle = rc(r); ctx.fillText('卡' + r, bx(r) + 2, L.top - 5);
+      }
+      // lines
+      as.forEach((a) => {
+        const [x, y] = dot(a.r, a.t), x2 = ex(a.e) + ew / 2, y2 = L.dstY - 4;
+        ctx.strokeStyle = a.drop ? C('--bad') : rc(a.r); ctx.globalAlpha = a.drop ? 0.4 : 0.22; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(x, y + 3); ctx.bezierCurveTo(x, y + 40, x2, y2 - 40, x2, y2); ctx.stroke();
+      });
+      ctx.globalAlpha = 1;
+      for (let r = 0; r < p; r++) for (let t = 0; t < T; t++) { const [x, y] = dot(r, t); ctx.fillStyle = rc(r); ctx.beginPath(); ctx.arc(x, y, 3.5, 0, 2 * Math.PI); ctx.fill(); }
+      // expert bars: stacked by arrival order, coloured by source
+      const base = L.dstY + L.barH;
+      as.forEach((a) => { const x = ex(a.e); ctx.fillStyle = a.drop ? C('--bad') : rc(a.r); ctx.fillRect(x + 2, base - (a.slot + 1) * uh, ew - 4, Math.max(1, uh - (uh > 3 ? 1 : 0))); });
+      ctx.strokeStyle = C('--ink-2'); ctx.lineWidth = 1.5; dash(ctx, true);
+      for (let r = 0; r < p; r++) { ctx.beginPath(); ctx.moveTo(bx(r) + 2, base - cap * uh); ctx.lineTo(bx(r) + L.bw - 2, base - cap * uh); ctx.stroke(); }
+      dash(ctx, false);
+      ctx.fillStyle = C('--muted');
+      for (let e = 0; e < E; e++) if (ew >= 16) ctx.fillText('E' + e, ex(e) + 2, base + 15);
+      // traffic matrix
+      const mx = L.W ? L.Wm + 34 : (w - L.mat) / 2 + 10, my = L.W ? 34 : base + 46, cs = L.mat / p;
+      const M = Array.from({ length: p }, () => new Array(p).fill(0));
+      as.forEach((a) => M[a.r][a.dst]++);
+      const mmax = Math.max(...M.flat());
+      ctx.fillStyle = C('--muted'); ctx.fillText('发 \\ 收', mx - 30, my - 10);
+      for (let i = 0; i < p; i++) {
+        ctx.fillStyle = rc(i); ctx.fillRect(mx - 10, my + i * cs + 1, 6, cs - 2); ctx.fillRect(mx + i * cs + 1, my - 8, cs - 2, 5);
+        for (let j = 0; j < p; j++) {
+          ctx.fillStyle = C('--surface-2'); ctx.fillRect(mx + j * cs + 1, my + i * cs + 1, cs - 2, cs - 2);
+          ctx.fillStyle = i === j ? C('--ink-2') : C('--c1'); ctx.globalAlpha = M[i][j] / mmax;
+          ctx.fillRect(mx + j * cs + 1, my + i * cs + 1, cs - 2, cs - 2); ctx.globalAlpha = 1;
+          if (cs >= 22) { ctx.fillStyle = M[i][j] / mmax > 0.55 ? C('--surface') : C('--ink'); ctx.fillText(String(M[i][j]), mx + j * cs + cs / 2 - 7, my + i * cs + cs / 2 + 4); }
+        }
+      }
+      const drop = as.filter((a) => a.drop).length, cross = as.filter((a) => a.dst !== a.r).length;
+      const recv = new Array(p).fill(0); as.forEach((a) => { if (!a.drop) recv[a.dst]++; });
+      const rmean = recv.reduce((s, x) => s + x, 0) / p;
+      $('o-rskew').textContent = V4U.fmt(+ssk.value, 1); $('o-cf').textContent = V4U.fmt(+scf.value, 2);
+      rd.innerHTML = `<span>容量 C <b>${cap}</b></span><span>丢弃 <b>${drop}</b>/${as.length}（${V4U.fmt((100 * drop) / as.length, 0)}%）</span><span>出卡比例 <b>${V4U.fmt((100 * cross) / as.length, 0)}%</b></span><span>最忙卡 / 平均 <b>${V4U.fmt(Math.max(...recv) / rmean, 2)}</b></span>`;
+    });
+    const re = () => { gen(); redraw(); };
+    V4U.seg($('seg-rp'), (v) => { p = +v; re(); });
+    V4U.seg($('seg-rk'), (v) => { k = +v; re(); });
+    ssk.addEventListener('input', re); scf.addEventListener('input', re);
+    $('bt-route').addEventListener('click', () => { seed++; re(); });
+  })();
+
+  /* ---------- 6. Node-limited routing ---------- */
+  (() => {
+    const cv = $('cv-node'), rd = $('rd-node');
+    const NN = 8, EP = 32, K = 8;
+    let M = 4, seed = 3, tok = null;
+    const draw1 = (R) => Array.from({ length: NN * EP }, () => sig(1.5 * gauss(R)));
+    const pick = (s, m) => {
+      let cand = [...Array(NN * EP).keys()], nodes = [...Array(NN).keys()];
+      if (m < NN) {
+        const per = K / m;
+        const score = nodes.map((n) => s.slice(n * EP, (n + 1) * EP).sort((a, b) => b - a).slice(0, per).reduce((x, y) => x + y, 0));
+        nodes = nodes.sort((a, b) => score[b] - score[a]).slice(0, m);
+        cand = cand.filter((i) => nodes.includes(Math.floor(i / EP)));
+      }
+      const sel = cand.sort((a, b) => s[b] - s[a]).slice(0, K);
+      return { sel, nodes: new Set(nodes), touched: new Set(sel.map((i) => Math.floor(i / EP))) };
+    };
+    const stats = {};
+    const mc = (m) => {
+      if (stats[m]) return stats[m];
+      const R = mkRng(99); let nt = 0, ret = 0;
+      for (let q = 0; q < 2000; q++) {
+        const s = draw1(R), a = pick(s, m), u = pick(s, NN);
+        nt += a.touched.size; ret += a.sel.reduce((x, i) => x + s[i], 0) / u.sel.reduce((x, i) => x + s[i], 0);
+      }
+      return (stats[m] = { nt: nt / 2000, ret: ret / 2000 });
+    };
+    const redraw = V4U.canvas(cv, 8 * 20 + 14, (ctx, w) => {
+      if (!tok) tok = draw1(mkRng(seed));
+      const res = pick(tok, M), lab = 46, cw = (w - lab - 4) / EP, rh = 20;
+      ctx.font = mono(11); ctx.textBaseline = 'middle';
+      for (let n = 0; n < NN; n++) {
+        const y = 6 + n * rh, on = res.nodes.has(n);
+        ctx.fillStyle = res.touched.has(n) ? C('--accent') : C('--muted');
+        ctx.fillText('节点' + n, 0, y + rh / 2 - 1);
+        for (let e = 0; e < EP; e++) {
+          const i = n * EP + e, x = lab + e * cw;
+          ctx.fillStyle = C('--surface-2'); ctx.fillRect(x + 0.5, y + 1, cw - 1, rh - 5);
+          ctx.fillStyle = C('--c1'); ctx.globalAlpha = on ? tok[i] ** 2 : 0.12 * tok[i]; ctx.fillRect(x + 0.5, y + 1, cw - 1, rh - 5); ctx.globalAlpha = 1;
+          if (res.sel.includes(i)) { ctx.fillStyle = C('--c2'); ctx.fillRect(x + 0.5, y + 1, cw - 1, rh - 5); }
+        }
+        if (!on) { ctx.strokeStyle = C('--line-2'); ctx.lineWidth = 1; ctx.strokeRect(lab + 0.5, y + 0.5, EP * cw - 1, rh - 4); }
+      }
+      const u = mc(NN), m = mc(M);
+      rd.innerHTML = `<span>本 token 触达 <b>${res.touched.size}</b> 个节点</span><span>平均：不限 <b>${V4U.fmt(u.nt, 2)}</b>，${M < NN ? '限 ' + M + ' 个' : '不限'} <b>${V4U.fmt(m.nt, 2)}</b></span><span>得分保留 <b>${V4U.fmt(100 * m.ret, 1)}%</b></span>`;
+    });
+    V4U.seg($('seg-M'), (v) => { M = +v; redraw(); });
+    $('bt-node').addEventListener('click', () => { seed++; tok = null; redraw(); });
+  })();
+
+  /* ---------- 7. Device mesh ---------- */
+  (() => {
+    const cv = $('cv-mesh'), rd = $('rd-mesh'), dimBtns = [...$('seg-dim').querySelectorAll('button')];
+    const sel = (id) => +$(id).value;
+    let layer = 'attn', dim = 0, focus = 0;
+    const names = { attn: ['TP', 'CP', 'DP', 'PP'], moe: ['ETP', 'EP', 'EDP', 'PP'] };
+    const cfg = () => {
+      const world = 8 * sel('se-nodes'), pp = sel('se-pp');
+      const s = layer === 'attn' ? [sel('se-tp'), sel('se-cp'), 0, pp] : [sel('se-etp'), sel('se-ep'), 0, pp];
+      const inner = s[0] * s[1] * pp, ok = world % inner === 0;
+      s[2] = ok ? world / inner : 0;
+      return { world, s, ok };
+    };
+    const coords = (r, s) => [r % s[0], Math.floor(r / s[0]) % s[1], Math.floor(r / (s[0] * s[1])) % s[2], Math.floor(r / (s[0] * s[1] * s[2]))];
+    const gid = (c, s, d) => { let g = 0, m = 1; for (let k = 0; k < 4; k++) if (k !== d) { g += c[k] * m; m *= s[k]; } return g; };
+    const geo = (w) => { const x0 = 4, sq = Math.min(72, (w - 2 * x0 - 56) / 8); return { sq, nh: sq + 40, x0 }; };
+    const redraw = V4U.canvas(cv, (w) => { const n = sel('se-nodes'); const g = geo(w); return n * g.nh + 6; }, (ctx, w) => {
+      const { world, s, ok } = cfg(), nodes = world / 8, g = geo(w);
+      const pos = (r) => [g.x0 + 6 + (r % 8) * (g.sq + 6), Math.floor(r / 8) * g.nh + 24];
+      if (focus >= world) focus = 0;
+      const fc = ok ? coords(focus, s) : null, fg = ok ? gid(fc, s, dim) : -1;
+      ctx.textBaseline = 'alphabetic';
+      for (let n = 0; n < nodes; n++) {
+        const y = n * g.nh;
+        ctx.strokeStyle = C('--line-2'); ctx.lineWidth = 1; ctx.strokeRect(g.x0 + 0.5, y + 6.5, 8 * (g.sq + 6) + 6, g.sq + 28);
+        ctx.fillStyle = C('--muted'); ctx.font = mono(11); ctx.fillText('节点 ' + n, g.x0 + 6, y + 19);
+      }
+      for (let r = 0; r < world; r++) {
+        const [x, y] = pos(r);
+        const yy = y;
+        if (!ok) { ctx.fillStyle = C('--surface-2'); ctx.fillRect(x, yy, g.sq, g.sq); continue; }
+        const c = coords(r, s), q = gid(c, s, dim);
+        ctx.fillStyle = rcs(q); ctx.fillRect(x, yy, g.sq, g.sq);
+        ctx.strokeStyle = rc(q); ctx.lineWidth = 2; ctx.strokeRect(x + 1, yy + 1, g.sq - 2, g.sq - 2);
+        if (q === fg) { ctx.strokeStyle = C('--ink'); ctx.lineWidth = 3; ctx.strokeRect(x - 2, yy - 2, g.sq + 4, g.sq + 4); }
+        ctx.fillStyle = C('--ink'); ctx.font = mono(g.sq < 40 ? 10 : 12);
+        ctx.fillText(String(r), x + 4, yy + (g.sq < 40 ? 12 : 16));
+        ctx.fillStyle = C('--ink-2'); ctx.font = mono(10);
+        ctx.fillText(names[layer][dim].toLowerCase() + c[dim], x + 4, yy + g.sq - 5);
+      }
+      $('seg-dim').querySelectorAll('button').forEach((b, i) => { b.textContent = names[layer][i]; });
+      if (!ok) { rd.innerHTML = `<span><b>${names[layer][0]}×${names[layer][1]}×PP</b> 不整除总卡数 ${world}</span>`; return; }
+      const nm = names[layer];
+      const members = []; for (let r = 0; r < world; r++) if (gid(coords(r, s), s, dim) === fg) members.push(r);
+      const ngroups = world / s[dim];
+      let crossN = 0; for (let q = 0; q < ngroups; q++) { const ns = new Set(); for (let r = 0; r < world; r++) if (gid(coords(r, s), s, dim) === q) ns.add(Math.floor(r / 8)); if (ns.size > 1) crossN++; }
+      const list = members.length > 8 ? members.slice(0, 3).join(',') + ',…,' + members[members.length - 1] : members.join(',');
+      rd.innerHTML = `<span>${nm.join('×')} = <b>${s.join('×')}</b></span><span>${nm[dim]} 组 <b>${ngroups}</b> 个，每组 <b>${s[dim]}</b> 卡</span><span>跨节点的组 <b>${crossN}</b></span><span>卡 ${focus} 的组：<b>${list}</b></span>`;
+    });
+    cv.addEventListener('click', (e) => {
+      const r = cv.getBoundingClientRect(), x = e.clientX - r.left, y = e.clientY - r.top, g = geo(cv.clientWidth);
+      const col = Math.floor((x - g.x0 - 6) / (g.sq + 6)), row = Math.floor(y / g.nh);
+      if (col >= 0 && col < 8 && row >= 0 && row < sel('se-nodes')) { focus = row * 8 + col; redraw(); }
+    });
+    ['se-nodes', 'se-tp', 'se-cp', 'se-pp', 'se-etp', 'se-ep'].forEach((id) => $(id).addEventListener('change', redraw));
+    V4U.seg($('seg-layer'), (v) => { layer = v; redraw(); });
+    V4U.seg($('seg-dim'), (v) => { dim = +v; redraw(); });
+  })();
+
+  /* ---------- 8. Config estimator ---------- */
+  (() => {
+    const cv = $('cv-cfg'), rd = $('rd-cfg');
+    const MODELS = { 8: { L: 32, h: 4096, a: 32, N: 8.0e9 }, 70: { L: 80, h: 8192, a: 64, N: 70.6e9 }, 405: { L: 126, h: 16384, a: 128, N: 405e9 } };
+    let model = 70, seq = 8192;
+    const v = (id) => +$(id).value;
+    const redraw = V4U.canvas(cv, 92, (ctx, w, h) => {
+      const md = MODELS[model], world = v('se-world'), tp = v('se-ctp'), cp = v('se-ccp'), pp = v('se-cpp');
+      const inner = tp * cp * pp, dp = world / inner, okDP = Number.isInteger(dp) && dp >= 1;
+      const gbSeq = (v('se-gb') * 2 ** 20) / seq, m = okDP ? gbSeq / dp : NaN;
+      const GB = 1e9;
+      const p4 = okDP ? ((md.N / (tp * pp)) * 4) / GB : 0, opt = okDP ? ((md.N / (tp * pp)) * 12) / (dp * cp) / GB : 0;
+      const aL = (34 * seq * md.h) / (tp * cp), act = okDP ? ((md.L / pp) * Math.min(pp, Math.max(1, Math.floor(m))) * aL) / GB : 0;
+      const tot = p4 + opt + act, cap = 80, xmax = Math.max(100, tot * 1.08), x0 = 4, x1 = w - 8, sx = (x1 - x0) / xmax;
+      const y = 26, bh = 30;
+      ctx.fillStyle = C('--surface-2'); ctx.fillRect(x0, y, x1 - x0, bh);
+      let x = x0;
+      [[p4, '--c1'], [opt, '--c4'], [act, '--c2']].forEach(([val, col]) => { ctx.fillStyle = C(col); ctx.fillRect(x, y, val * sx, bh); x += val * sx; });
+      ctx.strokeStyle = C('--bad'); ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(x0 + cap * sx, y - 8); ctx.lineTo(x0 + cap * sx, y + bh + 8); ctx.stroke();
+      ctx.font = mono(11); ctx.fillStyle = C('--muted'); ctx.textBaseline = 'alphabetic';
+      ctx.fillText('0', x0, y + bh + 22); const lb = '80 GB'; ctx.fillText(lb, x0 + cap * sx - ctx.measureText(lb).width / 2, y - 12);
+      const mx = V4U.fmt(xmax, 0) + ' GB'; ctx.fillText(mx, x1 - ctx.measureText(mx).width, y + bh + 22);
+      const warn = [];
+      if (!okDP) warn.push('TP×CP×PP 不整除总卡数');
+      else {
+        if (!Number.isInteger(m) || m < 1) warn.push('全局 batch 不能被 DP 整除');
+        if (md.L % pp) warn.push(`${md.L} 层不能被 PP${pp} 整除`);
+        if (md.a % tp) warn.push('头数不能被 TP 整除');
+      }
+      const mm = Math.max(1, Math.floor(m)), bub = (pp - 1) / (mm + pp - 1);
+      rd.innerHTML = okDP
+        ? `<span>DP <b>${dp}</b>，微批数 m <b>${Number.isFinite(m) ? (Number.isInteger(m) ? m : V4U.fmt(m, 1)) : '–'}</b></span><span>参数+梯度 <b>${V4U.fmt(p4, 1)}</b></span><span>优化器 <b>${V4U.fmt(opt, 1)}</b></span><span>激活 <b>${V4U.fmt(act, 1)}</b></span><span>合计 <b>${V4U.fmt(tot, 1)} GB</b> ${tot <= cap ? '放得下' : '<b>放不下</b>'}</span><span>气泡 <b>${V4U.fmt(100 * bub, 1)}%</b></span>${warn.map((x) => `<span>⚠ ${x}</span>`).join('')}`
+        : `<span>⚠ ${warn[0]}</span>`;
+    });
+    ['se-world', 'se-ctp', 'se-ccp', 'se-cpp', 'se-gb'].forEach((id) => $(id).addEventListener('change', redraw));
+    V4U.seg($('seg-model'), (x) => { model = +x; redraw(); });
+    V4U.seg($('seg-seq'), (x) => { seq = +x; redraw(); });
+  })();
+});
+</script>
+</body>
+</html>

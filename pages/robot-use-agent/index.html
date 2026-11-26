@@ -9,7 +9,7 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700&family=Inter+Tight:wght@700&family=JetBrains+Mono:wght@400;700&family=Noto+Sans+SC:wght@400;700&display=swap">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
-<link rel="stylesheet" href="../../assets/v4u.css?v=4288b6c4">
+<link rel="stylesheet" href="../../assets/v4u.css?v=691854ab">
 <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
 <script src="../../assets/v4u.js?v=d6640e00"></script>
@@ -42,11 +42,11 @@
 </head>
 <body>
 <!-- v4u:nav -->
-<nav class="v4u-nav" aria-label="站点导航"><div class="v4u-nav-in"><span class="v4u-crumb"><a href="../../"><b>Vis4Und</b></a><span class="v4u-sep">/</span><a href="../../#agentic-rl">(3) Agentic RL</a></span><span class="v4u-links"><a href="../llm-rl-basics/">补充 RL 基础</a><a href="../coding-agent/">(i) Coding Agent</a><a href="../robot-use-agent/" aria-current="page">(ii) Robot-Use Agent</a><button type="button" class="v4u-theme" aria-label="切换深浅色">深色</button></span></div></nav>
+<nav class="v4u-nav" aria-label="站点导航"><div class="v4u-nav-in"><span class="v4u-crumb"><a href="../../"><b>Vis4Und</b></a><span class="v4u-sep">/</span><a href="../../#agentic-rl">(3) Agentic RL</a></span><span class="v4u-links"><a href="../llm-rl-basics/">(i) RL 基础</a><a href="../coding-agent/">(ii) Coding Agent</a><a href="../robot-use-agent/" aria-current="page">(iii) Robot-Use Agent</a><button type="button" class="v4u-theme" aria-label="切换深浅色">深色</button></span></div></nav>
 <!-- /v4u:nav -->
 
 <header class="hero"><div class="wrap">
-  <p class="kicker">(3) Agentic RL · (ii)</p>
+  <p class="kicker">(3) Agentic RL · (iii)</p>
   <h1>Robot-Use Agent 的训练</h1>
   <p class="lede">让一个推理 VLM 像 computer-use agent 操作电脑那样操作机器人：每轮看相机画面和机械臂状态，写一段思维链，输出下一步末端位姿。这一页讲动作接口，以及 2026 年 11 月的两条训练路线：PEAR 在仿真里只用任务成功信号做 RL，nanoAstra 把真机示教改写成语义步骤做 SFT。</p>
   <p class="asks-h">读完能回答</p>
@@ -488,7 +488,7 @@
 </div>
 
 <!-- v4u:foot -->
-<footer class="v4u-foot"><div class="v4u-foot-in"><a class="pv" href="../coding-agent/"><span>上一篇</span>Coding Agent 的训练</a></div></footer>
+<footer class="v4u-foot"><div class="v4u-foot-in"><a class="pv" href="../coding-agent/"><span>上一篇</span>Coding Agent 的训练</a><a class="nx" href="../gpu-memory-flops/"><span>下一篇</span>训练的显存与算力账</a></div></footer>
 <!-- /v4u:foot -->
 
 <script>

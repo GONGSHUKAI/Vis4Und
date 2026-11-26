@@ -1,0 +1,834 @@
+<!doctype html>
+<html lang="zh-CN" data-sec="dist-train">
+<head>
+<!-- v4u:head -->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="icon" href="data:,">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700&family=Inter+Tight:wght@700&family=JetBrains+Mono:wght@400;700&family=Noto+Sans+SC:wght@400;700&display=swap">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<link rel="stylesheet" href="../../assets/v4u.css?v=691854ab">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
+<script src="../../assets/v4u.js?v=d6640e00"></script>
+<!-- /v4u:head -->
+<title>优化器：从 Adam 到 Muon · Vis4Und</title>
+<meta name="description" content="动量 SGD、Adam、AdamW 的更新规则与偏差修正，学习率调度与全局梯度裁剪，优化器状态的显存，Muon 的 Newton–Schulz 正交化、Moonlight 的 RMS 对齐、Kimi K2 的 QK-Clip，以及 ZeRO 切分下的分布式 Muon。">
+<style>
+.viz-ctrl .chk{gap:6px}
+.viz-ctrl .chk input{accent-color:var(--accent)}
+@media (max-width:760px){.tbl table.wide{min-width:640px}}
+.katex-display,.eq,.tbl{position:relative}
+</style>
+</head>
+<body>
+<!-- v4u:nav -->
+<nav class="v4u-nav" aria-label="站点导航"><div class="v4u-nav-in"><span class="v4u-crumb"><a href="../../"><b>Vis4Und</b></a><span class="v4u-sep">/</span><a href="../../#dist-train">(4) 分布式训练</a></span><span class="v4u-links"><a href="../gpu-memory-flops/">(i) 显存与算力</a><a href="../numerics/">(ii) 数值精度</a><a href="../collectives/">(iii) 集合通信</a><a href="../optimizers/" aria-current="page">(iv) 优化器</a><a href="../data-parallel/">(v) DP / ZeRO / FSDP</a><a href="../flash-attention/">(vi) FlashAttention</a><a href="../tp-pp/">(vii) TP / SP / PP</a><a href="../cp-ep/">(viii) CP / EP / 组合</a><button type="button" class="v4u-theme" aria-label="切换深浅色">深色</button></span></div></nav>
+<!-- /v4u:nav -->
+
+<header class="hero"><div class="wrap">
+  <p class="kicker">(4) 分布式训练 · (iv)</p>
+  <h1>优化器：从 Adam 到 Muon</h1>
+  <p class="lede">优化器决定怎样把梯度变成参数更新，也决定每个参数要额外存几份状态，后者正是 <a href="../data-parallel/#zero">ZeRO</a> 要切分的东西。这一页从动量 SGD 推到 Adam、AdamW，再到对整块矩阵做正交化的 Muon，以及把 Muon 放进千亿参数训练和 ZeRO 切分时要做的修改。</p>
+  <p class="asks-h">读完能回答</p>
+  <ul class="asks">
+    <li>损失乘以 10，SGD 和 Adam 的更新各变成多少？</li>
+    <li>AdamW 的权重衰减和在损失里加 L2 差在哪？</li>
+    <li>混合精度 AdamW 每个参数占几个字节，Muon 省下哪一份？</li>
+    <li>Muon 为什么把更新矩阵的奇异值都推到 1，五步 Newton–Schulz 怎么做到？</li>
+    <li>参数被 ZeRO 切开后，Muon 为什么要多一次 all-gather？</li>
+  </ul>
+</div></header>
+
+<div class="wrap layout">
+<nav class="toc" id="toc" aria-label="本页目录"></nav>
+<main>
+
+<!-- ============================== SGD ============================== -->
+<section id="sgd">
+  <h2>SGD 与动量</h2>
+  <p class="def"><b>随机梯度下降</b>（SGD）每步取一个 mini-batch 的梯度 $g_t$，沿负方向走 $\eta$ 倍：$\theta_t=\theta_{t-1}-\eta\,g_t$。</p>
+
+  <table class="notation">
+    <caption>记号</caption>
+    <thead><tr><th>符号</th><th>含义</th><th>形状</th></tr></thead>
+    <tbody>
+      <tr><td>$\theta_t$</td><td>第 $t$ 步更新后的参数</td><td>$\mathbb{R}^n$</td></tr>
+      <tr><td>$g_t$</td><td>第 $t$ 步 mini-batch 上的梯度</td><td>$\mathbb{R}^n$</td></tr>
+      <tr><td>$\eta$</td><td>学习率</td><td>标量</td></tr>
+      <tr><td>$\mu$</td><td>动量系数</td><td>标量，$[0,1)$</td></tr>
+      <tr><td>$m_t$</td><td>动量缓冲（梯度的指数累加）</td><td>$\mathbb{R}^n$</td></tr>
+      <tr><td>$H,\ \lambda_i$</td><td>二次损失的 Hessian 及其特征值</td><td>$n\times n$，标量</td></tr>
+      <tr><td>$\kappa$</td><td>条件数 $\lambda_{\max}/\lambda_{\min}$</td><td>标量</td></tr>
+    </tbody>
+  </table>
+
+  <p>在二次损失 $L=\tfrac12\theta^\top H\theta$ 上，梯度下降沿第 $i$ 个特征方向每步把误差乘以 $1-\eta\lambda_i$。稳定要求 $\eta \lt 2/\lambda_{\max}$，于是最平的方向每步最多缩小到 $1-2/\kappa$：条件数越大，平坦方向走得越慢。</p>
+
+  <h3>动量</h3>
+  <ol class="derive">
+    <li><p>heavy-ball 动量（Polyak, 1964）把过去的梯度指数累加，再用累加量更新：</p>$$m_t=\mu\,m_{t-1}+g_t,\quad \theta_t=\theta_{t-1}-\eta\,m_t$$</li>
+    <li><p>梯度恒为 $g$ 的平坦方向上，缓冲收敛到几何级数之和，有效学习率放大 $1/(1-\mu)$ 倍：</p>$$m_\infty=\sum_{k\ge 0}\mu^k g=\frac{g}{1-\mu}$$</li>
+    <li><p>陡峭方向的梯度正负交替，累加时互相抵消，振荡被压住。</p></li>
+    <li><p>二次损失上 $\eta,\mu$ 都取最优时，每步误差的收缩率从梯度下降的左式降到右式（$\kappa=100$：0.980 → 0.818）：</p>$$\frac{\kappa-1}{\kappa+1}\ \longrightarrow\ \frac{\sqrt\kappa-1}{\sqrt\kappa+1}$$</li>
+    <li><p>Nesterov 动量在「先按动量走一步」的位置看梯度。PyTorch 的等价写法：</p>$$\begin{gathered}m_t=\mu\,m_{t-1}+g_t\\ \theta_t=\theta_{t-1}-\eta\,(g_t+\mu\,m_t)\end{gathered}$$</li>
+  </ol>
+
+  <figure class="viz" id="viz-traj">
+    <div class="viz-h"><b>同一个病态二次损失，四种优化器各走 80 步</b><span>$\lambda_{\max}=1$，$\lambda_{\min}=1/\kappa$</span></div>
+    <div class="viz-stage"><canvas id="cv-traj" aria-label="椭圆等高线上四条优化轨迹"></canvas></div>
+    <div class="viz-ctrl">
+      <div class="seg" id="seg-rot"><button type="button" data-v="axis" aria-pressed="true">主轴沿坐标轴</button><button type="button" data-v="rot">主轴转 45°</button></div>
+      <label for="sl-kappa">κ <input type="range" id="sl-kappa" min="0.3" max="2.3" step="0.01" value="1.7"><output id="o-kappa">50</output></label>
+      <label for="sl-eta">η（SGD 系） <input type="range" id="sl-eta" min="0.1" max="2.1" step="0.01" value="0.6"><output id="o-eta">0.60</output></label>
+      <label for="sl-mu">μ <input type="range" id="sl-mu" min="0" max="0.95" step="0.01" value="0.8"><output id="o-mu">0.80</output></label>
+      <label for="sl-etaa">η（Adam） <input type="range" id="sl-etaa" min="0.005" max="0.2" step="0.005" value="0.05"><output id="o-etaa">0.050</output></label>
+      <button type="button" class="btn ghost" id="bt-traj">逐步播放</button>
+    </div>
+    <div class="viz-read" id="rd-traj"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>SGD</li><li><i style="background:var(--c2)"></i>heavy-ball 动量</li><li><i style="background:var(--c3)"></i>Nesterov</li><li><i style="background:var(--c4)"></i>Adam（β₁=0.9，β₂=0.999）</li></ul>
+    <figcaption>读数是 80 步后的 $L/L_0$。SGD 在平坦方向（长轴）上爬得慢；动量沿长轴积累速度。转到 45° 后，SGD 和两种动量的轨迹只是跟着整体旋转（它们对坐标旋转不变），Adam 的逐坐标归一化则依赖坐标轴，轨迹形状和读数都会变。</figcaption>
+  </figure>
+</section>
+
+<!-- ============================== Adam ============================== -->
+<section id="adam">
+  <h2>Adam：按坐标归一化的动量</h2>
+  <p class="def"><b>Adam</b>（Kingma &amp; Ba, 2015）给每个坐标分别维护梯度的一阶矩和二阶矩的指数平均，用二阶矩的平方根去除一阶矩，得到每个坐标自己的步长。</p>
+
+  <table class="notation">
+    <caption>记号（所有运算逐元素）</caption>
+    <thead><tr><th>符号</th><th>含义</th><th>形状</th></tr></thead>
+    <tbody>
+      <tr><td>$\beta_1,\ \beta_2$</td><td>一阶、二阶矩的衰减系数；平均窗口约 $1/(1-\beta)$ 步</td><td>标量</td></tr>
+      <tr><td>$m_t,\ v_t$</td><td>$g$ 与 $g^2$ 的指数平均，初值 0</td><td>$\mathbb{R}^n$</td></tr>
+      <tr><td>$\hat m_t,\ \hat v_t$</td><td>偏差修正后的矩</td><td>$\mathbb{R}^n$</td></tr>
+      <tr><td>$\epsilon$</td><td>防止除零的小常数，单位与梯度相同</td><td>标量</td></tr>
+    </tbody>
+  </table>
+
+  <div class="eq">$$\begin{aligned}m_t&=\beta_1 m_{t-1}+(1-\beta_1)\,g_t\\ v_t&=\beta_2 v_{t-1}+(1-\beta_2)\,g_t^2\\ \hat m_t&=\frac{m_t}{1-\beta_1^t},\qquad \hat v_t=\frac{v_t}{1-\beta_2^t}\\ \theta_t&=\theta_{t-1}-\eta\,\frac{\hat m_t}{\sqrt{\hat v_t}+\epsilon}\end{aligned}$$</div>
+
+  <h3>推导：偏差修正与有效步长</h3>
+  <ol class="derive">
+    <li><p>$m_0=0$，展开递推式，$m_t$ 是过去梯度的加权和：</p>$$m_t=(1-\beta_1)\sum_{i=1}^{t}\beta_1^{\,t-i}g_i$$</li>
+    <li><p>设梯度分布不随时间变，$\mathbb{E}[g_i]=\mathbb{E}[g]$，权重是有限项几何级数：</p>$$\begin{aligned}\mathbb{E}[m_t]&=\mathbb{E}[g]\,(1-\beta_1)\sum_{i=1}^{t}\beta_1^{\,t-i}\\&=\mathbb{E}[g]\,(1-\beta_1^t)\end{aligned}$$</li>
+    <li><p>除以 $1-\beta_1^t$ 就无偏；$v_t$ 同理除以 $1-\beta_2^t$。$t$ 小时修正量大，$t\gg 1/(1-\beta)$ 后趋于 1。</p>$$\mathbb{E}[\hat m_t]=\mathbb{E}[g],\qquad \mathbb{E}[\hat v_t]=\mathbb{E}[g^2]$$</li>
+    <li><p>坐标 $i$ 的梯度均值 $\mu_i$、标准差 $\sigma_i$ 时，$\hat m_i\approx\mu_i$，$\hat v_i\approx\mu_i^2+\sigma_i^2$，每步位移约为：</p>$$|\Delta\theta_i|\approx\eta\,\frac{|\mu_i|}{\sqrt{\mu_i^2+\sigma_i^2}}\ \le\ \eta$$<p>信号稳定的坐标走满 $\eta$，噪声大的坐标自动走小步。</p></li>
+    <li><p>梯度整体乘以 $c$，分子分母同乘 $|c|$，更新不变（忽略 $\epsilon$）：</p>$$g\to c\,g\ \Rightarrow\ \frac{\hat m}{\sqrt{\hat v}}\to\frac{c\,\hat m}{|c|\sqrt{\hat v}}=\operatorname{sign}(c)\frac{\hat m}{\sqrt{\hat v}}$$</li>
+  </ol>
+
+  <figure class="viz" id="viz-adam">
+    <div class="viz-h"><b>一个坐标上的 Adam：矩怎样跟踪带噪梯度</b><span>β₁ = 0.9，150 步</span></div>
+    <div class="viz-stage"><canvas id="cv-adam" aria-label="上图为梯度序列和两个矩，下图为每步更新与理论值"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="sl-gm">梯度均值 μ <input type="range" id="sl-gm" min="-1" max="1" step="0.05" value="0.3"><output id="o-gm">0.30</output></label>
+      <label for="sl-gs">噪声 σ <input type="range" id="sl-gs" min="0" max="2" step="0.05" value="1"><output id="o-gs">1.00</output></label>
+      <label for="sel-b2">β₂ <select id="sel-b2"><option value="0.95">0.95</option><option value="0.99">0.99</option><option value="0.999" selected>0.999</option></select></label>
+      <label class="chk" for="cb-bc"><input type="checkbox" id="cb-bc" checked>偏差修正</label>
+      <button type="button" class="btn ghost" id="bt-adam">换一组噪声</button>
+    </div>
+    <div class="viz-read" id="rd-adam"></div>
+    <ul class="chips"><li><i style="background:var(--muted)"></i>$g_t$</li><li><i style="background:var(--c1)"></i>$\hat m_t$</li><li><i style="background:var(--c2)"></i>$\pm\sqrt{\hat v_t}$</li><li><i style="background:var(--c3)"></i>$\hat m_t/\sqrt{\hat v_t}=-\Delta\theta_t/\eta$</li><li><i style="background:var(--c4)"></i>$\mu/\sqrt{\mu^2+\sigma^2}$</li></ul>
+    <figcaption>关掉偏差修正、β₂ = 0.999 时，第一步的 $m_1/\sqrt{v_1}=0.1/\sqrt{0.001}\approx3.2$：头几步步长是正常的 3 倍。打开修正后第一步恰好走 $\eta$。把 σ 调大，下图的曲线向 0 收缩：噪声大的坐标自动走小步。</figcaption>
+  </figure>
+
+  <div class="note"><b>LLM 上的常用值</b><p>GPT-3、LLaMA 都用 $\beta_1=0.9$、$\beta_2=0.95$、权重衰减 0.1、按全局范数 1.0 裁剪。$\beta_2=0.95$ 让 $v$ 只平均最近约 20 步，梯度尺度突变时分母跟得上，比默认的 0.999（约 1000 步）更不容易出现一步过大的更新。</p></div>
+  <div class="note pit"><b>易错</b><p>$\epsilon$ 和梯度同单位。若某些坐标的梯度 RMS 小到与 $\epsilon$ 同量级，分母被 $\epsilon$ 主导，这些坐标的更新变小，Adam 在这里退化成带动量的 SGD。损失被缩放过、或模型很大使单个梯度很小时要留意。</p></div>
+</section>
+
+<!-- ============================== AdamW ============================== -->
+<section id="adamw">
+  <h2>AdamW：把权重衰减从梯度里拿出来</h2>
+  <p class="def"><b>解耦权重衰减</b>（AdamW，Loshchilov &amp; Hutter, 2019）：衰减项不进入 $m,v$，直接作用在参数上：$\theta_t=\theta_{t-1}-\eta\big(\hat m_t/(\sqrt{\hat v_t}+\epsilon)+\lambda\,\theta_{t-1}\big)$。</p>
+
+  <ol class="derive">
+    <li><p>SGD 加 L2 正则 $\tfrac{\lambda}{2}\|\theta\|^2$，梯度变成 $g+\lambda\theta$，整理后正好是「每步把参数乘 $1-\eta\lambda$」：</p>$$\theta_t=(1-\eta\lambda)\,\theta_{t-1}-\eta\,g_t$$</li>
+    <li><p>Adam 加 L2：$\lambda\theta$ 进入 $m$ 和 $v$，再被 $\sqrt{\hat v}$ 除掉。只看衰减部分，坐标 $i$ 每步的收缩量：</p>$$\Delta\theta_i\approx-\eta\,\frac{\lambda\,\theta_i}{\sqrt{\hat v_i}}$$<p>梯度大的坐标衰减少，梯度小的衰减多，衰减强度跟梯度尺度绑在一起。</p></li>
+    <li><p>AdamW 让每个坐标按同一比例收缩。$(1-\eta\lambda)^k\approx e^{-\eta\lambda k}$，衰减的时间尺度是：</p>$$\tau_{\text{wd}}=\frac{1}{\eta\lambda}\ \text{步}$$</li>
+  </ol>
+
+  <figure class="viz" id="viz-wd">
+    <div class="viz-h"><b>两个参数只受噪声梯度和权重衰减：L2 与解耦衰减</b><span>η = 0.01，3000 步，θ₀ = 1</span></div>
+    <div class="viz-stage"><canvas id="cv-wd" aria-label="参数值随步数衰减的曲线"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="sl-sa">参数 A 的梯度噪声 σ_A <input type="range" id="sl-sa" min="-3" max="0" step="0.05" value="0"><output id="o-sa">1</output></label>
+      <label for="sl-sb">参数 B 的 σ_B <input type="range" id="sl-sb" min="-3" max="0" step="0.05" value="-2"><output id="o-sb">0.01</output></label>
+      <label for="sl-lam">λ <input type="range" id="sl-lam" min="0.01" max="0.3" step="0.01" value="0.1"><output id="o-lam">0.10</output></label>
+    </div>
+    <div class="viz-read" id="rd-wd"></div>
+    <ul class="chips"><li><i style="background:var(--c3)"></i>AdamW（A、B 相同）</li><li><i style="background:var(--c1)"></i>Adam + L2，参数 A</li><li><i style="background:var(--c2)"></i>Adam + L2，参数 B</li></ul>
+    <figcaption>梯度是均值 0 的噪声，画的是噪声平均后的期望轨迹：L2 版里 $\hat m\approx\lambda\theta$，$\hat v\approx\sigma^2+\lambda^2\theta^2$。梯度小的参数 B 每步几乎走满 $\eta$，很快被压到 0；梯度大的参数 A 衰减得和 AdamW 一样慢或更慢。AdamW 只由 $\eta\lambda$ 决定。</figcaption>
+  </figure>
+
+  <p>惯例上 bias 和归一化层的增益不做衰减。PyTorch 的 <code>torch.optim.AdamW</code> 把衰减乘了学习率（上式的 $\eta\lambda$），学习率调度因此也同时调了衰减强度。</p>
+</section>
+
+<!-- ============================== schedule ============================== -->
+<section id="schedule">
+  <h2>学习率调度与梯度裁剪</h2>
+
+  <h3>Warmup</h3>
+  <p>开头 $T_w$ 步把学习率从 0 线性升到 $\eta_{\max}$。刚开始参数离稳定区远，Adam 的 $\hat v$ 只平均了几步、估计噪声大，直接用大学习率容易发散。Goyal et al.（2017）用它把 ImageNet 训练的 batch 推到 8192。</p>
+
+  <h3>Cosine</h3>
+  <div class="eq">$$\eta_t=\eta_{\min}+\tfrac12(\eta_{\max}-\eta_{\min})\Big(1+\cos\frac{\pi\,(t-T_w)}{T-T_w}\Big)$$</div>
+  <p>其中 $T_w\le t\le T$。</p>
+  <p>曲线形状由总步数 $T$ 决定：要提前结束或续训，学习率曲线就对不上了。</p>
+
+  <h3>WSD（warmup – stable – decay）</h3>
+  <p>warmup 后保持 $\eta_{\max}$ 不变，只在最后一段（常为总步数的 10%–20%）快速降到很小（MiniCPM, 2024）。stable 段不依赖 $T$，所以可以从任一 stable 段 checkpoint 分出一条衰减支线，得到「在这里结束训练」的模型；续训也从 stable 段接着走。Hägele et al.（2024）显示衰减段足够长时，WSD 与 cosine 持平或更好。</p>
+
+  <figure class="viz" id="viz-lr">
+    <div class="viz-h"><b>cosine 与 WSD；在中途结束训练时各要多花多少</b><span>横轴：步数 / 原计划总步数 T</span></div>
+    <div class="viz-stage"><canvas id="cv-lr" aria-label="两条学习率曲线和两条提前结束的分支"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="sl-wu">warmup <input type="range" id="sl-wu" min="0" max="0.1" step="0.005" value="0.02"><output id="o-wu">2%</output></label>
+      <label for="sl-dec">WSD 衰减段 <input type="range" id="sl-dec" min="0.05" max="0.4" step="0.01" value="0.2"><output id="o-dec">20%</output></label>
+      <label for="sl-min">η_min / η_max <input type="range" id="sl-min" min="0" max="0.2" step="0.01" value="0.1"><output id="o-min">0.10</output></label>
+      <label for="sl-stop">在 s 处结束 <input type="range" id="sl-stop" min="0.2" max="0.7" step="0.01" value="0.5"><output id="o-stop">50%</output></label>
+    </div>
+    <div class="viz-read" id="rd-lr"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>cosine（实线：原计划；虚线：按 s 重新设计，要从头跑）</li><li><i style="background:var(--c2)"></i>WSD（实线：原计划；虚线：从 s 分出的衰减支线）</li></ul>
+    <figcaption>WSD 衰减段这里画成线性下降。拖动 s：cosine 在 s 处还没退火，想要一个「训练 s 步」的退火模型只能按新的总步数从头跑；WSD 只需从 s 处的 checkpoint 再跑一段衰减。</figcaption>
+  </figure>
+
+  <h3>梯度裁剪</h3>
+  <div class="eq">$$\hat g=g\cdot\min\!\Big(1,\ \frac{c}{\|g\|_2}\Big)$$</div>
+  <p>$\|g\|_2$ 是全模型所有参数拼在一起的范数。</p>
+  <p>分布式训练时每卡只有一部分梯度（<a href="../data-parallel/#zero">ZeRO</a> 切片、<a href="../tp-pp/#tp">张量并行</a>切块、<a href="../tp-pp/#pp">流水线</a>各段）。每卡先算本地平方和，<a href="../collectives/#primitives">all-reduce</a> 求和后开方，所有卡用同一个缩放系数，梯度方向不变：</p>
+  <div class="eq">$$\|g\|_2=\sqrt{\textstyle\sum_{r}\|g^{(r)}\|_2^2}$$</div>
+
+  <figure class="viz" id="viz-clip">
+    <div class="viz-h"><b>梯度分在 4 张卡上：全局裁剪与各卡各自裁剪</b><span>每卡 6 个分量</span></div>
+    <div class="viz-stage"><canvas id="cv-clip" aria-label="四组柱状图，浅色为原梯度，深色为裁剪后"></canvas></div>
+    <div class="viz-ctrl">
+      <div class="seg" id="seg-clip"><button type="button" data-v="global" aria-pressed="true">全局范数裁剪</button><button type="button" data-v="local">各卡用本地范数裁剪</button></div>
+      <label for="sl-spike">rank 1 梯度放大 <input type="range" id="sl-spike" min="1" max="20" step="0.5" value="6"><output id="o-spike">6×</output></label>
+      <label for="sl-c">阈值 c <input type="range" id="sl-c" min="0.5" max="6" step="0.1" value="2"><output id="o-c">2.0</output></label>
+    </div>
+    <div class="viz-read" id="rd-clip"></div>
+    <ul class="chips"><li><i style="background:var(--c1s);border:1px solid var(--c1)"></i>原梯度</li><li><i style="background:var(--c1)"></i>裁剪后</li></ul>
+    <figcaption>「各卡用本地范数裁剪」只缩了出尖峰的那张卡，各卡之间的比例被改掉，$\cos(\hat g,g)$ 小于 1，裁剪后的总范数也可能超过 $c$。</figcaption>
+  </figure>
+  <div class="note pit"><b>易错</b><p>被复制的参数只能算一次。张量并行里每个 TP rank 都存一份的 LayerNorm 增益，如果每个 rank 都把它计入平方和，全局范数偏大、裁剪过度。Megatron 按参数标记去重，只让一个 TP rank 计入。</p></div>
+</section>
+
+<!-- ============================== state memory ============================== -->
+<section id="state-memory">
+  <h2>优化器状态占多少显存</h2>
+  <p>每个参数除了权重本身，还要存梯度和优化器状态。混合精度 AdamW（BF16 权重与梯度，FP32 主权重、$m$、$v$，见<a href="../numerics/#mixed">混合精度</a>）每参数 $2+2+4+4+4=16$ 字节。激活另算，见<a href="../gpu-memory-flops/#memory">显存账</a>。</p>
+
+  <figure class="viz" id="viz-mem">
+    <div class="viz-h"><b>每参数字节数，以及换算到整个模型</b><span>GB = 10⁹ 字节，不含激活</span></div>
+    <div class="viz-stage"><canvas id="cv-mem" aria-label="各优化器每参数字节数的堆叠条"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="sl-n">参数量 N <input type="range" id="sl-n" min="9" max="12" step="0.005" value="9.845"><output id="o-n">7.0B</output></label>
+      <label for="sl-nd">ZeRO-1 卡数 $N_d$ <input type="range" id="sl-nd" min="0" max="10" step="1" value="3"><output id="o-nd">8</output></label>
+    </div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>权重</li><li><i style="background:var(--c2)"></i>梯度</li><li><i style="background:var(--c3)"></i>FP32 主权重</li><li><i style="background:var(--c4)"></i>一阶矩 / 动量</li><li><i style="background:var(--c5)"></i>二阶矩</li></ul>
+    <figcaption>每行右侧是整个模型的总量，以及（窄屏上斜杠后面的数） <a href="../data-parallel/#zero">ZeRO-1</a> 把主权重和优化器状态切到 $N_d$ 张卡后每卡的量（权重和梯度仍是全量）。「FP32 梯度」一行对应 Megatron 默认的 FP32 梯度累加缓冲：$2+4+12=18$ 字节。Adafactor 的分解二阶矩只有 $O(n+m)$，图里按 0 画。</figcaption>
+  </figure>
+
+  <p><b>8-bit Adam</b>（Dettmers et al., 2022）把 $m,v$ 分块量化到 8 bit，每块另存一个缩放系数，状态从 8 字节降到约 2 字节。</p>
+  <p><b>Adafactor</b>（Shazeer &amp; Stern, 2018）对矩阵参数 $W\in\mathbb{R}^{n\times m}$ 只存二阶矩的行和 $R\in\mathbb{R}^n$ 与列和 $C\in\mathbb{R}^m$，用秩 1 的 $\hat V=RC^\top/(\mathbf 1^\top R)$ 近似，状态从 $nm$ 降到 $n+m$，常同时去掉一阶矩。</p>
+  <div class="note"><b>和 ZeRO 的关系</b><p>16 字节里的 12 字节（主权重、$m$、$v$）只在 <code>optimizer.step()</code> 里用到，而且 AdamW 是逐元素的，任意切分后各卡独立更新自己那段即可。这就是 <a href="../data-parallel/#zero">ZeRO-1</a> 先切它们的原因。</p></div>
+</section>
+
+<!-- ============================== Muon ============================== -->
+<section id="muon">
+  <h2>Muon：把动量矩阵正交化</h2>
+  <p class="def"><b>Muon</b>（MomentUm Orthogonalized by Newton–Schulz，Jordan et al., 2024）只用于隐藏层的二维权重：先算动量 $M_t$，再把它换成最接近的正交矩阵 $UV^\top$（$M_t=U\Sigma V^\top$），用它更新 $W$。</p>
+
+  <table class="notation">
+    <caption>记号</caption>
+    <thead><tr><th>符号</th><th>含义</th><th>形状</th></tr></thead>
+    <tbody>
+      <tr><td>$W$</td><td>一层的权重，$A$ 行（输出维）× $B$ 列（输入维）</td><td>$A\times B$</td></tr>
+      <tr><td>$G_t,\ M_t$</td><td>梯度、动量</td><td>$A\times B$</td></tr>
+      <tr><td>$U\Sigma V^\top$</td><td>SVD，$r=\min(A,B)$，$\Sigma=\operatorname{diag}(\sigma_1\ge\dots\ge\sigma_r)$</td><td>$A\times r,\ r\times r,\ B\times r$</td></tr>
+      <tr><td>$O_t$</td><td>正交化后的更新，$\approx UV^\top$</td><td>$A\times B$</td></tr>
+      <tr><td>$\|\cdot\|_F,\ \|\cdot\|_2,\ \|\cdot\|_*$</td><td>Frobenius 范数 $\sqrt{\sum\sigma_i^2}$、谱范数 $\sigma_1$、核范数 $\sum\sigma_i$</td><td>标量</td></tr>
+      <tr><td>$\varphi(\sigma)$</td><td>Newton–Schulz 一步作用在奇异值上的多项式，系数 $(a,b,c)$</td><td>标量函数</td></tr>
+    </tbody>
+  </table>
+
+  <div class="eq">$$\begin{aligned}M_t&=\mu\,M_{t-1}+G_t\\ O_t&=\operatorname{NS}_5(M_t)\approx UV^\top\\ W_t&=W_{t-1}-\eta\,O_t\end{aligned}$$</div>
+  <p>原实现用 Nesterov 形式（对 $G_t+\mu M_t$ 正交化），$\mu=0.95$，并把 $O_t$ 乘以 $\sqrt{\max(1,A/B)}$。NS 前先除以 Frobenius 范数，所以动量写成累加形式还是 EMA 形式不影响结果。</p>
+
+  <h3>为什么是 $UV^\top$：谱范数约束下的最速下降</h3>
+  <ol class="derive">
+    <li><p>把损失在 $W$ 处线性化，限定更新的谱范数不超过 $\eta$，找下降最多的方向：</p>$$\begin{gathered}\min_{\|\Delta W\|_2\le\eta}\ \langle G,\Delta W\rangle\\ \langle G,\Delta W\rangle=\operatorname{tr}(G^\top\Delta W)\end{gathered}$$</li>
+    <li><p>代入 $G=\sum_i\sigma_i u_i v_i^\top$：</p>$$\langle G,\Delta W\rangle=\sum_i\sigma_i\,u_i^\top\Delta W\,v_i$$</li>
+    <li><p>$u_i,v_i$ 是单位向量，$|u_i^\top\Delta W v_i|\le\|\Delta W\|_2\le\eta$，所以：</p>$$\langle G,\Delta W\rangle\ \ge\ -\eta\sum_i\sigma_i=-\eta\,\|G\|_*$$</li>
+    <li><p>$\Delta W=-\eta UV^\top$ 让每一项都等于 $-\eta\sigma_i$，取到下界：</p>$$\Delta W^\star=-\eta\,UV^\top$$</li>
+  </ol>
+  <p>约束谱范数的理由：线性层 $y=Wx$ 的输出变化满足 $\|\Delta W x\|_2\le\|\Delta W\|_2\|x\|_2$，谱范数直接限制「这一步最多让输出变多少」（Bernstein &amp; Newhouse, 2024）。效果上，$UV^\top$ 把动量的所有奇异值换成 1：梯度里占主导的少数方向被压下去，很少出现的方向被抬到同样大小。</p>
+  <p>不做累积的 Shampoo（Gupta et al., 2018）给出同一个方向：$(GG^\top)^{-1/4}\,G\,(G^\top G)^{-1/4}=U\Sigma^{-1/2}\,\Sigma\,\Sigma^{-1/2}V^\top=UV^\top$。</p>
+
+  <figure class="viz" id="viz-spec">
+    <div class="viz-h"><b>24×48 的动量矩阵：正交化前后的奇异值</b><span>$\sigma_i\propto i^{-\alpha}$；都除以各自最大值；五次系数 5 步</span></div>
+    <div class="viz-stage"><canvas id="cv-spec" aria-label="奇异值柱状图，正交化前递减，正交化后接近 1"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="sl-alpha">衰减指数 α <input type="range" id="sl-alpha" min="0" max="2.5" step="0.05" value="1.2"><output id="o-alpha">1.20</output></label>
+      <button type="button" class="btn ghost" id="bt-spec">重新采样 U、V</button>
+    </div>
+    <div class="viz-read" id="rd-spec"></div>
+    <ul class="chips"><li><i style="background:var(--c2)"></i>动量 $M$ 的 $\sigma_i/\sigma_1$</li><li><i style="background:var(--c1)"></i>$\operatorname{NS}_5(M)$ 的 $\sigma_i/\sigma_1$</li><li><i style="background:var(--c3)"></i>精确 $UV^\top$（全为 1）</li></ul>
+    <figcaption>矩阵是真的按 $X\leftarrow aX+(bA+cA^2)X$ 迭代出来的，再用 Jacobi 法求奇异值。α 越大，原动量越被前几个方向主导；正交化后各方向的大小拉到同一量级。</figcaption>
+  </figure>
+
+  <h3>Newton–Schulz 迭代</h3>
+  <p>SVD 在 GPU 上慢且难以批量做；Newton–Schulz 只用矩阵乘法，能在 BF16 下稳定运行。</p>
+  <ol class="derive">
+    <li><p>先归一化。$\sigma_1\le\|M\|_F$，所以所有奇异值落进 $(0,1]$：</p>$$X_0=M/\|M\|_F$$</li>
+    <li><p>取奇多项式 $p(X)=aX+b(XX^\top)X+c(XX^\top)^2X$。由 $XX^\top X=U\Sigma^3V^\top$，奇异向量不动，每个奇异值各自过一遍 $\varphi$：</p>$$\begin{gathered}p(X)=U\,\varphi(\Sigma)\,V^\top\\ \varphi(\sigma)=a\sigma+b\sigma^3+c\sigma^5\end{gathered}$$</li>
+    <li><p>迭代 $k$ 次后奇异值是 $\varphi^{(k)}(\sigma)$，目标是让 $(0,1]$ 里的值都靠近 1。经典三次版 $(1.5,-0.5,0)$ 在 1 处二次收敛，但 0 附近斜率只有 1.5，小奇异值长得慢：</p>$$\varphi(\sigma)=1.5\sigma-0.5\sigma^3,\qquad \varphi'(0)=1.5$$</li>
+    <li><p>Jordan 的五次系数把 0 处斜率提到 3.4445，代价是不再收敛到恰好 1（$\varphi(1)=0.701$）。5 步后，初值在 $[0.01,1]$ 的奇异值都落进约 $[0.68,1.13]$；Jordan 报告这点误差不影响训练效果：</p>$$(a,b,c)=(3.4445,\ -4.7750,\ 2.0315)$$</li>
+    <li><p>先转置使 $A\le B$，每步 3 次矩阵乘。方阵 $n\times n$ 每步约 $6n^3$ FLOPs，$T$ 步与这层一个 batch（$B_{\text{tok}}$ 个 token）的训练 FLOPs $6n^2B_{\text{tok}}$（见 <a href="../gpu-memory-flops/#flops">6ND</a>）之比：</p>$$\frac{6Tn^3}{6n^2B_{\text{tok}}}=\frac{Tn}{B_{\text{tok}}}$$<p>$T=5$、$n=4096$、$B_{\text{tok}}=4\text{M}$ 时约 0.5%。</p></li>
+  </ol>
+
+  <figure class="viz" id="viz-ns">
+    <div class="viz-h"><b>一个 2×2 矩阵被 Newton–Schulz 一步步正交化</b><span>拖动 M 的两列</span></div>
+    <div class="viz-grid">
+      <div class="viz-stage"><canvas id="cv-ns" aria-label="单位圆、矩阵 X_k 把单位圆映成的椭圆，以及 X_k 的两列"></canvas></div>
+      <div class="viz-stage"><canvas id="cv-phi" aria-label="迭代多项式曲线与两个奇异值"></canvas></div>
+    </div>
+    <div class="viz-ctrl">
+      <div class="seg" id="seg-ns"><button type="button" data-v="q" aria-pressed="true">五次 (3.4445, −4.7750, 2.0315)</button><button type="button" data-v="c">三次 (1.5, −0.5, 0)</button></div>
+      <label for="sl-k">步数 k <input type="range" id="sl-k" min="0" max="8" step="1" value="5"><output id="o-k">5</output></label>
+      <button type="button" class="btn ghost" id="bt-ns">从 k = 0 播放</button>
+    </div>
+    <div class="viz-read" id="rd-ns"></div>
+    <ul class="chips"><li><i style="background:var(--c2)"></i>M 的两列（可拖动）</li><li><i style="background:var(--c1)"></i>$X_k$ 的两列与它把单位圆映成的椭圆</li><li><i style="background:var(--c3)"></i>目标 $UV^\top$ 的两列</li><li><i style="background:var(--line-2)"></i>单位圆 / $y=\sigma$</li></ul>
+    <figcaption>左：椭圆的两条半轴就是 $X_k$ 的两个奇异值，正交化就是把椭圆变成圆、两列变成互相垂直的单位向量。右：曲线是 $\varphi^{(k)}(\sigma)$，两个点是 $X_0$ 的奇异值在 $k$ 步后的位置。三次版要 8 步以上才把小奇异值抬起来；五次版 3–4 步就到 1 附近，然后在 0.7–1.2 之间来回。</figcaption>
+  </figure>
+
+<pre><code># 对应上面的推导：先归一化，再迭代 5 次（BF16 即可）
+def newton_schulz5(G, steps=5, eps=1e-7):
+    a, b, c = 3.4445, -4.7750, 2.0315
+    X = G.bfloat16()
+    if G.size(0) > G.size(1):
+        X = X.T                      # 让 A &lt;= B，XX^T 更小
+    X = X / (X.norm() + eps)         # 奇异值落进 (0, 1]
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * A @ A
+        X = a * X + B @ X            # 每个奇异值 σ -> aσ + bσ³ + cσ⁵
+    if G.size(0) > G.size(1):
+        X = X.T
+    return X</code></pre>
+  <p>Polar Express（Amsel et al., ICLR 2026）每一步换一组系数，按最坏情形误差最小化来选，比固定系数收敛得更快、更接近 1。</p>
+
+  <h3>哪些参数用 Muon</h3>
+  <p>只用于隐藏层的二维矩阵：attention 的 Q/K/V/O 投影和 MLP；卷积核展平成二维。embedding、LM head、归一化层增益和 bias 仍用 AdamW：embedding 是按 token 查表，不是对稠密输入的线性变换，谱范数的理由不成立；LM head 用 AdamW 是经验结论。Muon 只存一个动量缓冲，混合精度下每参数 12 字节，比 AdamW 少一份二阶矩。PyTorch 2.9 起内置 <code>torch.optim.Muon</code>，只接受二维参数。</p>
+</section>
+
+<!-- ============================== Muon at scale ============================== -->
+<section id="muon-scale">
+  <h2>Muon 用到大模型上</h2>
+
+  <h3>Moonlight：权重衰减 + 更新 RMS 对齐</h3>
+  <p>Liu et al.（2025）训练 Moonlight（16B 总参数、3B 激活的 MoE，5.7T token）时发现原版 Muon 放大后有两个问题：没有权重衰减，权重和层输出的 RMS 一直增长；不同形状矩阵的更新 RMS 不同，也和仍用 AdamW 的参数不在一个尺度上。</p>
+  <ol class="derive">
+    <li><p>满秩时 $O=UV^\top$，$U\in\mathbb{R}^{A\times r}$、$V\in\mathbb{R}^{B\times r}$ 列正交，$r=\min(A,B)$：</p>$$\|O\|_F^2=\operatorname{tr}(VU^\top UV^\top)=\operatorname{tr}(V^\top V)=r$$</li>
+    <li><p>RMS 是每个元素的均方根，只由矩阵形状决定：</p>$$\begin{aligned}\operatorname{RMS}(O)&=\sqrt{\frac{\|O\|_F^2}{AB}}=\sqrt{\frac{\min(A,B)}{AB}}\\&=\frac{1}{\sqrt{\max(A,B)}}\end{aligned}$$</li>
+    <li><p>乘上 $0.2\sqrt{\max(A,B)}$，任何形状的更新 RMS 都是 0.2；再加上 AdamW 式的解耦衰减：</p>$$\begin{gathered}\tilde O_t=0.2\sqrt{\max(A,B)}\;O_t\\ W_t=W_{t-1}-\eta_t\big(\tilde O_t+\lambda W_{t-1}\big)\end{gathered}$$</li>
+  </ol>
+  <p>0.2 取自 AdamW 更新 RMS 的典型值（Moonlight 观察到约 0.2–0.4），于是 Muon 参数可以直接沿用为 AdamW 调好的 $\eta$ 和 $\lambda$。论文报告在计算最优的训练设置下，Muon 的计算效率约为 AdamW 的 2 倍。PyTorch 的 <code>torch.optim.Muon</code> 用 <code>adjust_lr_fn="match_rms_adamw"</code> 实现这个缩放，默认的 <code>"original"</code> 对应 Jordan 的 $\sqrt{\max(1,A/B)}$。</p>
+
+  <h3>Kimi K2：QK-Clip</h3>
+  <p>Kimi K2（Kimi Team, 2025；1.04T 总参数、32B 激活的 MoE，15.5T token）用 Muon 预训练时，部分 attention 头的最大 logit $S_{\max}^h=\max_{i,j} q_i^\top k_j/\sqrt{d}$ 持续增长，可能引发 loss spike。QK-Clip 在每步更新之后检查各头的 $S_{\max}^h$，超过阈值 $\tau$ 就把这个头的 query、key 投影各缩 $\sqrt{\gamma_h}$：</p>
+  <div class="eq">$$\begin{gathered}\gamma_h=\min\!\Big(1,\ \frac{\tau}{S_{\max}^h}\Big)\\ W_q^h\leftarrow\sqrt{\gamma_h}\,W_q^h,\qquad W_k^h\leftarrow\sqrt{\gamma_h}\,W_k^h\end{gathered}$$</div>
+  <p>logit 对 $W_q$、$W_k$ 是双线性的，两边各乘 $\sqrt{\gamma_h}$，logit 正好乘 $\gamma_h$，最大值压回 $\tau$。只动超限的头，不改当前步的前向和反向。在 MLA 里，各头独有的 $q^C,k^C$ 各乘 $\sqrt{\gamma_h}$，rotary 部分只把 $q^R$ 乘 $\gamma_h$，各头共享的 $k^R$ 不动。K2 取 $\tau=100$，15.5T token 全程没有 loss spike。Muon（带 Moonlight 的两处修改）加 QK-Clip 合称 MuonClip。</p>
+  <p>截至 2026-11，用 Muon 做预训练的公开大模型还有 GLM-4.5（2025）。</p>
+</section>
+
+<!-- ============================== distributed Muon ============================== -->
+<section id="muon-dist">
+  <h2>分布式 Muon</h2>
+  <p>AdamW 逐元素更新：参数被 <a href="../data-parallel/#zero">ZeRO</a> 按扁平缓冲区随便切开，每卡更新自己那段即可。Muon 的 NS 要整块矩阵：$XX^\top$ 把所有行混在一起，只拿一段行做正交化，得到的是另一个矩阵。</p>
+  <ol class="derive">
+    <li><p>把 $M$ 按行切成 $p$ 块，每卡各自正交化，得到的每块行向量各自正交：</p>$$\begin{gathered}M=\begin{bmatrix}M_1\\ \vdots\\ M_p\end{bmatrix}\\ O_i=\operatorname{orth}(M_i),\qquad O_iO_i^\top=I\end{gathered}$$</li>
+    <li><p>拼起来的 $\tilde O$ 只有对角块是单位阵，交叉块 $O_iO_j^\top$ 一般不为 0：</p>$$\tilde O\tilde O^\top=\begin{bmatrix}I&O_1O_2^\top&\cdots\\ O_2O_1^\top&I&\cdots\\ \vdots&&\ddots\end{bmatrix}\ne I$$</li>
+    <li><p>各块的行空间越重合，交叉项越大；完全重合时 $\tilde O$ 的最大奇异值达到 $\sqrt{p}$，最小的接近 0。</p></li>
+  </ol>
+
+  <figure class="viz" id="viz-shard">
+    <div class="viz-h"><b>8×12 的动量按行切到 p 张卡：正交化结果的 $OO^\top$</b><span>正交矩阵的 $OO^\top$ 应是单位阵</span></div>
+    <div class="viz-stage"><canvas id="cv-shard" aria-label="两张 8×8 热力图，左为整块正交化的 OO^T，右为分块正交化后拼接的 OO^T"></canvas></div>
+    <div class="viz-ctrl">
+      <div class="seg" id="seg-p"><button type="button" data-v="1">p = 1</button><button type="button" data-v="2">p = 2</button><button type="button" data-v="4" aria-pressed="true">p = 4</button></div>
+      <button type="button" class="btn ghost" id="bt-shard">重新采样 M</button>
+    </div>
+    <div class="viz-read" id="rd-shard"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>正值</li><li><i style="background:var(--c2)"></i>负值（颜色深浅为绝对值，满色 = 1）</li><li><i style="background:var(--c5)"></i>卡与卡之间的切分线</li></ul>
+    <figcaption>$M$ 由两个主方向加小噪声构成，梯度矩阵常是这样低秩占优。两边都用 $\operatorname{NS}_5$，所以左图对角线不是严格的 1。右图的对角块接近单位阵，对角块之外的交叉项 $O_iO_j^\top$ 很大：拼起来的矩阵不再正交。$p=1$ 时两边相同。</figcaption>
+  </figure>
+
+  <h3>做法</h3>
+  <ul>
+    <li><b>聚合后重复计算</b>：Moonlight 的 Distributed Muon 建在 Megatron 的 ZeRO-1 上。梯度 reduce-scatter 后每卡更新自己那段动量，再在数据并行组内 <a href="../collectives/#primitives">all-gather</a> 拼出整块 $M$，每卡都算一遍 NS，只取自己那段更新。代价是一次额外的 all-gather 和组内重复的 NS 计算。</li>
+    <li><b>按矩阵分工</b>：把不同矩阵的 NS 分给不同 rank 算，算完再 all-gather 回去，去掉重复计算。</li>
+    <li><b>张量并行</b>：被 <a href="../tp-pp/#tp">TP</a> 切开的矩阵同样要先在 TP 组内拼起来再正交化。</li>
+    <li><b>换算法</b>：Dion（Ahn et al., 2025）用低秩的正交化更新，可以直接在 FSDP / TP 切分下计算。</li>
+  </ul>
+</section>
+
+<!-- ============================== quiz ============================== -->
+<section id="quiz">
+  <h2>自测</h2>
+  <details class="q"><summary>带偏差修正的 Adam，第一步每个坐标走多远？</summary><div><p>$\hat m_1=g_1$，$\hat v_1=g_1^2$，所以 $\Delta\theta=-\eta\,g_1/|g_1|$：每个坐标都走 $\eta$，方向是梯度符号，等于一步 sign descent（忽略 $\epsilon$）。</p></div></details>
+  <details class="q"><summary>把损失乘以 10，SGD 和 Adam 的更新各变成多少？</summary><div><p>SGD 的更新变成 10 倍，等于学习率乘 10。Adam 的 $\hat m$ 和 $\sqrt{\hat v}$ 同乘 10，更新不变（只要梯度远大于 $\epsilon$）。</p></div></details>
+  <details class="q"><summary>在 SGD 里加 L2 和用解耦衰减等价吗？在 Adam 里呢？</summary><div><p>SGD 里等价：都是每步乘 $1-\eta\lambda$。Adam 里不等价：L2 项被 $\sqrt{\hat v}$ 除，梯度大的参数衰减少、梯度小的衰减多；AdamW 对所有参数按同一比例 $1-\eta\lambda$ 收缩。</p></div></details>
+  <details class="q"><summary>7B 模型用混合精度 AdamW，权重、梯度和优化器状态共多少显存？用 8 卡 ZeRO-1 后每卡多少？</summary><div><p>$7\times10^9\times16=112$ GB。ZeRO-1 只切 12 字节的主权重与 $m,v$：每卡 $7\times10^9\times(4+12/8)=38.5$ GB，再加激活。</p></div></details>
+  <details class="q"><summary>NS 迭代前为什么要除以 Frobenius 范数，而不是谱范数？</summary><div><p>迭代只在奇异值位于 $(0,1]$ 附近时把它们推向 1，需要先保证 $\sigma_1\le1$。$\sigma_1\le\|M\|_F$，而 Frobenius 范数只要一次逐元素求和，谱范数要额外迭代。副作用是小奇异值被压得更小，所以要用 0 处斜率大的系数。</p></div></details>
+  <details class="q"><summary>为什么 embedding 和 LM head 不用 Muon？</summary><div><p>Muon 的理由是线性层对稠密输入的谱范数约束；embedding 的输入是 one-hot，做的是查表，每次只有出现过的 token 那几行有梯度，这个几何不成立。LM head 用 AdamW 是 Jordan 和 Moonlight 的经验结论。</p></div></details>
+  <details class="q"><summary>ZeRO-1 下用 Muon，为什么比 AdamW 多一次通信？</summary><div><p>ZeRO-1 让每卡只更新自己那段扁平参数，AdamW 逐元素更新不需要别人的数据；Muon 要整块矩阵做 NS，所以先在数据并行组内 all-gather 动量，正交化后再取回自己那段。</p></div></details>
+  <details class="q"><summary>WSD 比 cosine 方便在哪？</summary><div><p>stable 段的学习率与总步数无关：任一 stable 段 checkpoint 都可以接一段短衰减得到可用模型，也可以直接续训；cosine 的曲线由总步数决定，改总步数就得从头重跑。</p></div></details>
+</section>
+
+<!-- ============================== refs ============================== -->
+<section id="refs">
+  <h2>延伸阅读</h2>
+  <ol class="refs">
+    <li><b>Sutskever, Martens, Dahl, Hinton, On the importance of initialization and momentum in deep learning</b>, ICML 2013. <a href="https://proceedings.mlr.press/v28/sutskever13.html">PMLR</a></li>
+    <li><b>Kingma &amp; Ba, Adam: A Method for Stochastic Optimization</b>, ICLR 2015. <a href="https://arxiv.org/abs/1412.6980">arXiv:1412.6980</a></li>
+    <li><b>Loshchilov &amp; Hutter, Decoupled Weight Decay Regularization</b>, ICLR 2019. <a href="https://arxiv.org/abs/1711.05101">arXiv:1711.05101</a></li>
+    <li><b>Loshchilov &amp; Hutter, SGDR: Stochastic Gradient Descent with Warm Restarts</b>, ICLR 2017. <a href="https://arxiv.org/abs/1608.03983">arXiv:1608.03983</a></li>
+    <li><b>Goyal et al., Accurate, Large Minibatch SGD: Training ImageNet in 1 Hour</b>, 2017. <a href="https://arxiv.org/abs/1706.02677">arXiv:1706.02677</a></li>
+    <li><b>Hu et al., MiniCPM: Unveiling the Potential of Small Language Models with Scalable Training Strategies</b>, 2024（WSD）. <a href="https://arxiv.org/abs/2404.06395">arXiv:2404.06395</a></li>
+    <li><b>Hägele et al., Scaling Laws and Compute-Optimal Training Beyond Fixed Training Durations</b>, NeurIPS 2024. <a href="https://arxiv.org/abs/2405.18392">arXiv:2405.18392</a></li>
+    <li><b>Pascanu, Mikolov, Bengio, On the difficulty of training recurrent neural networks</b>, ICML 2013（梯度裁剪）. <a href="https://arxiv.org/abs/1211.5063">arXiv:1211.5063</a></li>
+    <li><b>Shazeer &amp; Stern, Adafactor: Adaptive Learning Rates with Sublinear Memory Cost</b>, ICML 2018. <a href="https://arxiv.org/abs/1804.04235">arXiv:1804.04235</a></li>
+    <li><b>Dettmers et al., 8-bit Optimizers via Block-wise Quantization</b>, ICLR 2022. <a href="https://arxiv.org/abs/2110.02861">arXiv:2110.02861</a></li>
+    <li><b>Gupta, Koren, Singer, Shampoo: Preconditioned Stochastic Tensor Optimization</b>, ICML 2018. <a href="https://arxiv.org/abs/1802.09568">arXiv:1802.09568</a></li>
+    <li><b>Jordan et al., Muon: An optimizer for hidden layers in neural networks</b>, 博客, 2024. <a href="https://kellerjordan.github.io/posts/muon/">kellerjordan.github.io/posts/muon</a>；代码 <a href="https://github.com/KellerJordan/Muon">github.com/KellerJordan/Muon</a></li>
+    <li><b>Bernstein &amp; Newhouse, Old Optimizer, New Norm: An Anthology</b>, NeurIPS 2024 OPT Workshop. <a href="https://arxiv.org/abs/2409.20325">arXiv:2409.20325</a></li>
+    <li><b>Liu et al., Muon is Scalable for LLM Training</b>（Moonlight）, 2025. <a href="https://arxiv.org/abs/2502.16982">arXiv:2502.16982</a>；代码 <a href="https://github.com/MoonshotAI/Moonlight">github.com/MoonshotAI/Moonlight</a></li>
+    <li><b>Kimi Team, Kimi K2: Open Agentic Intelligence</b>, 2025（MuonClip）. <a href="https://arxiv.org/abs/2507.20534">arXiv:2507.20534</a></li>
+    <li><b>GLM-4.5 Team, GLM-4.5: Agentic, Reasoning, and Coding (ARC) Foundation Models</b>, 2025. <a href="https://arxiv.org/abs/2508.06471">arXiv:2508.06471</a></li>
+    <li><b>Amsel, Persson, Musco, Gower, The Polar Express: Optimal Matrix Sign Methods and Their Application to the Muon Algorithm</b>, ICLR 2026. <a href="https://arxiv.org/abs/2505.16932">arXiv:2505.16932</a></li>
+    <li><b>Ahn et al., Dion: Distributed Orthonormalized Updates</b>, 2025. <a href="https://arxiv.org/abs/2504.05295">arXiv:2504.05295</a></li>
+  </ol>
+</section>
+
+</main>
+</div>
+
+<!-- v4u:foot -->
+<footer class="v4u-foot"><div class="v4u-foot-in"><a class="pv" href="../collectives/"><span>上一篇</span>集合通信</a><a class="nx" href="../data-parallel/"><span>下一篇</span>数据并行：DDP、ZeRO 与 FSDP</a></div></footer>
+<!-- /v4u:foot -->
+
+<script>
+V4U.ready(() => {
+  const $ = (id) => document.getElementById(id);
+  const C = (n) => V4U.css(n);
+  const mono = (px) => px + 'px ' + C('--f-mono');
+  const rng = (seed) => { let a = seed >>> 0; return () => { a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; };
+  const gauss = (r) => { let u = 0; while (u === 0) u = r(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * r()); };
+  const line = (ctx, pts, col, wd, dash) => { ctx.strokeStyle = col; ctx.lineWidth = wd || 1.5; ctx.setLineDash(dash || []); ctx.beginPath(); pts.forEach((p, i) => (i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]))); ctx.stroke(); ctx.setLineDash([]); };
+  const arrow = (ctx, x0, y0, x1, y1, col, wd) => {
+    ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = wd; ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+    const a = Math.atan2(y1 - y0, x1 - x0), L = 5 + wd * 2;
+    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x1 - L * Math.cos(a - 0.4), y1 - L * Math.sin(a - 0.4)); ctx.lineTo(x1 - L * Math.cos(a + 0.4), y1 - L * Math.sin(a + 0.4)); ctx.closePath(); ctx.fill();
+  };
+  const still = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const sci = (x) => (!isFinite(x) ? '发散' : x === 0 ? '0' : x.toExponential(1));
+
+  /* ---------- small dense linear algebra ---------- */
+  const LA = {
+    zeros: (r, c) => Array.from({ length: r }, () => new Float64Array(c)),
+    T: (A) => { const r = A.length, c = A[0].length, B = LA.zeros(c, r); for (let i = 0; i < r; i++) for (let j = 0; j < c; j++) B[j][i] = A[i][j]; return B; },
+    mul: (A, B) => { const r = A.length, k = B.length, c = B[0].length, Cm = LA.zeros(r, c); for (let i = 0; i < r; i++) { const Ai = A[i], Ci = Cm[i]; for (let t = 0; t < k; t++) { const a = Ai[t]; if (!a) continue; const Bt = B[t]; for (let j = 0; j < c; j++) Ci[j] += a * Bt[j]; } } return Cm; },
+    lin: (s, A, t, B) => A.map((row, i) => row.map((v, j) => s * v + t * B[i][j])),
+    fro: (A) => Math.sqrt(A.reduce((s, row) => s + row.reduce((u, v) => u + v * v, 0), 0)),
+    ns: (G, coef, steps) => {
+      const [a, b, c] = coef; const tr = G.length > G[0].length; let X = tr ? LA.T(G) : G.map((r) => Float64Array.from(r));
+      const n = LA.fro(X) + 1e-7; X = X.map((r) => r.map((v) => v / n));
+      for (let s = 0; s < steps; s++) { const A = LA.mul(X, LA.T(X)); const B = LA.lin(b, A, c, LA.mul(A, A)); X = LA.lin(a, X, 1, LA.mul(B, X)); }
+      return tr ? LA.T(X) : X;
+    },
+    symEig: (S) => {
+      const n = S.length, A = S.map((r) => Float64Array.from(r));
+      for (let sweep = 0; sweep < 80; sweep++) {
+        let off = 0; for (let p = 0; p < n; p++) for (let q = p + 1; q < n; q++) off += A[p][q] * A[p][q];
+        if (off < 1e-22) break;
+        for (let p = 0; p < n; p++) for (let q = p + 1; q < n; q++) {
+          const apq = A[p][q]; if (Math.abs(apq) < 1e-300) continue;
+          const th = (A[q][q] - A[p][p]) / (2 * apq), t = (th >= 0 ? 1 : -1) / (Math.abs(th) + Math.sqrt(th * th + 1));
+          const c = 1 / Math.sqrt(t * t + 1), s = t * c;
+          for (let k = 0; k < n; k++) { const akp = A[k][p], akq = A[k][q]; A[k][p] = c * akp - s * akq; A[k][q] = s * akp + c * akq; }
+          for (let k = 0; k < n; k++) { const apk = A[p][k], aqk = A[q][k]; A[p][k] = c * apk - s * aqk; A[q][k] = s * apk + c * aqk; }
+        }
+      }
+      return Array.from({ length: n }, (_, i) => A[i][i]).sort((x, y) => y - x);
+    },
+    sv: (X) => LA.symEig(X.length <= X[0].length ? LA.mul(X, LA.T(X)) : LA.mul(LA.T(X), X)).map((l) => Math.sqrt(Math.max(0, l))),
+    randOrth: (n, k, r) => { // n×k with orthonormal columns
+      const Q = LA.zeros(n, k);
+      for (let j = 0; j < k; j++) {
+        const v = new Float64Array(n); for (let i = 0; i < n; i++) v[i] = gauss(r);
+        for (let q = 0; q < j; q++) { let d = 0; for (let i = 0; i < n; i++) d += v[i] * Q[i][q]; for (let i = 0; i < n; i++) v[i] -= d * Q[i][q]; }
+        let nv = 0; for (let i = 0; i < n; i++) nv += v[i] * v[i]; nv = Math.sqrt(nv);
+        for (let i = 0; i < n; i++) Q[i][j] = v[i] / nv;
+      }
+      return Q;
+    },
+  };
+  const COEF = { q: [3.4445, -4.7750, 2.0315], c: [1.5, -0.5, 0] };
+
+  /* ---------- 1. trajectories on an ill-conditioned quadratic ---------- */
+  (() => {
+    const cv = $('cv-traj'), sK = $('sl-kappa'), sE = $('sl-eta'), sM = $('sl-mu'), sA = $('sl-etaa'), rd = $('rd-traj');
+    const K = 80; let rot = 0, shown = K, redraw = () => {};
+    const names = ['SGD', '动量', 'Nesterov', 'Adam'], cols = ['--c1', '--c2', '--c3', '--c4'];
+    V4U.seg($('seg-rot'), (v) => { rot = v === 'rot' ? Math.PI / 4 : 0; redraw(); });
+    const sim = () => {
+      const kap = Math.pow(10, +sK.value), eta = +sE.value, mu = +sM.value, ea = +sA.value;
+      const l1 = 1 / kap, l2 = 1, c = Math.cos(rot), s = Math.sin(rot);
+      const uv = (p) => [c * p[0] + s * p[1], -s * p[0] + c * p[1]];
+      const L = (p) => { const [u, v] = uv(p); return 0.5 * (l1 * u * u + l2 * v * v); };
+      const G = (p) => { const [u, v] = uv(p); const gu = l1 * u, gv = l2 * v; return [c * gu - s * gv, s * gu + c * gv]; };
+      const x0 = [-1.6 * c - 0.7 * s, -1.6 * s + 0.7 * c];
+      const paths = [];
+      for (let o = 0; o < 4; o++) {
+        let p = x0.slice(), m = [0, 0], v = [0, 0]; const P = [p.slice()]; let dead = false;
+        for (let t = 1; t <= K; t++) {
+          const g = G(p);
+          for (let i = 0; i < 2; i++) {
+            if (o === 0) p[i] -= eta * g[i];
+            else if (o === 1) { m[i] = mu * m[i] + g[i]; p[i] -= eta * m[i]; }
+            else if (o === 2) { m[i] = mu * m[i] + g[i]; p[i] -= eta * (g[i] + mu * m[i]); }
+            else { m[i] = 0.9 * m[i] + 0.1 * g[i]; v[i] = 0.999 * v[i] + 0.001 * g[i] * g[i]; const mh = m[i] / (1 - 0.9 ** t), vh = v[i] / (1 - 0.999 ** t); p[i] -= ea * mh / (Math.sqrt(vh) + 1e-8); }
+          }
+          if (!(Math.abs(p[0]) < 1e3 && Math.abs(p[1]) < 1e3)) { dead = true; break; }
+          P.push(p.slice());
+        }
+        paths.push({ P, dead, r: dead ? Infinity : L(P[P.length - 1]) / L(x0) });
+      }
+      return { paths, L0: L(x0), l1, l2, x0 };
+    };
+    redraw = V4U.canvas(cv, (w) => Math.min(340, Math.max(220, w * 0.55)), (ctx, w, h) => {
+      const S = sim(); $('o-kappa').textContent = Math.round(Math.pow(10, +sK.value)); $('o-eta').textContent = V4U.fmt(+sE.value); $('o-mu').textContent = V4U.fmt(+sM.value); $('o-etaa').textContent = V4U.fmt(+sA.value, 3);
+      const sc = Math.min(w / 2.6, h / 2.0), cx = S.x0[0] / 2, cy = S.x0[1] / 2, ox = w / 2 - sc * cx, oy = h / 2 + sc * cy, X = (p) => [ox + sc * p[0], oy - sc * p[1]];
+      // contours
+      ctx.strokeStyle = C('--line-2'); ctx.lineWidth = 1;
+      for (let k = 0; k < 9; k++) { const Lk = S.L0 * Math.pow(0.32, k); ctx.beginPath(); ctx.ellipse(ox, oy, sc * Math.sqrt(2 * Lk / S.l1), sc * Math.sqrt(2 * Lk / S.l2), -rot, 0, 2 * Math.PI); ctx.stroke(); }
+      ctx.fillStyle = C('--ink'); ctx.beginPath(); ctx.arc(ox, oy, 3, 0, 2 * Math.PI); ctx.fill();
+      S.paths.forEach((pa, o) => {
+        const col = C(cols[o]), pts = pa.P.slice(0, shown + 1).map(X);
+        line(ctx, pts, col, 1.8);
+        ctx.fillStyle = col; pts.forEach((q) => { ctx.beginPath(); ctx.arc(q[0], q[1], 2.1, 0, 2 * Math.PI); ctx.fill(); });
+      });
+      const s0 = X(S.x0); ctx.strokeStyle = C('--ink'); ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(s0[0], s0[1], 5, 0, 2 * Math.PI); ctx.stroke();
+      ctx.fillStyle = C('--muted'); ctx.font = mono(12); ctx.fillText('t = ' + Math.min(shown, K), 8, 16);
+      rd.innerHTML = S.paths.map((pa, o) => `<span>${names[o]} L/L₀ = <b>${sci(pa.r)}</b></span>`).join('');
+    });
+    [sK, sE, sM, sA].forEach((el) => el.addEventListener('input', () => { shown = K; redraw(); }));
+    let anim = null;
+    $('bt-traj').addEventListener('click', (e) => {
+      if (anim) { anim.stop(); anim = null; e.target.textContent = '逐步播放'; shown = K; redraw(); return; }
+      if (still()) return;
+      shown = 0; e.target.textContent = '停止'; let acc = 0;
+      anim = V4U.loop(cv, (t, dt) => { acc += dt * 20; shown = Math.min(K, Math.floor(acc)); redraw(); if (shown >= K) { anim && anim.stop(); anim = null; e.target.textContent = '逐步播放'; } });
+    });
+  })();
+
+  /* ---------- 2. Adam on one coordinate ---------- */
+  (() => {
+    const cv = $('cv-adam'), sm = $('sl-gm'), ss = $('sl-gs'), sb = $('sel-b2'), cb = $('cb-bc'), rd = $('rd-adam');
+    const T = 150, b1 = 0.9; let seed = 11, z = [];
+    const resample = () => { const r = rng(seed); z = Array.from({ length: T }, () => gauss(r)); };
+    resample();
+    const redraw = V4U.canvas(cv, (w) => (w < 500 ? 300 : 320), (ctx, w, h) => {
+      const mu = +sm.value, sg = +ss.value, b2 = +sb.value, bc = cb.checked;
+      $('o-gm').textContent = V4U.fmt(mu); $('o-gs').textContent = V4U.fmt(sg);
+      let m = 0, v = 0; const G = [], MH = [], VH = [], U = [];
+      for (let t = 1; t <= T; t++) {
+        const g = mu + sg * z[t - 1]; m = b1 * m + (1 - b1) * g; v = b2 * v + (1 - b2) * g * g;
+        const mh = bc ? m / (1 - b1 ** t) : m, vh = bc ? v / (1 - b2 ** t) : v;
+        G.push(g); MH.push(mh); VH.push(Math.sqrt(vh)); U.push(mh / (Math.sqrt(vh) + 1e-8));
+      }
+      const pl = 36, pr = 10, X = (t) => pl + (w - pl - pr) * (t / (T - 1));
+      const top = [8, h * 0.52 - 8], bot = [h * 0.52 + 8, h - 20];
+      const ym1 = Math.max(0.5, ...G.map(Math.abs), ...VH) * 1.05, ym2 = Math.max(1.2, ...U.map(Math.abs)) * 1.05;
+      const Y1 = (y) => (top[0] + top[1]) / 2 - (y / ym1) * (top[1] - top[0]) / 2, Y2 = (y) => (bot[0] + bot[1]) / 2 - (y / ym2) * (bot[1] - bot[0]) / 2;
+      ctx.font = mono(11); ctx.fillStyle = C('--muted'); ctx.textAlign = 'right';
+      [[Y1, ym1], [Y2, ym2]].forEach(([Y, ym]) => {
+        line(ctx, [[pl, Y(0)], [w - pr, Y(0)]], C('--line-2'), 1);
+        [ym / 1.05, -ym / 1.05].forEach((tv) => ctx.fillText(V4U.fmt(tv, 1), pl - 4, Y(tv) + 4));
+      });
+      line(ctx, [[pl, Y2(1)], [w - pr, Y2(1)]], C('--line'), 1, [2, 3]); line(ctx, [[pl, Y2(-1)], [w - pr, Y2(-1)]], C('--line'), 1, [2, 3]);
+      ctx.textAlign = 'center'; [0, 50, 100, 149].forEach((t) => ctx.fillText(t + 1, X(t), h - 5)); ctx.textAlign = 'left';
+      ctx.fillStyle = C('--muted'); G.forEach((g, t) => { ctx.beginPath(); ctx.arc(X(t), Y1(g), 1.8, 0, 2 * Math.PI); ctx.fill(); });
+      line(ctx, VH.map((s, t) => [X(t), Y1(s)]), C('--c2'), 1.6); line(ctx, VH.map((s, t) => [X(t), Y1(-s)]), C('--c2'), 1.6);
+      line(ctx, MH.map((s, t) => [X(t), Y1(s)]), C('--c1'), 2);
+      const th = sg === 0 && mu === 0 ? 0 : mu / Math.sqrt(mu * mu + sg * sg);
+      line(ctx, [[pl, Y2(th)], [w - pr, Y2(th)]], C('--c4'), 1.5, [6, 4]);
+      line(ctx, U.map((s, t) => [X(t), Y2(s)]), C('--c3'), 2);
+      const tail = U.slice(-50).reduce((s, x) => s + x, 0) / 50;
+      rd.innerHTML = `<span>第 1 步 |Δθ|/η = <b>${V4U.fmt(Math.abs(U[0]))}</b></span><span>后 50 步平均 m̂/√v̂ = <b>${V4U.fmt(tail)}</b></span><span>μ/√(μ²+σ²) = <b>${V4U.fmt(th)}</b></span>`;
+    });
+    [sm, ss].forEach((el) => el.addEventListener('input', redraw)); [sb, cb].forEach((el) => el.addEventListener('change', redraw));
+    $('bt-adam').addEventListener('click', () => { seed += 1; resample(); redraw(); });
+  })();
+
+  /* ---------- 3. L2 vs decoupled weight decay (expected trajectories) ---------- */
+  (() => {
+    const cv = $('cv-wd'), sa = $('sl-sa'), sb = $('sl-sb'), sl = $('sl-lam'), rd = $('rd-wd');
+    const T = 3000, eta = 0.01;
+    const pow10 = (x) => Math.pow(10, x), f = (x) => (x >= 0.1 ? V4U.fmt(x, 2) : x >= 0.001 ? x.toPrecision(2) : x.toExponential(0));
+    const redraw = V4U.canvas(cv, (w) => (w < 500 ? 240 : 270), (ctx, w, h) => {
+      const sA = pow10(+sa.value), sB = pow10(+sb.value), lam = +sl.value;
+      $('o-sa').textContent = f(sA); $('o-sb').textContent = f(sB); $('o-lam').textContent = V4U.fmt(lam);
+      const traj = (sig, mode) => { let th = 1; const out = [1]; for (let t = 1; t <= T; t++) { th -= mode ? eta * lam * th : eta * lam * th / (Math.sqrt(sig * sig + lam * lam * th * th) + 1e-8); if (th < 0) th = 0; out.push(th); } return out; };
+      const W = traj(0, 1), A = traj(sA, 0), B = traj(sB, 0);
+      const pl = 34, pr = 10, pt = 10, pb = 22, X = (t) => pl + (w - pl - pr) * t / T, Y = (y) => pt + (h - pt - pb) * (1 - y);
+      ctx.font = mono(11); ctx.fillStyle = C('--muted'); ctx.textAlign = 'right';
+      [0, 0.5, 1].forEach((y) => { line(ctx, [[pl, Y(y)], [w - pr, Y(y)]], C('--line'), 1); ctx.fillText(V4U.fmt(y, 1), pl - 4, Y(y) + 4); });
+      ctx.textAlign = 'center'; [0, 1000, 2000, 3000].forEach((t) => ctx.fillText(t, X(t), h - 6)); ctx.textAlign = 'left';
+      const pts = (arr) => arr.map((y, t) => [X(t), Y(y)]).filter((_, t) => t % 5 === 0 || t === T);
+      line(ctx, pts(W), C('--c3'), 2.6); line(ctx, pts(A), C('--c1'), 2, [7, 4]); line(ctx, pts(B), C('--c2'), 2, [7, 4]);
+      const half = (arr) => { const i = arr.findIndex((y) => y <= 0.5); return i < 0 ? '> 3000' : i; };
+      rd.innerHTML = `<span>AdamW：θ₃₀₀₀ = <b>${f(W[T])}</b>，半衰 <b>${half(W)}</b> 步</span><span>L2·A：θ₃₀₀₀ = <b>${f(A[T])}</b>，半衰 <b>${half(A)}</b> 步</span><span>L2·B：θ₃₀₀₀ = <b>${f(B[T])}</b>，半衰 <b>${half(B)}</b> 步</span>`;
+    });
+    [sa, sb, sl].forEach((el) => el.addEventListener('input', redraw));
+  })();
+
+  /* ---------- 4. LR schedules ---------- */
+  (() => {
+    const cv = $('cv-lr'), sw = $('sl-wu'), sd = $('sl-dec'), sn = $('sl-min'), ss = $('sl-stop'), rd = $('rd-lr');
+    const cosv = (t, wu, mn) => (t < wu ? t / wu : mn + 0.5 * (1 - mn) * (1 + Math.cos(Math.PI * Math.min(1, (t - wu) / (1 - wu)))));
+    const wsd = (t, wu, dec, mn) => (t < wu ? t / wu : t < 1 - dec ? 1 : 1 - (1 - mn) * Math.min(1, (t - (1 - dec)) / dec));
+    const redraw = V4U.canvas(cv, (w) => (w < 500 ? 240 : 270), (ctx, w, h) => {
+      const wu = +sw.value, dec = +sd.value, mn = +sn.value, s = +ss.value;
+      $('o-wu').textContent = Math.round(wu * 1000) / 10 + '%'; $('o-dec').textContent = Math.round(dec * 100) + '%'; $('o-min').textContent = V4U.fmt(mn); $('o-stop').textContent = Math.round(s * 100) + '%';
+      const xmax = 1.05, pl = 46, pr = 12, pt = 12, pb = 22, X = (t) => pl + (w - pl - pr) * t / xmax, Y = (y) => pt + (h - pt - pb) * (1 - y / 1.08);
+      ctx.font = mono(11); ctx.fillStyle = C('--muted'); ctx.textAlign = 'right';
+      line(ctx, [[pl, Y(0)], [w - pr, Y(0)]], C('--line-2'), 1); line(ctx, [[pl, Y(1)], [w - pr, Y(1)]], C('--line'), 1);
+      ctx.fillText('η_max', pl - 4, Y(1) + 4); ctx.fillText('0', pl - 4, Y(0) + 4);
+      ctx.textAlign = 'center'; [[0, '0'], [0.5, '0.5T'], [1, 'T']].forEach(([t, l]) => ctx.fillText(l, X(t), h - 6)); ctx.textAlign = 'left';
+      const N = 400, curve = (fn, a, b) => Array.from({ length: N + 1 }, (_, i) => { const t = a + (b - a) * i / N; return [X(t), Y(fn(t))]; });
+      line(ctx, curve((t) => cosv(t, wu, mn), 0, 1), C('--c1'), 2.2);
+      line(ctx, curve((t) => wsd(t, wu, dec, mn), 0, 1), C('--c2'), 2.2);
+      // branches at s
+      line(ctx, [[X(s), Y(0)], [X(s), Y(1.06)]], C('--ink-2'), 1, [3, 3]);
+      line(ctx, curve((t) => cosv(t / s, wu, mn), 0, s), C('--c1'), 1.6, [6, 4]);
+      const e = s * (1 + dec);
+      line(ctx, curve((t) => 1 - (1 - mn) * (t - s) / (s * dec), s, e), C('--c2'), 1.8, [6, 4]);
+      ctx.fillStyle = C('--ink'); ctx.beginPath(); ctx.arc(X(s), Y(wsd(s, wu, dec, mn)), 4, 0, 2 * Math.PI); ctx.fill();
+      ctx.fillStyle = C('--muted'); ctx.textAlign = 'center'; ctx.fillText('s', X(s), Y(1.06) - 1); ctx.textAlign = 'left';
+      rd.innerHTML = `<span>s 处 cosine：η/η_max = <b>${V4U.fmt(cosv(s, wu, mn))}</b>（未退火）</span><span>cosine 要按 s 重跑：<b>${Math.round(s * 100)}%</b> T</span><span>WSD 支线：再走 <b>${Math.round(s * dec * 100)}%</b> T</span>`;
+    });
+    [sw, sd, sn, ss].forEach((el) => el.addEventListener('input', redraw));
+  })();
+
+  /* ---------- 5. global vs local gradient clipping ---------- */
+  (() => {
+    const cv = $('cv-clip'), sp = $('sl-spike'), sc = $('sl-c'), rd = $('rd-clip');
+    const r = rng(5), base = Array.from({ length: 4 }, () => Array.from({ length: 6 }, () => 0.35 * gauss(r)));
+    let mode = 'global', redraw = () => {};
+    V4U.seg($('seg-clip'), (v) => { mode = v; redraw(); });
+    redraw = V4U.canvas(cv, (w) => (w < 500 ? 220 : 240), (ctx, w, h) => {
+      const spike = +sp.value, c = +sc.value; $('o-spike').textContent = spike + '×'; $('o-c').textContent = V4U.fmt(c, 1);
+      const g = base.map((row, k) => row.map((x) => x * (k === 1 ? spike : 1)));
+      const nr = g.map((row) => Math.sqrt(row.reduce((s, x) => s + x * x, 0))), ng = Math.sqrt(nr.reduce((s, x) => s + x * x, 0));
+      const sc_ = mode === 'global' ? nr.map(() => Math.min(1, c / ng)) : nr.map((n) => Math.min(1, c / n));
+      const hat = g.map((row, k) => row.map((x) => x * sc_[k]));
+      const nh = Math.sqrt(hat.flat().reduce((s, x) => s + x * x, 0)), dot = g.flat().reduce((s, x, i) => s + x * hat.flat()[i], 0);
+      const pt = 10, pb = 36, gap = 14, gw = (w - gap * 5) / 4, hi = Math.max(0.1, ...g.flat()) * 1.05, lo = Math.min(-0.1, ...g.flat()) * 1.05, Y = (y) => pt + (h - pt - pb) * (hi - y) / (hi - lo), mid = Y(0);
+      const cols = ['--c1', '--c2', '--c3', '--c4'];
+      for (let k = 0; k < 4; k++) {
+        const x0 = gap + k * (gw + gap), bw = gw / 6;
+        line(ctx, [[x0, mid], [x0 + gw, mid]], C('--line-2'), 1);
+        for (let j = 0; j < 6; j++) {
+          const bx = x0 + j * bw + bw * 0.15, bwi = bw * 0.7;
+          ctx.fillStyle = C(cols[k] + 's'); ctx.strokeStyle = C(cols[k]); ctx.lineWidth = 1;
+          const y0 = Y(g[k][j]); ctx.fillRect(bx, Math.min(y0, mid), bwi, Math.abs(y0 - mid)); ctx.strokeRect(bx, Math.min(y0, mid), bwi, Math.abs(y0 - mid));
+          const y1 = Y(hat[k][j]); ctx.fillStyle = C(cols[k]); ctx.fillRect(bx + bwi * 0.2, Math.min(y1, mid), bwi * 0.6, Math.abs(y1 - mid));
+        }
+        ctx.fillStyle = C('--ink-2'); ctx.font = mono(11); ctx.textAlign = 'center';
+        ctx.fillText('rank ' + k, x0 + gw / 2, h - 20); ctx.fillStyle = C('--muted'); ctx.fillText('‖g‖=' + V4U.fmt(nr[k]), x0 + gw / 2, h - 6); ctx.textAlign = 'left';
+      }
+      const fac = mode === 'global' ? `<b>${V4U.fmt(sc_[0])}</b>（所有卡）` : sc_.map((s) => `<b>${V4U.fmt(s)}</b>`).join(' / ');
+      rd.innerHTML = `<span>全局 ‖g‖ = <b>${V4U.fmt(ng)}</b></span><span>缩放系数 ${fac}</span><span>裁剪后 ‖ĝ‖ = <b>${V4U.fmt(nh)}</b></span><span>cos(ĝ, g) = <b>${V4U.fmt(dot / (ng * nh), 3)}</b></span>`;
+    });
+    [sp, sc].forEach((el) => el.addEventListener('input', redraw));
+  })();
+
+  /* ---------- 6. bytes per parameter ---------- */
+  (() => {
+    const cv = $('cv-mem'), sn = $('sl-n'), sd = $('sl-nd');
+    const rows = [
+      ['SGD + 动量（纯 FP32）', [4, 4, 0, 4, 0]],
+      ['AdamW（纯 FP32）', [4, 4, 0, 4, 4]],
+      ['AdamW 混合精度', [2, 2, 4, 4, 4]],
+      ['AdamW 混合精度，FP32 梯度', [2, 4, 4, 4, 4]],
+      ['8-bit AdamW 混合精度', [2, 2, 4, 1, 1]],
+      ['Adafactor 混合精度（无一阶矩）', [2, 2, 4, 0, 0]],
+      ['Muon 混合精度', [2, 2, 4, 4, 0]],
+    ];
+    const cols = ['--c1', '--c2', '--c3', '--c4', '--c5'];
+    const fN = (n) => (n >= 1e12 ? V4U.fmt(n / 1e12, 1) + 'T' : n >= 1e11 ? Math.round(n / 1e9) + 'B' : V4U.fmt(n / 1e9, 1) + 'B');
+    const fG = (g) => (g >= 1000 ? V4U.fmt(g / 1000, 1) + ' TB' : g >= 100 ? Math.round(g) + ' GB' : V4U.fmt(g, 1) + ' GB');
+    const rh = 50;
+    const redraw = V4U.canvas(cv, () => rows.length * rh + 6, (ctx, w) => {
+      const N = Math.pow(10, +sn.value), Nd = Math.pow(2, +sd.value);
+      $('o-n').textContent = fN(N); $('o-nd').textContent = Nd;
+      const unit = (w - 40) / 18;
+      rows.forEach(([name, b], i) => {
+        const y = i * rh + 4, tot = b.reduce((s, x) => s + x, 0), z1 = (b[0] + b[1] + (b[2] + b[3] + b[4]) / Nd) * N / 1e9;
+        ctx.font = '13px ' + C('--f-body'); ctx.fillStyle = C('--ink'); ctx.textAlign = 'left'; ctx.fillText(name, 0, y + 13);
+        ctx.font = mono(11.5); ctx.fillStyle = C('--ink-2'); ctx.textAlign = 'right';
+        const right = `${fG(tot * N / 1e9)} · ZeRO-1 每卡 ${fG(z1)}`;
+        const nameW = (ctx.font = '13px ' + C('--f-body'), ctx.measureText(name).width); ctx.font = mono(11.5);
+        if (w >= 600 && nameW + ctx.measureText(right).width + 16 < w) ctx.fillText(right, w, y + 13); else ctx.fillText(`${fG(tot * N / 1e9)} / ${fG(z1)}`, w, y + 13);
+        let x = 0;
+        b.forEach((v, k) => { if (!v) return; ctx.fillStyle = C(cols[k]); ctx.fillRect(x, y + 20, v * unit - 1.5, 16); x += v * unit; });
+        ctx.textAlign = 'left'; ctx.fillStyle = C('--ink'); ctx.font = mono(12); ctx.fillText(tot + ' B', x + 6, y + 33);
+      });
+    });
+    [sn, sd].forEach((el) => el.addEventListener('input', redraw));
+  })();
+
+  /* ---------- 7. spectrum before / after NS5 ---------- */
+  (() => {
+    const cv = $('cv-spec'), sa = $('sl-alpha'), rd = $('rd-spec');
+    const A = 24, B = 48; let seed = 3, U, V;
+    const resample = () => { const r = rng(seed); U = LA.randOrth(A, A, r); V = LA.randOrth(B, A, r); };
+    resample();
+    const redraw = V4U.canvas(cv, (w) => (w < 500 ? 220 : 250), (ctx, w, h) => {
+      const al = +sa.value; $('o-alpha').textContent = V4U.fmt(al);
+      const s = Array.from({ length: A }, (_, i) => Math.pow(i + 1, -al));
+      const US = U.map((row) => row.map((x, j) => x * s[j]));
+      const M = LA.mul(US, LA.T(V));
+      const O = LA.ns(M, COEF.q, 5);
+      const sm = LA.sv(M), so = LA.sv(O);
+      const nm = sm.map((x) => x / sm[0]), no = so.map((x) => x / so[0]);
+      const pl = 30, pr = 8, pt = 8, pb = 20, gw = (w - pl - pr) / A, Y = (y) => pt + (h - pt - pb) * (1 - y / 1.05);
+      ctx.font = mono(11); ctx.fillStyle = C('--muted'); ctx.textAlign = 'right';
+      [0, 0.5, 1].forEach((y) => { line(ctx, [[pl, Y(y)], [w - pr, Y(y)]], C('--line'), 1); ctx.fillText(V4U.fmt(y, 1), pl - 4, Y(y) + 4); });
+      ctx.textAlign = 'center'; [1, 8, 16, 24].forEach((i) => ctx.fillText(i, pl + gw * (i - 0.5), h - 5)); ctx.textAlign = 'left';
+      for (let i = 0; i < A; i++) {
+        const x = pl + i * gw; ctx.fillStyle = C('--c2'); ctx.fillRect(x + gw * 0.12, Y(nm[i]), gw * 0.36, Y(0) - Y(nm[i]));
+        ctx.fillStyle = C('--c1'); ctx.fillRect(x + gw * 0.52, Y(no[i]), gw * 0.36, Y(0) - Y(no[i]));
+      }
+      line(ctx, [[pl, Y(1)], [w - pr, Y(1)]], C('--c3'), 1.5, [6, 4]);
+      const share = (a) => a[0] * a[0] / a.reduce((t, x) => t + x * x, 0);
+      rd.innerHTML = `<span>最大方向占的能量 σ₁²/Σσ²：M <b>${Math.round(share(sm) * 100)}%</b> → NS₅(M) <b>${Math.round(share(so) * 100)}%</b></span><span>NS₅(M) 的奇异值 ∈ [<b>${V4U.fmt(so[A - 1])}</b>, <b>${V4U.fmt(so[0])}</b>]</span>`;
+    });
+    sa.addEventListener('input', redraw);
+    $('bt-spec').addEventListener('click', () => { seed += 1; resample(); redraw(); });
+  })();
+
+  /* ---------- 8. 2×2 Newton–Schulz ---------- */
+  (() => {
+    const cv = $('cv-ns'), cp = $('cv-phi'), sk = $('sl-k'), rd = $('rd-ns');
+    let coef = COEF.q, cols = [[1.1, 0.25], [0.8, 0.55]], drag = -1, redrawAll = () => {};
+    const mat = () => [[cols[0][0], cols[1][0]], [cols[0][1], cols[1][1]]];
+    const step = (X, [a, b, c]) => { const A = LA.mul(X, LA.T(X)); const Bm = LA.lin(b, A, c, LA.mul(A, A)); return LA.lin(a, X, 1, LA.mul(Bm, X)); };
+    const svd2 = (X) => { // singular values and polar factor of 2×2
+      const S = LA.mul(LA.T(X), X), p = S[0][0], q = S[0][1], r = S[1][1];
+      const m = (p + r) / 2, d = Math.sqrt(((p - r) / 2) ** 2 + q * q), l1 = m + d, l2 = Math.max(0, m - d);
+      const th = 0.5 * Math.atan2(2 * q, p - r), c = Math.cos(th), s = Math.sin(th);
+      const i1 = 1 / Math.sqrt(Math.max(l1, 1e-12)), i2 = 1 / Math.sqrt(Math.max(l2, 1e-12));
+      const Sih = [[c * c * i1 + s * s * i2, c * s * (i1 - i2)], [c * s * (i1 - i2), s * s * i1 + c * c * i2]];
+      return { s: [Math.sqrt(l1), Math.sqrt(l2)], Q: LA.mul(X, Sih) };
+    };
+    const state = () => {
+      const M = mat(), n = LA.fro(M) + 1e-12; let X = M.map((r) => r.map((v) => v / n)); const X0 = X;
+      for (let i = 0; i < +sk.value; i++) X = step(X, coef);
+      return { M, X0, X, s0: svd2(X0).s, sk: svd2(X).s, Q: svd2(X0).Q };
+    };
+    const geo = (w, h) => { const sc = Math.min(w, h) / 3.2; return { sc, ox: w / 2, oy: h / 2 }; };
+    const rL = V4U.canvas(cv, (w) => Math.min(300, Math.max(230, w * 0.8)), (ctx, w, h) => {
+      const S = state(), { sc, ox, oy } = geo(w, h), P = (x, y) => [ox + sc * x, oy - sc * y];
+      ctx.strokeStyle = C('--line-2'); ctx.setLineDash([4, 4]); ctx.lineWidth = 1; ctx.beginPath(); ctx.arc(ox, oy, sc, 0, 2 * Math.PI); ctx.stroke(); ctx.setLineDash([]);
+      line(ctx, [[ox - sc * 1.5, oy], [ox + sc * 1.5, oy]], C('--line'), 1); line(ctx, [[ox, oy - sc * 1.5], [ox, oy + sc * 1.5]], C('--line'), 1);
+      // ellipse X(unit circle)
+      const X = S.X, pts = Array.from({ length: 121 }, (_, i) => { const t = i / 120 * 2 * Math.PI, c = Math.cos(t), s = Math.sin(t); return P(X[0][0] * c + X[0][1] * s, X[1][0] * c + X[1][1] * s); });
+      ctx.fillStyle = C('--c1s'); ctx.beginPath(); pts.forEach((p, i) => (i ? ctx.lineTo(...p) : ctx.moveTo(...p))); ctx.closePath(); ctx.fill(); line(ctx, pts, C('--c1'), 1.6);
+      // target UV^T columns
+      for (let j = 0; j < 2; j++) { const e = P(S.Q[0][j], S.Q[1][j]); line(ctx, [[ox, oy], e], C('--c3'), 2, [5, 4]); }
+      // X_k columns
+      for (let j = 0; j < 2; j++) { const e = P(X[0][j], X[1][j]); arrow(ctx, ox, oy, e[0], e[1], C('--c1'), 2.6); }
+      // M columns (draggable)
+      for (let j = 0; j < 2; j++) { const e = P(cols[j][0], cols[j][1]); arrow(ctx, ox, oy, e[0], e[1], C('--c2'), 1.2); ctx.fillStyle = C('--c2'); ctx.beginPath(); ctx.arc(e[0], e[1], 7, 0, 2 * Math.PI); ctx.fill(); ctx.fillStyle = C('--ink-2'); ctx.font = mono(12); ctx.fillText('m' + (j + 1), e[0] + 9, e[1] - 8); }
+    });
+    const rR = V4U.canvas(cp, (w) => Math.min(300, Math.max(230, w * 0.8)), (ctx, w, h) => {
+      const S = state(), k = +sk.value, pl = 34, pr = 10, pt = 10, pb = 22, X = (x) => pl + (w - pl - pr) * x, Y = (y) => pt + (h - pt - pb) * (1 - y / 1.3);
+      ctx.font = mono(11); ctx.fillStyle = C('--muted'); ctx.textAlign = 'right';
+      [0, 0.5, 1].forEach((y) => { line(ctx, [[pl, Y(y)], [w - pr, Y(y)]], C('--line'), 1); ctx.fillText(V4U.fmt(y, 1), pl - 4, Y(y) + 4); });
+      ctx.textAlign = 'center'; [0, 0.5, 1].forEach((x) => ctx.fillText(V4U.fmt(x, 1), X(x), h - 6)); ctx.textAlign = 'left';
+      line(ctx, [[X(0), Y(0)], [X(1), Y(1)]], C('--line-2'), 1, [4, 4]);
+      line(ctx, [[X(0), Y(1)], [X(1), Y(1)]], C('--c3'), 1.4, [6, 4]);
+      const phi = (x) => coef[0] * x + coef[1] * x ** 3 + coef[2] * x ** 5, it = (x) => { for (let i = 0; i < k; i++) x = phi(x); return x; };
+      line(ctx, Array.from({ length: 301 }, (_, i) => { const x = i / 300; return [X(x), Y(Math.min(1.3, Math.max(0, it(x))))]; }), C('--c1'), 2);
+      S.s0.forEach((s, i) => { ctx.fillStyle = C('--c1'); ctx.strokeStyle = C('--surface'); ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(X(s), Y(Math.min(1.3, S.sk[i])), 6, 0, 2 * Math.PI); ctx.fill(); ctx.stroke(); ctx.fillStyle = C('--ink-2'); ctx.font = mono(12); const lx = X(s) > w - 40 ? X(s) - 26 : X(s) + 8; ctx.fillText('σ' + (i + 1), lx, Y(Math.min(1.3, S.sk[i])) + (S.sk[i] > 1.1 ? 16 : -8)); });
+    });
+    redrawAll = () => {
+      $('o-k').textContent = sk.value; rL(); rR();
+      const S = state(), err = LA.fro(LA.lin(1, S.X, -1, S.Q));
+      rd.innerHTML = `<span>X₀ 的奇异值 (<b>${V4U.fmt(S.s0[0])}</b>, <b>${V4U.fmt(S.s0[1])}</b>)</span><span>X_k 的奇异值 (<b>${V4U.fmt(S.sk[0])}</b>, <b>${V4U.fmt(S.sk[1])}</b>)</span><span>‖X_k − UVᵀ‖_F = <b>${V4U.fmt(err, 3)}</b></span>`;
+    };
+    V4U.seg($('seg-ns'), (v) => { coef = COEF[v]; redrawAll(); });
+    sk.addEventListener('input', redrawAll);
+    V4U.drag(cv, (x, y, ph) => {
+      const w = cv.clientWidth, h = cv.clientHeight, { sc, ox, oy } = geo(w, h), wx = (x - ox) / sc, wy = (oy - y) / sc;
+      if (ph === 'down') { const d = cols.map((c) => Math.hypot(c[0] - wx, c[1] - wy)); drag = d[0] < d[1] ? 0 : 1; if (d[drag] * sc > 40) drag = -1; }
+      if (drag >= 0 && ph !== 'up') { cols[drag] = [V4U.clamp(wx, -1.45, 1.45), V4U.clamp(wy, -1.45, 1.45)]; redrawAll(); }
+      if (ph === 'up') drag = -1;
+    });
+    let anim = null;
+    $('bt-ns').addEventListener('click', (e) => {
+      if (anim) { anim.stop(); anim = null; e.target.textContent = '从 k = 0 播放'; return; }
+      if (still()) return;
+      sk.value = 0; redrawAll(); e.target.textContent = '停止'; let acc = 0;
+      anim = V4U.loop(cv, (t, dt) => { acc += dt; const k = Math.min(+sk.max, Math.floor(acc / 0.7)); if (k !== +sk.value) { sk.value = k; redrawAll(); } if (k >= 6) { anim && anim.stop(); anim = null; e.target.textContent = '从 k = 0 播放'; } });
+    });
+    redrawAll();
+  })();
+
+  /* ---------- 9. sharded vs full orthogonalization ---------- */
+  (() => {
+    const cv = $('cv-shard'), rd = $('rd-shard');
+    const R = 8, Cc = 12; let seed = 21, M, p = 4, redraw = () => {};
+    const resample = () => {
+      const r = rng(seed), u = LA.randOrth(R, 2, r), v = LA.randOrth(Cc, 2, r);
+      M = LA.zeros(R, Cc);
+      for (let i = 0; i < R; i++) for (let j = 0; j < Cc; j++) M[i][j] = 3 * u[i][0] * v[j][0] + 1.6 * u[i][1] * v[j][1] + 0.12 * gauss(r);
+    };
+    resample();
+    V4U.seg($('seg-p'), (v) => { p = +v; redraw(); });
+    const cellOf = (w) => (w < 520 ? Math.min(30, (w - 24) / 16) : Math.min(32, (w - 80) / 16));
+    redraw = V4U.canvas(cv, (w) => R * cellOf(w) + 34, (ctx, w, h) => {
+      const Of = LA.ns(M, COEF.q, 5), rows = R / p; let Os = [];
+      for (let b = 0; b < p; b++) Os = Os.concat(LA.ns(M.slice(b * rows, (b + 1) * rows), COEF.q, 5));
+      const cell = cellOf(w), gw = cell * R, gap = Math.max(24, (w - 2 * gw) / 3), y0 = 24;
+      const pos = [(w - 2 * gw - gap) / 2, (w - 2 * gw - gap) / 2 + gw + gap];
+      const labels = ['整块：O Oᵀ', `分块拼接：Õ Õᵀ，p = ${p}`];
+      [Of, Os].forEach((O, g) => {
+        const Gm = LA.mul(O, LA.T(O)), x0 = pos[g];
+        ctx.fillStyle = C('--ink-2'); ctx.font = (w < 520 ? '12px ' : '13px ') + C('--f-body'); ctx.fillText(labels[g], x0, y0 - 8);
+        for (let i = 0; i < R; i++) for (let j = 0; j < R; j++) {
+          const v = Gm[i][j]; ctx.fillStyle = C(v >= 0 ? '--c1' : '--c2'); ctx.globalAlpha = Math.min(1, Math.abs(v));
+          ctx.fillRect(x0 + j * cell + 0.5, y0 + i * cell + 0.5, cell - 1, cell - 1);
+        }
+        ctx.globalAlpha = 1; ctx.strokeStyle = C('--line-2'); ctx.lineWidth = 1; ctx.strokeRect(x0, y0, gw, gw);
+        if (g === 1) for (let b = 1; b < p; b++) {
+          line(ctx, [[x0 - 4, y0 + b * rows * cell], [x0 + gw + 4, y0 + b * rows * cell]], C('--c5'), 1.5);
+          line(ctx, [[x0 + b * rows * cell, y0 - 4], [x0 + b * rows * cell, y0 + gw + 4]], C('--c5'), 1.5);
+        }
+      });
+      const sf = LA.sv(Of), ss = LA.sv(Os), diff = LA.fro(LA.lin(1, Os, -1, Of)) / LA.fro(Of);
+      rd.innerHTML = `<span>整块 O：σ ∈ [<b>${V4U.fmt(sf[R - 1])}</b>, <b>${V4U.fmt(sf[0])}</b>]</span><span>分块拼接 Õ：σ ∈ [<b>${V4U.fmt(ss[R - 1])}</b>, <b>${V4U.fmt(ss[0])}</b>]</span><span>‖Õ − O‖_F / ‖O‖_F = <b>${V4U.fmt(diff)}</b></span>`;
+    });
+    $('bt-shard').addEventListener('click', () => { seed += 1; resample(); redraw(); });
+  })();
+});
+</script>
+</body>
+</html>

@@ -52,7 +52,7 @@ def load():
 
 
 def label(p):
-    return "补充" if p.get("extra") else f"({p['no']})"
+    return f"({p['no']})"
 
 
 def head_block(rel):
@@ -174,11 +174,10 @@ def build_home(cat, secs):
     for s in cat["sections"]:
         rows = []
         for p in [q for q in cat["pages"] if q["section"] == s["id"]]:
-            tag = '<span class="tag">补充</span>' if p.get("extra") else ""
             rows.append(
                 f'<li><a href="pages/{esc(p["slug"])}/">'
                 f'<span class="no">{esc(label(p))}</span>'
-                f'<span class="body"><b>{esc(p["title"])}</b>{tag}<i>{esc(p["en"])}</i>'
+                f'<span class="body"><b>{esc(p["title"])}</b><i>{esc(p["en"])}</i>'
                 f'<span class="sum">{esc(p["summary"])}</span></span></a></li>'
             )
         blocks.append(

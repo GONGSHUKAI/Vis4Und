@@ -8,6 +8,7 @@
   --acc-robotics:#D4410B; --acc-robotics-soft:#FBE4D9;
   --acc-3d:#0A7F68; --acc-3d-soft:#D5EFE8;
   --acc-rl:#7239C9; --acc-rl-soft:#E9DFFA;
+  --acc-dist:#1B5BD0; --acc-dist-soft:#DCE8FB;
   --accent:#12151A; --accent-soft:#ECEEF2; --on-accent:#FFFFFF;
   /* categorical colours for diagrams (use in this order) + soft fills */
   --c1:#1B5BD0; --c1s:#DCE8FB;
@@ -29,6 +30,7 @@
     --acc-robotics:#FF8A5C; --acc-robotics-soft:#3A2015;
     --acc-3d:#4FCBB0; --acc-3d-soft:#11302A;
     --acc-rl:#B693FF; --acc-rl-soft:#281C42;
+    --acc-dist:#7DA9FF; --acc-dist-soft:#17253F;
     --accent:#E9ECF1; --accent-soft:#20242B; --on-accent:#0F1114;
     --c1:#7DA9FF; --c1s:#17253F;
     --c2:#FF8A5C; --c2s:#3A2015;
@@ -45,6 +47,7 @@
   --acc-robotics:#FF8A5C; --acc-robotics-soft:#3A2015;
   --acc-3d:#4FCBB0; --acc-3d-soft:#11302A;
   --acc-rl:#B693FF; --acc-rl-soft:#281C42;
+  --acc-dist:#7DA9FF; --acc-dist-soft:#17253F;
   --accent:#E9ECF1; --accent-soft:#20242B; --on-accent:#0F1114;
   --c1:#7DA9FF; --c1s:#17253F;
   --c2:#FF8A5C; --c2s:#3A2015;
@@ -54,9 +57,10 @@
   --c6:#FF7FA8; --c6s:#3B1626;
   --ok:#62C98A; --ok-soft:#14301F; --bad:#FF7B7B; --bad-soft:#3A1717; --warn:#E6B84A; --warn-soft:#352A0E;
 }
-html[data-sec="robotics"]{--accent:var(--acc-robotics);--accent-soft:var(--acc-robotics-soft)}
-html[data-sec="vision3d"]{--accent:var(--acc-3d);--accent-soft:var(--acc-3d-soft)}
-html[data-sec="agentic-rl"]{--accent:var(--acc-rl);--accent-soft:var(--acc-rl-soft)}
+:root[data-sec="robotics"]{--accent:var(--acc-robotics);--accent-soft:var(--acc-robotics-soft)}
+:root[data-sec="vision3d"]{--accent:var(--acc-3d);--accent-soft:var(--acc-3d-soft)}
+:root[data-sec="agentic-rl"]{--accent:var(--acc-rl);--accent-soft:var(--acc-rl-soft)}
+:root[data-sec="dist-train"]{--accent:var(--acc-dist);--accent-soft:var(--acc-dist-soft)}
 
 *{box-sizing:border-box}
 html{scroll-behavior:smooth;-webkit-text-size-adjust:100%}

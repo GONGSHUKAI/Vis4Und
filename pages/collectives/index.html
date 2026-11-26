@@ -1,0 +1,821 @@
+<!doctype html>
+<html lang="zh-CN" data-sec="dist-train">
+<head>
+<!-- v4u:head -->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="icon" href="data:,">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700&family=Inter+Tight:wght@700&family=JetBrains+Mono:wght@400;700&family=Noto+Sans+SC:wght@400;700&display=swap">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<link rel="stylesheet" href="../../assets/v4u.css?v=691854ab">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
+<script src="../../assets/v4u.js?v=d6640e00"></script>
+<!-- /v4u:head -->
+<title>集合通信 · Vis4Und</title>
+<meta name="description" content="broadcast、reduce、all-reduce、all-gather、reduce-scatter、all-to-all 的语义与每卡通信量，ring 与 double binary tree 的 α-β 代价，nccl-tests 的 algbw / busbw，NVLink / InfiniBand 拓扑与层次化 all-reduce，NCCL 与 torch.distributed。">
+<style>
+@media (max-width:760px){.tbl table.wide{min-width:640px}}
+.katex-display,.eq,.tbl{position:relative}
+.notation td:last-child{white-space:nowrap}
+</style>
+</head>
+<body>
+<!-- v4u:nav -->
+<nav class="v4u-nav" aria-label="站点导航"><div class="v4u-nav-in"><span class="v4u-crumb"><a href="../../"><b>Vis4Und</b></a><span class="v4u-sep">/</span><a href="../../#dist-train">(4) 分布式训练</a></span><span class="v4u-links"><a href="../gpu-memory-flops/">(i) 显存与算力</a><a href="../numerics/">(ii) 数值精度</a><a href="../collectives/" aria-current="page">(iii) 集合通信</a><a href="../optimizers/">(iv) 优化器</a><a href="../data-parallel/">(v) DP / ZeRO / FSDP</a><a href="../flash-attention/">(vi) FlashAttention</a><a href="../tp-pp/">(vii) TP / SP / PP</a><a href="../cp-ep/">(viii) CP / EP / 组合</a><button type="button" class="v4u-theme" aria-label="切换深浅色">深色</button></span></div></nav>
+<!-- /v4u:nav -->
+
+<header class="hero"><div class="wrap">
+  <p class="kicker">(4) 分布式训练 · (iii)</p>
+  <h1>集合通信</h1>
+  <p class="lede">所有并行策略最后都落到少数几个通信原语上：梯度用 all-reduce，FSDP 用 all-gather 和 reduce-scatter，MoE 用 all-to-all。这一页讲每个原语做什么、每张卡要收发多少字节、ring 和 tree 两种算法各花多少时间，以及节点内外的带宽差距怎样决定并行维度的摆放。</p>
+  <p class="asks-h">读完能回答</p>
+  <ul class="asks">
+    <li>all-reduce 为什么等于 reduce-scatter 加 all-gather？每张卡最少要收发多少数据？</li>
+    <li>ring all-reduce 的带宽项为什么几乎不随卡数增长？它的短板在哪，tree 怎么补？</li>
+    <li>nccl-tests 输出的 algbw 和 busbw 有什么区别，busbw 该拿去和什么比？</li>
+    <li>节点内 NVLink 和节点间 InfiniBand 差几倍？为什么张量并行一般不跨节点？</li>
+    <li>DDP、FSDP、TP、PP、EP 各自用哪个原语？</li>
+  </ul>
+</div></header>
+
+<div class="wrap layout">
+<nav class="toc" id="toc" aria-label="本页目录"></nav>
+<main>
+
+<section id="primitives">
+  <h2>八个原语</h2>
+  <p class="def"><b>集合通信</b>（collective）是一组 rank 同时参与的通信操作：组内每个 rank 调用同一个函数、给出各自的缓冲区，调用结束时各 rank 的输出满足约定的关系。与之相对的是两个 rank 之间的点对点通信 send / recv。一个 rank 通常对应一张 GPU。</p>
+
+  <table class="notation">
+    <caption>记号</caption>
+    <thead><tr><th>符号</th><th>含义</th><th>形状 / 单位</th></tr></thead>
+    <tbody>
+      <tr><td>$p$</td><td>组内 rank 数</td><td>标量</td></tr>
+      <tr><td>$r,\ q$</td><td>rank 编号；broadcast / reduce 等有根的原语默认根是 0</td><td>$0,\dots,p-1$</td></tr>
+      <tr><td>$n$</td><td>每个 rank 的完整缓冲区大小（all-gather 指输出，reduce-scatter 指输入）</td><td>字节</td></tr>
+      <tr><td>$x_r$</td><td>rank $r$ 的输入</td><td>$n$ 字节</td></tr>
+      <tr><td>$x_r^{(j)}$</td><td>把 $x_r$ 均分成 $p$ 块后的第 $j$ 块</td><td>$n/p$ 字节</td></tr>
+    </tbody>
+  </table>
+
+  <figure class="viz" id="viz-prim">
+    <div class="viz-h"><b>每个 rank 的缓冲区，调用前与调用后</b><span>p = 4，每格是 n/p 字节的一块</span></div>
+    <div class="viz-stage"><canvas id="cv-prim" aria-label="四个 rank 的缓冲区在集合通信前后的内容，数据块从左侧网格移动到右侧网格"></canvas></div>
+    <div class="viz-ctrl">
+      <div class="seg" id="sg-prim" role="group" aria-label="选择原语">
+        <button type="button" data-v="broadcast">broadcast</button><button type="button" data-v="reduce">reduce</button><button type="button" data-v="allreduce" aria-pressed="true">all-reduce</button><button type="button" data-v="reducescatter">reduce-scatter</button><button type="button" data-v="allgather">all-gather</button><button type="button" data-v="alltoall">all-to-all</button><button type="button" data-v="scatter">scatter</button><button type="button" data-v="gather">gather</button>
+      </div>
+      <button type="button" class="btn ghost" id="bt-prim">播放</button>
+    </div>
+    <div class="viz-read" id="rd-prim"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>rank 0 的数据</li><li><i style="background:var(--c2)"></i>rank 1</li><li><i style="background:var(--c3)"></i>rank 2</li><li><i style="background:var(--c4)"></i>rank 3</li><li><i style="background:var(--surface-2);border:1px solid var(--line-2)"></i>Σ：四个 rank 同一块之和（底部色条表示参与求和的 rank）</li></ul>
+    <figcaption>格子里的数字是块号 $j$。all-to-all 调用前，第 $j$ 格是要发给 rank $j$ 的那块；调用后 rank $r$ 收齐了所有人发给它的块，整体相当于把「rank × 块」矩阵转置。</figcaption>
+  </figure>
+
+  <div class="tbl"><table class="wide">
+    <thead><tr><th>原语</th><th>调用后</th><th>每卡最少收发</th><th>训练里的典型用途</th></tr></thead>
+    <tbody>
+      <tr><td>broadcast</td><td>所有 rank 得到 $x_0$</td><td>根至少发 $n$</td><td>启动时把 rank 0 的权重发给所有人</td></tr>
+      <tr><td>reduce</td><td>根得到 $\sum_q x_q$</td><td>根至少收 $n$</td><td>少用，一般直接 all-reduce</td></tr>
+      <tr><td>all-reduce</td><td>每个 rank 得到 $\sum_q x_q$</td><td>收、发各 $2\frac{p-1}{p}n$</td><td>DDP 梯度，张量并行的激活</td></tr>
+      <tr><td>reduce-scatter</td><td>rank $r$ 得到 $\sum_q x_q^{(r)}$</td><td>收、发各 $\frac{p-1}{p}n$</td><td>ZeRO / FSDP 的梯度，序列并行</td></tr>
+      <tr><td>all-gather</td><td>每个 rank 得到 $[x_0^{(0)},\dots,x_{p-1}^{(p-1)}]$</td><td>收、发各 $\frac{p-1}{p}n$</td><td>FSDP 取回整块参数，序列并行</td></tr>
+      <tr><td>all-to-all</td><td>rank $r$ 得到 $[x_0^{(r)},\dots,x_{p-1}^{(r)}]$</td><td>收、发各 $\frac{p-1}{p}n$</td><td>MoE 的 token 分发与回收，Ulysses</td></tr>
+      <tr><td>scatter / gather</td><td>根的块分给各 rank / 各 rank 的块收到根</td><td>根发 / 收 $\frac{p-1}{p}n$</td><td>收集评测结果等小数据</td></tr>
+      <tr><td>send / recv</td><td>点对点</td><td>$n$</td><td>流水线并行的激活，Ring Attention 的 KV</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="identities">
+  <h2>原语之间的关系</h2>
+  <p>all-gather 和 reduce-scatter 是两个「基本件」，其余几个大消息原语都能拼出来，每卡收发量也就跟着定了。</p>
+  <ol class="derive">
+    <li><p>reduce-scatter：rank $r$ 输入里有 $p-1$ 块归别人所有，每块的信息都必须离开 rank $r$，所以每卡至少发：</p>$$V_\text{RS} = \frac{p-1}{p}\,n$$</li>
+    <li><p>all-gather：rank $r$ 缺 $p-1$ 块，每块只能从外面收进来，所以每卡至少收：</p>$$V_\text{AG} = \frac{p-1}{p}\,n$$</li>
+    <li><p>all-reduce 先按块求和、再把和发给所有人，正好是两者串联：</p>$$\text{AllReduce}(x) = \text{AllGather}\big(\text{ReduceScatter}(x)\big),\qquad V_\text{AR} = 2\,\frac{p-1}{p}\,n$$</li>
+    <li><p>Patarasuk 与 Yuan（2009）证明任何 all-reduce 都至少有一个 rank 发出、一个 rank 收进 $2\frac{p-1}{p}n$，所以「reduce-scatter + all-gather」在带宽上是最优的。同理，大消息的 broadcast 常做成 scatter + all-gather，reduce 做成 reduce-scatter + gather。</p></li>
+  </ol>
+  <div class="note"><b>为什么 FSDP 不用 all-reduce</b><p>FSDP / ZeRO 每张卡只存 $1/p$ 的参数和优化器状态，所以只需要「自己那一块」的梯度和：一次 reduce-scatter 就够，通信量是 all-reduce 的一半；前向前再 all-gather 取回整块参数。两次加起来和一次 all-reduce 一样多，见 <a href="../data-parallel/#zero">ZeRO 的通信量</a>。</p></div>
+</section>
+
+<section id="cost">
+  <h2>α-β 代价模型</h2>
+  <p class="def"><b>α-β 模型</b>（Hockney 模型）把一次点对点传输的时间写成固定启动延迟加字节数乘以每字节时间：$T = \alpha + n\beta$。</p>
+  <table class="notation">
+    <caption>记号</caption>
+    <thead><tr><th>符号</th><th>含义</th><th>单位</th></tr></thead>
+    <tbody>
+      <tr><td>$\alpha$</td><td>每条消息的启动延迟：软件开销、同步、网络往返</td><td>s</td></tr>
+      <tr><td>$B$</td><td>一个 rank 单方向的链路带宽</td><td>byte/s</td></tr>
+      <tr><td>$\beta = 1/B$</td><td>每字节传输时间</td><td>s/byte</td></tr>
+      <tr><td>$n$</td><td>消息大小</td><td>byte</td></tr>
+    </tbody>
+  </table>
+  <div class="eq">$$T_\text{p2p}(n) = \alpha + n\beta,\qquad n_{1/2} = \frac{\alpha}{\beta} = \alpha B$$</div>
+  <p>$n &lt; n_{1/2}$ 时延迟占大头，叫延迟受限；$n \gg n_{1/2}$ 时带宽占大头，叫带宽受限。例如 $\alpha = 5\,\mu\text{s}$、$B = 50$ GB/s 时 $n_{1/2} = 250$ KB。训练里的梯度、参数通常是几十 MB 到几 GB，带宽受限；loss、梯度范数这类标量是纯延迟受限。集合通信由多步点对点组成，算法的总时间写成 $a\,\alpha + b\,n\beta$，比的就是两项的系数 $a$ 和 $b$。</p>
+</section>
+
+<section id="ring">
+  <h2>Ring all-reduce</h2>
+  <p>$p$ 个 rank 连成环，每个 rank 只和下一个 rank 通信，每步每条链路上同时有数据在走，所有链路都不闲着。</p>
+  <ol class="derive">
+    <li><p>把每个 rank 的缓冲区切成 $p$ 块，每块 $n/p$。</p></li>
+    <li><p>reduce-scatter 阶段：第 $s$ 步（$s=0,\dots,p-2$），rank $r$ 把块 $(r-s) \bmod p$ 发给 rank $r+1$，接收方加到自己的同号块上。每步耗时：</p>$$\alpha + \frac{n}{p}\beta$$</li>
+    <li><p>$p-1$ 步后，块 $c$ 从 rank $c$ 出发绕了 $p-1$ 跳，累加了所有 rank 的贡献，停在 rank $c-1$：每个 rank 恰好持有一块完整的和。</p></li>
+    <li><p>all-gather 阶段：再走 $p-1$ 步，第 $s$ 步 rank $r$ 把块 $(r+1-s) \bmod p$（已完整）发给下一个，接收方直接覆盖。</p></li>
+    <li><p>共 $2(p-1)$ 步：</p>$$T_\text{ring} = 2(p-1)\,\alpha + 2\,\frac{p-1}{p}\,n\beta$$</li>
+    <li><p>带宽项达到上一节的下界，$p\to\infty$ 时趋于 $2n\beta$，与卡数无关；延迟项随 $p$ 线性增长，卡多、消息小时成为瓶颈。</p></li>
+  </ol>
+
+  <figure class="viz" id="viz-ring">
+    <div class="viz-h"><b>逐步看 ring all-reduce</b><span>行 = rank，列 = 块</span></div>
+    <div class="viz-stage"><canvas id="cv-ring" aria-label="ring all-reduce 每一步各 rank 各块累加了哪些 rank 的贡献"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="sl-ring-p">p <input type="range" id="sl-ring-p" min="3" max="6" step="1" value="4"><output id="o-ring-p">4</output></label>
+      <label for="sl-ring-k">第几步 <input type="range" id="sl-ring-k" min="0" max="6" step="1" value="3"><output id="o-ring-k">3</output></label>
+      <button type="button" class="btn ghost" id="bt-ring">播放</button>
+    </div>
+    <div class="viz-read" id="rd-ring"></div>
+    <figcaption>每格按 rank 分成竖条，有颜色的竖条表示这一块已经加进了该 rank 的数据；标 Σ 的格子已经是 $p$ 个 rank 的完整和。描边的格子是这一步刚发出去的块，箭头指向接收方，最后一行的块绕回第一行。默认停在第 $p-1$ 步，即 reduce-scatter 刚结束的时刻。</figcaption>
+  </figure>
+</section>
+
+<section id="tree">
+  <h2>Tree 与 double binary tree</h2>
+  <p>ring 的步数是 $2(p-1)$。树形算法先沿树把数据归约到根，再从根广播回去，步数只和树高 $\lceil\log_2 p\rceil$ 有关；大消息切成小块流水着走，带宽也能用满。</p>
+  <ol class="derive">
+    <li><p>二叉树高度 $\lceil\log_2 p\rceil$，归约上行、广播下行各走一遍，延迟项：</p>$$2\lceil\log_2 p\rceil\,\alpha$$</li>
+    <li><p>单棵二叉树里约一半 rank 是叶子：广播时叶子只收不发，内部节点要给两个孩子各发一份，链路用得不均匀。</p></li>
+    <li><p>double binary tree（Sanders 等，2009；NCCL 2.4 起用于 all-reduce）建两棵树，各管一半数据。第二棵树把第一棵的叶子换成内部节点，于是每个 rank 在一棵树里是内部节点、在另一棵里是叶子。</p></li>
+    <li><p>数一下每个 rank 发出的量：做内部节点的那棵树里，上行 $\tfrac{n}{2}$、下行给两个孩子 $2\cdot\tfrac{n}{2}$；做叶子的那棵树里，上行 $\tfrac{n}{2}$。合计 $2n$，与 ring 的 $2\frac{p-1}{p}n$ 几乎相同：</p>$$T_\text{tree} \approx 2\lceil\log_2 p\rceil\,\alpha + 2n\beta$$</li>
+  </ol>
+
+  <figure class="viz" id="viz-tree">
+    <div class="viz-h"><b>两棵互补的二叉树</b><span>点一个 rank 看它在两棵树里的角色</span></div>
+    <div class="viz-stage"><canvas id="cv-tree" aria-label="p 个 rank 排成一行，上方弧线是第一棵树，下方弧线是第二棵树"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="sl-tree-p">p <input type="range" id="sl-tree-p" min="4" max="16" step="2" value="8"><output id="o-tree-p">8</output></label>
+      <label for="sl-tree-s">阶段 <input type="range" id="sl-tree-s" min="0" max="8" step="1" value="0"><output id="o-tree-s">0</output></label>
+      <button type="button" class="btn ghost" id="bt-tree">播放</button>
+    </div>
+    <div class="viz-read" id="rd-tree"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>树 A（上方）</li><li><i style="background:var(--c2)"></i>树 B（下方，= 树 A 整体右移一位）</li><li><i style="background:var(--accent)"></i>选中的 rank</li></ul>
+    <figcaption>每个 rank 在一棵树里有孩子、在另一棵树里没有孩子，所以两棵树同时跑时每个 rank 的收发量相同。「阶段」逐层点亮正在传数据的边：前半是从叶子归约到根，后半是从根广播回叶子，总阶段数是两倍树高。</figcaption>
+  </figure>
+
+  <figure class="viz" id="viz-cost">
+    <div class="viz-h"><b>all-reduce 时间随消息大小变化</b><span>双对数坐标，α-β 模型</span></div>
+    <div class="viz-stage"><canvas id="cv-cost" aria-label="ring、double binary tree 和递归减半倍增三种 all-reduce 的时间曲线"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="sl-cost-p">p <input type="range" id="sl-cost-p" min="1" max="12" step="1" value="6"><output id="o-cost-p">64</output></label>
+      <label for="sl-cost-a">α <input type="range" id="sl-cost-a" min="1" max="20" step="0.5" value="5"><output id="o-cost-a">5 µs</output></label>
+      <label for="sl-cost-b">B <input type="range" id="sl-cost-b" min="10" max="450" step="5" value="50"><output id="o-cost-b">50 GB/s</output></label>
+      <label for="sl-cost-n">n <input type="range" id="sl-cost-n" min="3" max="9.6" step="0.1" value="7.2"><output id="o-cost-n">16 MB</output></label>
+    </div>
+    <div class="viz-read" id="rd-cost"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>ring</li><li><i style="background:var(--c2)"></i>double binary tree</li><li><i style="background:var(--c3)"></i>递归减半 + 倍增（虚线）</li></ul>
+    <figcaption>α、B 的默认值是示例量级，不是某台机器的实测。模型没算流水线填充、协议开销和链路争用；NCCL 实际按自己的性能模型在 ring / tree 等算法之间切换。</figcaption>
+  </figure>
+  <p>图里的虚线是 Rabenseifner 的递归减半 + 递归倍增（Thakur 等，2005）：reduce-scatter 每步和距离减半的伙伴交换一半数据，all-gather 反过来，$T = 2\log_2 p\,\alpha + 2\frac{p-1}{p}n\beta$，两项系数同时最小。它在 MPI 里常用，但每步的通信伙伴相距 $p/2, p/4, \dots$，在分层网络上远距离的通信对会挤在同一段上行链路上，实际跑不到模型里的数，这也是 NCCL 主要用 ring 和 tree 的原因。NCCL 2.23 加入的 PAT 是同一思路的变体：只用于 all-gather / reduce-scatter，先处理最远的维度、按缓冲区大小限制聚合量，针对大规模下的中小消息（初版每节点只支持 1 张 GPU）。</p>
+</section>
+
+<section id="busbw">
+  <h2>algbw 与 busbw</h2>
+  <p>nccl-tests（<code>all_reduce_perf</code> 等）每行输出两个带宽。它的文档里 $S$ 是数组总字节数、$n$ 是 rank 数；下面沿用本页记号，$S$ 照旧、rank 数写作 $p$。</p>
+  <ol class="derive">
+    <li><p>算法带宽，直接拿数据量除以时间：</p>$$\text{algbw} = \frac{S}{t}$$</li>
+    <li><p>all-reduce 每个元素要 $p-1$ 次加法和 $p$ 次赋值，至少 $2(p-1)$ 次传输，由 $p$ 条带宽为 $B$ 的链路分担，所以最快：</p>$$t = \frac{2(p-1)}{p}\cdot\frac{S}{B}$$</li>
+    <li><p>反解出硬件带宽，就是总线带宽：</p>$$\text{busbw} = \text{algbw}\cdot\frac{2(p-1)}{p}$$</li>
+    <li><p>其它原语的修正因子：reduce-scatter、all-gather、all-to-all 是 $\frac{p-1}{p}$；broadcast、reduce 是 $1$（根的那条链路是瓶颈）。</p></li>
+  </ol>
+
+  <figure class="viz" id="viz-bw">
+    <div class="viz-h"><b>卡数增加时 algbw 变，busbw 不变</b><span>理想硬件，单位 GB/s</span></div>
+    <div class="viz-stage"><canvas id="cv-bw" aria-label="algbw 和 busbw 随 rank 数的曲线"></canvas></div>
+    <div class="viz-ctrl">
+      <div class="seg" id="sg-bw" role="group" aria-label="选择原语"><button type="button" data-v="ar" aria-pressed="true">all-reduce</button><button type="button" data-v="ag">all-gather / reduce-scatter / all-to-all</button><button type="button" data-v="bc">broadcast / reduce</button></div>
+      <label for="sl-bw-p">p <input type="range" id="sl-bw-p" min="2" max="64" step="1" value="8"><output id="o-bw-p">8</output></label>
+      <label for="sl-bw-b">链路 B <input type="range" id="sl-bw-b" min="25" max="900" step="25" value="450"><output id="o-bw-b">450</output></label>
+    </div>
+    <div class="viz-read" id="rd-bw"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>busbw（= 链路带宽，横线）</li><li><i style="background:var(--c2)"></i>理想 algbw = B / 修正因子</li></ul>
+    <figcaption>默认 B = 450 GB/s 是 H100 NVLink4 的单方向带宽（官方 900 GB/s 是双向合计）。实测 busbw 接近链路带宽，说明通信库把硬件用满了；明显偏低就该查拓扑、网卡绑定或 NCCL 选的算法。</figcaption>
+  </figure>
+  <div class="note pit"><b>易错</b><p>拿 algbw 和链路带宽比会得出误导结论：8 卡 all-reduce 的 algbw 理论上只有链路带宽的 $8/14$，看起来「只用了 57%」，其实已经满了。比较不同卡数的结果、或者和硬件规格比，都用 busbw。</p></div>
+</section>
+
+<section id="topology">
+  <h2>拓扑：节点内与节点间</h2>
+  <p>一台 8 卡服务器（一个节点）里，GPU 之间走 NVLink，经 NVSwitch 全互联；节点之间每张 GPU 通常配一张 InfiniBand 或 RoCE 网卡。两层带宽差将近一个数量级，这是安排并行维度的首要约束。</p>
+  <div class="tbl"><table class="wide">
+    <thead><tr><th>链路</th><th>带宽</th><th>口径</th><th>典型位置</th></tr></thead>
+    <tbody>
+      <tr><td>PCIe 4.0 ×16</td><td class="num">≈ 32 GB/s</td><td>单方向</td><td>GPU ↔ CPU、网卡</td></tr>
+      <tr><td>PCIe 5.0 ×16</td><td class="num">≈ 64 GB/s</td><td>单方向</td><td>同上（H100 / B200 一代）</td></tr>
+      <tr><td>NVLink 3（A100）</td><td class="num">600 GB/s</td><td>每 GPU，双向合计</td><td>节点内</td></tr>
+      <tr><td>NVLink 4（H100）</td><td class="num">900 GB/s</td><td>每 GPU，双向合计（18 条链路）</td><td>节点内</td></tr>
+      <tr><td>NVLink 5（B200 / GB200）</td><td class="num">1.8 TB/s</td><td>每 GPU，双向合计（18 × 100 GB/s）</td><td>节点内；GB200 NVL72 整柜 72 卡</td></tr>
+      <tr><td>NVLink 6（Rubin）</td><td class="num">3.6 TB/s</td><td>每 GPU，双向合计，NVIDIA 公布规格</td><td>Vera Rubin NVL72</td></tr>
+      <tr><td>InfiniBand HDR</td><td class="num">200 Gb/s</td><td>每端口单方向，= 25 GB/s</td><td>节点间</td></tr>
+      <tr><td>InfiniBand NDR</td><td class="num">400 Gb/s</td><td>= 50 GB/s</td><td>节点间（H100 / B200 集群常见，每 GPU 一张）</td></tr>
+      <tr><td>InfiniBand XDR</td><td class="num">800 Gb/s</td><td>= 100 GB/s</td><td>节点间（ConnectX-8 / Quantum-X800）</td></tr>
+    </tbody>
+  </table></div>
+  <div class="note pit"><b>单位</b><p>NVLink 的官方数字是双向合计、单位 GB/s（字节）；网卡是单方向、单位 Gb/s（比特）。换到同一口径：H100 的 NVLink 单向 450 GB/s，NDR 网卡单向 50 GB/s，相差 9 倍。GB200 NVL72 把 NVLink 域扩到 72 卡，官方合计 130 TB/s（= 72 × 1.8 TB/s）。</p></div>
+
+  <h3>层次化 all-reduce</h3>
+  <p>$m$ 个节点、每节点 $g$ 张卡（$p = mg$）。先在节点内把数据切成 $g$ 块，再只让「每卡负责的那 $1/g$」过网卡：</p>
+  <ol class="derive">
+    <li><p>节点内 reduce-scatter（NVLink，带宽 $B_\text{nv}$）：每卡持有本节点 $n/g$ 一块的和。</p>$$t_1 = \frac{g-1}{g}\cdot\frac{n}{B_\text{nv}}$$</li>
+    <li><p>节点间 all-reduce：各节点第 $i$ 号卡组成一个组，同时在各自的网卡上做大小为 $n/g$ 的 all-reduce。</p>$$t_2 = 2\,\frac{m-1}{m}\cdot\frac{n/g}{B_\text{ib}}$$</li>
+    <li><p>节点内 all-gather，把完整结果发回本节点所有卡：</p>$$t_3 = \frac{g-1}{g}\cdot\frac{n}{B_\text{nv}}$$</li>
+    <li><p>过网卡的字节数从 $\approx 2n$ 降到 $\approx 2n/g$，网络这一项被 $g$ 张网卡分摊。</p></li>
+  </ol>
+
+  <figure class="viz" id="viz-topo">
+    <div class="viz-h"><b>同样一次 all-reduce，放在哪些卡上</b><span>2 个节点 × 8 卡</span></div>
+    <div class="viz-stage"><canvas id="cv-topo" aria-label="两个 8 卡节点，选中的 GPU 和 all-reduce 的环路"></canvas></div>
+    <div class="viz-ctrl">
+      <div class="seg" id="sg-topo" role="group" aria-label="选择放法"><button type="button" data-v="a" aria-pressed="true">8 卡同节点</button><button type="button" data-v="b">8 卡跨节点</button><button type="button" data-v="c">16 卡单环</button><button type="button" data-v="d">16 卡层次化</button></div>
+      <label for="sl-topo-n">n <input type="range" id="sl-topo-n" min="0" max="6" step="1" value="4"><output id="o-topo-n">256 MB</output></label>
+      <label for="sl-topo-nv">NVLink <input type="range" id="sl-topo-nv" min="100" max="900" step="50" value="450"><output id="o-topo-nv">450</output></label>
+      <label for="sl-topo-ib">网卡 <input type="range" id="sl-topo-ib" min="12.5" max="100" step="12.5" value="50"><output id="o-topo-ib">50</output></label>
+    </div>
+    <div class="viz-read" id="rd-topo"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>走 NVLink 的一跳</li><li><i style="background:var(--c2)"></i>走网卡 / IB 交换机的一跳</li><li><i style="background:var(--accent-soft);border:1px solid var(--accent)"></i>参与的 GPU</li></ul>
+    <figcaption>只算带宽项。单个环的速度由最慢的一跳决定：8 卡只要有一跳出节点，整个环就降到网卡速度。两个带宽滑块是 NVLink 与网卡的单方向带宽 $B_\text{nv}$、$B_\text{ib}$（GB/s），默认值对应 H100 + NDR。</figcaption>
+  </figure>
+  <div class="note"><b>NCCL 实际怎么做</b><p>NCCL 会建多个环（channel），不同的环走不同网卡，节点间流量同样被多张网卡分摊，所以真实的「平铺」all-reduce 接近层次化的数字；上图的单环只用来说明瓶颈在哪一跳。集群网络通常按「轨道」（rail）布线：各节点的第 $i$ 号网卡接到同一组交换机，层次化第 2 步里的第 $i$ 号卡之间只隔一跳。</p></div>
+  <p>这就是并行维度的摆放规则：通信最频繁、消息又在关键路径上的维度（<a href="../tp-pp/#tp-comm">张量并行</a>，每层都要 all-reduce 激活）放在节点内；通信能和计算重叠的维度（数据并行、<a href="../tp-pp/#pp">流水线并行</a>的点对点）放到节点间。完整的排法见 <a href="../cp-ep/#compose">多维组合</a>。</p>
+</section>
+
+<section id="nccl">
+  <h2>NCCL 与 torch.distributed</h2>
+  <p class="def"><b>NCCL</b>（NVIDIA Collective Communications Library）把每个集合通信实现成 CUDA kernel，直接在 GPU 之间经 NVLink、PCIe 或网卡（GPUDirect RDMA）搬数据，不经过 CPU。PyTorch 的 <code>torch.distributed</code> 在 GPU 上默认用它做后端。</p>
+  <ul>
+    <li><b>算法</b>：Ring、Tree；CollNet（借助 InfiniBand 交换机的 SHARP 在网络里做归约）；NVLS（NCCL 2.17 起，在 Hopper 一代的 NVSwitch 上做 NVLink SHARP，归约在交换机里完成）；PAT（2.23 起，all-gather / reduce-scatter）。</li>
+    <li><b>协议</b>：Simple、LL、LL128。LL 系列用标志位做细粒度同步，延迟低、有效带宽低一些；Simple 用内存栅栏，适合大消息。NCCL 按消息大小和拓扑自动选算法与协议，可用环境变量 <code>NCCL_ALGO</code>、<code>NCCL_PROTO</code> 强制指定，<code>NCCL_DEBUG=INFO</code> 打印它选了什么、建了哪些环。</li>
+    <li><b>channel</b>：每个 channel 是一个 CTA（线程块），占一个 SM。通信 kernel 和计算 kernel 同时跑时会抢 SM 和显存带宽，所以「重叠」并不完全免费。</li>
+  </ul>
+<pre><code>import os, torch, torch.distributed as dist
+dist.init_process_group("nccl")              # torchrun 设好 RANK / WORLD_SIZE / MASTER_ADDR
+torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+p = dist.get_world_size()
+x = torch.randn(1 &lt;&lt; 20, device="cuda")
+
+dist.all_reduce(x, op=dist.ReduceOp.SUM)                 # 原地求和
+out = torch.empty(p * x.numel(), device="cuda")
+dist.all_gather_into_tensor(out, x)                      # 拼接所有 rank 的 x
+y = torch.empty(x.numel() // p, device="cuda")
+dist.reduce_scatter_tensor(y, x)                         # 求和后每人留 1/p
+z = torch.empty_like(x)
+dist.all_to_all_single(z, x)                             # 第 j 块发给 rank j
+
+work = dist.all_reduce(x, async_op=True)   # 立即返回，通信排在 NCCL 的流上
+# ... 这里可以继续排不依赖 x 的计算 ...
+work.wait()                                # 让当前 CUDA 流等通信完成（不阻塞 CPU）</code></pre>
+  <p>子组用 <code>dist.new_group(ranks)</code> 建；多维并行用 <code>init_device_mesh("cuda", (dp, tp), mesh_dim_names=("dp", "tp"))</code> 一次建好每一维的组，见 <a href="../cp-ep/#compose">多维组合</a>。</p>
+
+  <figure class="viz" id="viz-ovl">
+    <div class="viz-h"><b>通信放在单独的流上，和反向计算重叠</b><span>6 层反向，时间单位 = 一层反向的计算时间</span></div>
+    <div class="viz-stage"><canvas id="cv-ovl" aria-label="计算流和通信流的时间线"></canvas></div>
+    <div class="viz-ctrl">
+      <div class="seg" id="sg-ovl" role="group" aria-label="执行方式"><button type="button" data-v="ser">串行</button><button type="button" data-v="ovl" aria-pressed="true">异步重叠</button></div>
+      <label for="sl-ovl">通信 / 计算 <input type="range" id="sl-ovl" min="0.2" max="2" step="0.05" value="0.6"><output id="o-ovl">0.60</output></label>
+    </div>
+    <div class="viz-read" id="rd-ovl"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>第 l 层反向计算（计算流）</li><li><i style="background:var(--c2)"></i>第 l 层梯度的 all-reduce（通信流）</li></ul>
+    <figcaption>反向从最后一层往前算，第 $l$ 层梯度一算完就可以发出去，同时计算流接着算第 $l-1$ 层。通信 / 计算比小于 1 时，只有最后一层的通信露在外面；大于 1 时通信流成为瓶颈。DDP 把多个参数的梯度攒成桶再发，见 <a href="../data-parallel/#ddp">DDP 的分桶</a>。</figcaption>
+  </figure>
+  <div class="note pit"><b>易错：卡住不动</b><p>同一组里的所有 rank 必须以相同顺序调用相同的集合通信，张量大小也要一致。某个 rank 因为分支条件少调一次 <code>all_reduce</code>，其它 rank 不会报错，而是一直等，直到超时（<code>init_process_group</code> 的 <code>timeout</code>）后 watchdog 才把进程杀掉。常见诱因：只在 rank 0 上做的评测里调用了集合通信、各 rank 的 batch 数不同、MoE 里某些专家没收到 token 就跳过了通信。</p></div>
+</section>
+
+<section id="which">
+  <h2>每种并行用哪个原语</h2>
+  <div class="tbl"><table class="wide">
+    <thead><tr><th>并行方式</th><th>原语</th><th>传什么</th><th>每步频率</th><th>详见</th></tr></thead>
+    <tbody>
+      <tr><td>DDP</td><td>all-reduce</td><td>梯度（分桶）</td><td>每个 step 一轮，和反向重叠</td><td><a href="../data-parallel/#ddp">DDP</a></td></tr>
+      <tr><td>ZeRO-1 / 2</td><td>reduce-scatter + all-gather</td><td>梯度求和后每人留 1/p；更新后取回参数</td><td>每个 step 一轮</td><td><a href="../data-parallel/#zero">ZeRO</a></td></tr>
+      <tr><td>FSDP / ZeRO-3</td><td>all-gather + reduce-scatter</td><td>前向、反向前取回整块参数；梯度切片求和</td><td>每层前向 1 次 AG，反向 1 次 AG + 1 次 RS</td><td><a href="../data-parallel/#fsdp">FSDP</a></td></tr>
+      <tr><td>张量并行</td><td>all-reduce</td><td>激活及其梯度</td><td>每层前向 2 次、反向 2 次，在关键路径上</td><td><a href="../tp-pp/#tp">TP</a></td></tr>
+      <tr><td>TP + 序列并行</td><td>reduce-scatter + all-gather</td><td>同上，拆开以便沿序列切 LayerNorm 段</td><td>同上</td><td><a href="../tp-pp/#sp">SP</a></td></tr>
+      <tr><td>流水线并行</td><td>send / recv</td><td>stage 边界的激活与梯度</td><td>每个 micro-batch</td><td><a href="../tp-pp/#pp">PP</a></td></tr>
+      <tr><td>Ring Attention（CP）</td><td>send / recv</td><td>K、V 分块绕环</td><td>每层 attention</td><td><a href="../cp-ep/#cp">CP</a></td></tr>
+      <tr><td>Ulysses</td><td>all-to-all</td><td>序列切分 ↔ 头切分</td><td>每层 attention 前后各一次</td><td><a href="../cp-ep/#ulysses">Ulysses</a></td></tr>
+      <tr><td>专家并行（EP）</td><td>all-to-all</td><td>token 发往专家（dispatch）、结果收回（combine）</td><td>每个 MoE 层前向 2 次、反向 2 次</td><td><a href="../cp-ep/#ep">EP</a></td></tr>
+      <tr><td>分布式 Muon</td><td>gather / all-gather</td><td>把切开的矩阵拼整再做正交化</td><td>每个 step</td><td><a href="../optimizers/#muon-dist">Muon</a></td></tr>
+      <tr><td>日志、梯度裁剪</td><td>all-reduce</td><td>loss、梯度范数等标量</td><td>每个 step，延迟受限</td><td>—</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="quiz">
+  <h2>自测</h2>
+  <details class="q"><summary>8 卡用 ring 对 1 GB 梯度做 all-reduce，每张卡发出多少字节？</summary><div><p>$2\cdot\frac{7}{8}\cdot 1\text{ GB} = 1.75$ GB，收进也是 1.75 GB。卡数再多，这个数也不会超过 2 GB。</p></div></details>
+  <details class="q"><summary>ring 的带宽项与卡数无关，为什么上千卡时还要换 tree？</summary><div><p>ring 的延迟项是 $2(p-1)\alpha$，随卡数线性增长；消息不大时它占了大头。double binary tree 的延迟项是 $2\lceil\log_2 p\rceil\alpha$，带宽项仍约 $2n\beta$，所以在卡多、消息中小时更快。</p></div></details>
+  <details class="q"><summary>nccl-tests 在 8 卡上测 all-reduce，algbw = 200 GB/s，busbw 是多少？该和什么比？</summary><div><p>$200 \times \frac{2\cdot 7}{8} = 350$ GB/s。和单张卡单方向的链路带宽比，例如 H100 NVLink4 的 450 GB/s。</p></div></details>
+  <details class="q"><summary>为什么说 all-reduce = reduce-scatter + all-gather 不只是一个实现技巧？</summary><div><p>两半各需要每卡收发 $\frac{p-1}{p}n$，加起来正好是 all-reduce 的带宽下界 $2\frac{p-1}{p}n$。ZeRO / FSDP 把这两半拆开、中间插进优化器更新或前向计算，总通信量不变。</p></div></details>
+  <details class="q"><summary>8 卡张量并行，如果 4 张在节点 A、4 张在节点 B，会怎样？</summary><div><p>环里有两跳要走网卡，整个 all-reduce 降到网卡速度。H100 + NDR 下单方向 450 vs 50 GB/s，约慢 9 倍，而且张量并行的通信在每层的关键路径上，无法藏到计算后面。</p></div></details>
+  <details class="q"><summary>all-to-all 和 all-gather 每卡收发量都是 $\frac{p-1}{p}n$，区别在哪？</summary><div><p>all-gather 每人收到的是同一份数据，可以用树、交换机内复制（NVLS）等方式省带宽；all-to-all 每对 rank 之间是不同的数据，没有冗余可省。MoE 里每对之间的量还取决于路由结果，负载不均时最慢的那对决定时间。</p></div></details>
+  <details class="q"><summary>训练卡住不动、没有报错，GPU 利用率 100%，最可能是什么？</summary><div><p>某个 rank 少调或多调了一次集合通信，其它 rank 的 NCCL kernel 在 GPU 上自旋等待（所以利用率显示很高）。用 <code>NCCL_DEBUG=INFO</code>、PyTorch 的 flight recorder 或 py-spy 看各 rank 停在哪一次调用。</p></div></details>
+</section>
+
+<section id="refs">
+  <h2>延伸阅读</h2>
+  <ol class="refs">
+    <li><b>Thakur, Rabenseifner, Gropp, Optimization of Collective Communication Operations in MPICH</b>, IJHPCA 19(1), 2005. <a href="https://web.cels.anl.gov/~thakur/papers/mpi-coll.pdf">PDF</a>（各原语的经典算法与 α-β 代价）</li>
+    <li><b>Patarasuk, Yuan, Bandwidth Optimal All-reduce Algorithms for Clusters of Workstations</b>, JPDC 69, 2009. <a href="https://www.cs.fsu.edu/~xyuan/paper/09jpdc.pdf">PDF</a>（ring all-reduce 与带宽下界）</li>
+    <li><b>Sanders, Speck, Träff, Two-tree Algorithms for Full Bandwidth Broadcast, Reduction and Scan</b>, Parallel Computing 35(12), 2009. <a href="https://doi.org/10.1016/j.parco.2009.09.001">doi:10.1016/j.parco.2009.09.001</a></li>
+    <li><b>NVIDIA, Massively Scale Your Deep Learning Training with NCCL 2.4</b>, NVIDIA Technical Blog, 2019. <a href="https://developer.nvidia.com/blog/massively-scale-deep-learning-training-nccl-2-4/">链接</a>（double binary tree）</li>
+    <li><b>Jeaugey, PAT: a New Algorithm for All-Gather and Reduce-Scatter Operations at Scale</b>, 2025. <a href="https://arxiv.org/abs/2506.20252">arXiv:2506.20252</a></li>
+    <li><b>Hu et al., Demystifying NCCL: An In-depth Analysis of GPU Communication Protocols and Algorithms</b>, 2025. <a href="https://arxiv.org/abs/2507.04786">arXiv:2507.04786</a>（channel、Simple / LL / LL128、ring 与 tree 的实现）</li>
+    <li><b>nccl-tests：Performance reported by NCCL tests</b>（algbw / busbw 的定义）. <a href="https://github.com/NVIDIA/nccl-tests/blob/master/doc/PERFORMANCE.md">GitHub</a></li>
+    <li><b>NCCL</b> 源码. <a href="https://github.com/NVIDIA/nccl">github.com/NVIDIA/nccl</a></li>
+    <li><b>Li et al., PyTorch Distributed: Experiences on Accelerating Data Parallel Training</b>, VLDB 2020. <a href="https://arxiv.org/abs/2006.15704">arXiv:2006.15704</a>（DDP 的分桶与重叠）</li>
+  </ol>
+</section>
+
+</main>
+</div>
+
+<!-- v4u:foot -->
+<footer class="v4u-foot"><div class="v4u-foot-in"><a class="pv" href="../numerics/"><span>上一篇</span>数值精度与混合精度</a><a class="nx" href="../optimizers/"><span>下一篇</span>优化器：从 Adam 到 Muon</a></div></footer>
+<!-- /v4u:foot -->
+
+<script>
+V4U.ready(() => {
+  const C = (k) => V4U.css(k);
+  const RANK = ['--c1', '--c2', '--c3', '--c4', '--c5', '--c6'];
+  const RANKS = ['--c1s', '--c2s', '--c3s', '--c4s', '--c5s', '--c6s'];
+  const mono = (px) => `${px}px ${C('--f-mono')}`;
+  const body = (px, wt) => `${wt || 400} ${px}px ${C('--f-body')}`;
+  const rrect = (ctx, x, y, w, h, r) => { ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); };
+  const arrow = (ctx, x1, y1, x2, y2, col, wd) => {
+    ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = wd || 2;
+    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+    const a = Math.atan2(y2 - y1, x2 - x1), L = 7;
+    ctx.beginPath(); ctx.moveTo(x2, y2); ctx.lineTo(x2 - L * Math.cos(a - 0.45), y2 - L * Math.sin(a - 0.45)); ctx.lineTo(x2 - L * Math.cos(a + 0.45), y2 - L * Math.sin(a + 0.45)); ctx.closePath(); ctx.fill();
+  };
+  const fmtBytes = (b) => b >= 1e9 ? V4U.fmt(b / 1e9, b >= 1e10 ? 0 : 1) + ' GB' : b >= 1e6 ? V4U.fmt(b / 1e6, b >= 1e7 ? 0 : 1) + ' MB' : V4U.fmt(b / 1e3, 0) + ' KB';
+  const fmtT = (t) => t < 1e-3 ? V4U.fmt(t * 1e6, 1) + ' µs' : t < 1 ? V4U.fmt(t * 1e3, t < 1e-2 ? 2 : 1) + ' ms' : V4U.fmt(t, 2) + ' s';
+  const ease = (t) => 0.5 - 0.5 * Math.cos(Math.PI * V4U.clamp(t, 0, 1));
+  const playOnce = (btn, el, dur, onT, onEnd) => {
+    let anim = null;
+    btn.addEventListener('click', () => {
+      if (anim) { anim.stop(); anim = null; btn.textContent = '播放'; onEnd && onEnd(); return; }
+      btn.textContent = '停止';
+      let T = 0;
+      anim = V4U.loop(el, (t, dt) => {
+        T += dt;
+        const done = T >= dur || (t === 0 && dt === 0);
+        onT(done ? 1 : T / dur);
+        if (done && anim) { anim.stop(); anim = null; btn.textContent = '播放'; onEnd && onEnd(); }
+      });
+    });
+  };
+
+  /* ---------- 1. primitives ---------- */
+  (() => {
+    const P = 4, cv = document.getElementById('cv-prim'), rd = document.getElementById('rd-prim');
+    const D = (s, j) => ({ s, j });
+    const grid = (f) => [...Array(P)].map((_, r) => [...Array(P)].map((_, j) => f(r, j)));
+    const all = (j) => [...Array(P)].map((_, q) => [q, j]);
+    const OPS = {
+      broadcast: { before: grid((r, j) => r === 0 ? D(0, j) : null), src: (r, j) => [[0, j]],
+        read: ['根 rank 0 发 n（流水线转发时每个非末端 rank 也各发 n）', '每个非根 rank 收 n', '用途：启动时同步初始权重'] },
+      reduce: { before: grid((r, j) => D(r, j)), src: (r, j) => r === 0 ? all(j) : null,
+        read: ['根 rank 0 至少收 n', '结果只在根上', '用途：少用，一般直接 all-reduce'] },
+      allreduce: { before: grid((r, j) => D(r, j)), src: (r, j) => all(j),
+        read: ['每卡发 2(p−1)/p·n = 1.5n', '每卡收 1.5n', '用途：DDP 梯度、TP 激活'] },
+      reducescatter: { before: grid((r, j) => D(r, j)), src: (r, j) => r === j ? all(j) : null,
+        read: ['每卡发 (p−1)/p·n = 0.75n', '每卡收 0.75n', '结果大小 n/p', '用途：ZeRO / FSDP 梯度'] },
+      allgather: { before: grid((r, j) => r === j ? D(r, j) : null), src: (r, j) => [[j, j]],
+        read: ['每卡发 (p−1)/p·n = 0.75n', '每卡收 0.75n', '用途：FSDP 取回参数'] },
+      alltoall: { before: grid((r, j) => D(r, j)), src: (r, j) => [[j, r]],
+        read: ['每卡发 (p−1)/p·n = 0.75n', '每卡收 0.75n', '用途：MoE dispatch / combine、Ulysses'] },
+      scatter: { before: grid((r, j) => r === 0 ? D(0, j) : null), src: (r, j) => r === j ? [[0, j]] : null,
+        read: ['根发 (p−1)/p·n = 0.75n', '每个非根 rank 收 n/p', '用途：分发小数据'] },
+      gather: { before: grid((r, j) => r === j ? D(r, j) : null), src: (r, j) => r === 0 ? [[j, j]] : null,
+        read: ['根收 (p−1)/p·n = 0.75n', '每个非根 rank 发 n/p', '用途：收集评测结果'] },
+    };
+    let op = 'allreduce', t = 1;
+    const cellOf = (o, r, j) => {
+      const s = o.src(r, j); if (!s) return null;
+      if (s.length > 1) return { sum: true, j };
+      const b = o.before[s[0][0]][s[0][1]];
+      return b ? { s: b.s, j: b.j } : null;
+    };
+    const redraw = V4U.canvas(cv, (w) => { const cs = Math.min(46, Math.floor((w - 56 - 44) / (2 * P))); return 30 + P * (cs + 8) + 6; }, (ctx, w, h) => {
+      const o = OPS[op];
+      const LBL = 56, GAP = 44, cs = Math.min(46, Math.floor((w - LBL - GAP) / (2 * P))), rh = cs + 8, y0 = 30;
+      const gw = P * cs, ox = Math.max(0, (w - (LBL + 2 * gw + GAP)) / 2);
+      const x0 = ox + LBL, x1 = x0 + gw + GAP;
+      const pos = (side, r, j) => [(side ? x1 : x0) + j * cs, y0 + r * rh];
+      ctx.textBaseline = 'middle'; ctx.textAlign = 'center';
+      ctx.fillStyle = C('--muted'); ctx.font = body(12);
+      ctx.fillText('调用前', x0 + gw / 2, 12); ctx.fillText('调用后', x1 + gw / 2, 12);
+      ctx.fillStyle = C('--muted'); ctx.font = mono(16); ctx.fillText('→', x0 + gw + GAP / 2, y0 + (P * rh) / 2 - 4);
+      ctx.textAlign = 'left'; ctx.font = mono(12); ctx.fillStyle = C('--ink-2');
+      for (let r = 0; r < P; r++) ctx.fillText('rank ' + r, ox + 4, y0 + r * rh + cs / 2);
+      const drawCell = (x, y, c, alpha) => {
+        ctx.globalAlpha = alpha == null ? 1 : alpha;
+        if (!c) {
+          ctx.setLineDash([3, 3]); ctx.strokeStyle = C('--line-2'); ctx.lineWidth = 1;
+          rrect(ctx, x + 2, y + 2, cs - 4, cs - 4, 4); ctx.stroke(); ctx.setLineDash([]);
+        } else if (c.sum) {
+          ctx.fillStyle = C('--surface-2'); rrect(ctx, x + 2, y + 2, cs - 4, cs - 4, 4); ctx.fill();
+          ctx.strokeStyle = C('--ink-2'); ctx.lineWidth = 1.2; ctx.stroke();
+          const bw = (cs - 8) / P;
+          for (let q = 0; q < P; q++) { ctx.fillStyle = C(RANK[q]); ctx.fillRect(x + 4 + q * bw, y + cs - 9, bw, 4); }
+          ctx.fillStyle = C('--ink'); ctx.textAlign = 'center'; ctx.font = mono(Math.max(10, Math.min(13, cs * 0.34)));
+          ctx.fillText('Σ' + c.j, x + cs / 2, y + cs / 2 - 3);
+        } else {
+          ctx.fillStyle = C(RANKS[c.s]); rrect(ctx, x + 2, y + 2, cs - 4, cs - 4, 4); ctx.fill();
+          ctx.strokeStyle = C(RANK[c.s]); ctx.lineWidth = 1.6; ctx.stroke();
+          ctx.fillStyle = C('--ink'); ctx.textAlign = 'center'; ctx.font = mono(Math.max(10, Math.min(13, cs * 0.34)));
+          ctx.fillText(String(c.j), x + cs / 2, y + cs / 2);
+        }
+        ctx.globalAlpha = 1;
+      };
+      for (let r = 0; r < P; r++) for (let j = 0; j < P; j++) { const [x, y] = pos(0, r, j); drawCell(x, y, o.before[r][j]); }
+      const e = ease(t);
+      for (let r = 0; r < P; r++) for (let j = 0; j < P; j++) {
+        const [x, y] = pos(1, r, j);
+        if (t >= 1) drawCell(x, y, cellOf(o, r, j));
+        else drawCell(x, y, null);
+      }
+      if (t < 1) {
+        for (let r = 0; r < P; r++) for (let j = 0; j < P; j++) {
+          const s = o.src(r, j); if (!s) continue;
+          const [xa, ya] = pos(1, r, j);
+          s.forEach(([q, k]) => {
+            const b = o.before[q][k]; if (!b) return;
+            const [xb, yb] = pos(0, q, k);
+            drawCell(V4U.lerp(xb, xa, e), V4U.lerp(yb, ya, e), b, 0.85);
+          });
+        }
+      }
+    });
+    const setRead = () => { rd.innerHTML = OPS[op].read.map((s) => `<span>${s}</span>`).join(''); };
+    V4U.seg(document.getElementById('sg-prim'), (v) => { op = v; t = 1; setRead(); redraw(); });
+    playOnce(document.getElementById('bt-prim'), cv, 1.6, (x) => { t = x; redraw(); }, () => { t = 1; redraw(); });
+  })();
+
+  /* ---------- 2. ring all-reduce ---------- */
+  (() => {
+    const cv = document.getElementById('cv-ring'), slP = document.getElementById('sl-ring-p'), slK = document.getElementById('sl-ring-k');
+    const oP = document.getElementById('o-ring-p'), oK = document.getElementById('o-ring-k'), rd = document.getElementById('rd-ring');
+    const state = (p, k) => {
+      let m = [...Array(p)].map((_, r) => [...Array(p)].map(() => 1 << r));
+      let sends = [];
+      for (let step = 1; step <= k; step++) {
+        const nm = m.map((row) => row.slice()); sends = [];
+        for (let r = 0; r < p; r++) {
+          const d = (r + 1) % p;
+          if (step <= p - 1) { const c = (((r - (step - 1)) % p) + p) % p; nm[d][c] = m[d][c] | m[r][c]; sends.push([r, c]); }
+          else { const c = (((r + 1 - (step - p)) % p) + p) % p; nm[d][c] = m[r][c]; sends.push([r, c]); }
+        }
+        m = nm;
+      }
+      return { m, sends, full: (1 << p) - 1 };
+    };
+    const geo = (w, p) => { const cs = Math.min(66, Math.floor((w - 56 - 8) / p)); const LBL = 56 + Math.max(0, (w - 56 - 8 - p * cs) / 2); return { LBL, cs, gap: 16, top: 34 }; };
+    const redraw = V4U.canvas(cv, (w) => { const p = +slP.value, g = geo(w, p); return g.top + p * (g.cs + g.gap) + 14; }, (ctx, w, h) => {
+      const p = +slP.value, k = Math.min(+slK.value, 2 * (p - 1));
+      const { LBL, cs, gap, top } = geo(w, p), rh = cs + gap;
+      const { m, sends, full } = state(p, k);
+      ctx.textBaseline = 'middle'; ctx.textAlign = 'center'; ctx.font = mono(11); ctx.fillStyle = C('--muted');
+      for (let c = 0; c < p; c++) ctx.fillText('块 ' + c, LBL + c * cs + cs / 2, 12);
+      ctx.textAlign = 'left'; ctx.font = mono(12); ctx.fillStyle = C('--ink-2');
+      for (let r = 0; r < p; r++) ctx.fillText('rank ' + r, LBL - 52, top + r * rh + cs / 2);
+      const sent = new Set(sends.map(([r, c]) => r * 16 + c));
+      for (let r = 0; r < p; r++) for (let c = 0; c < p; c++) {
+        const x = LBL + c * cs + 2, y = top + r * rh, ww = cs - 4, hh = cs;
+        ctx.fillStyle = C('--surface-2'); rrect(ctx, x, y, ww, hh, 4); ctx.fill();
+        const sw = (ww - 4) / p;
+        for (let q = 0; q < p; q++) if (m[r][c] & (1 << q)) { ctx.fillStyle = C(RANK[q]); ctx.fillRect(x + 2 + q * sw, y + 3, sw, hh - 6); }
+        if (m[r][c] === full) {
+          ctx.fillStyle = C('--surface'); rrect(ctx, x + ww / 2 - 11, y + hh / 2 - 9, 22, 18, 4); ctx.fill();
+          ctx.fillStyle = C('--ink'); ctx.textAlign = 'center'; ctx.font = mono(12); ctx.fillText('Σ', x + ww / 2, y + hh / 2 + 1);
+        }
+        ctx.strokeStyle = sent.has(r * 16 + c) ? C('--accent') : C('--line-2');
+        ctx.lineWidth = sent.has(r * 16 + c) ? 3 : 1; rrect(ctx, x, y, ww, hh, 4); ctx.stroke();
+      }
+      sends.forEach(([r, c]) => {
+        const cx = LBL + c * cs + cs / 2, yb = top + r * rh + cs;
+        if (r < p - 1) arrow(ctx, cx, yb + 1, cx, yb + gap - 1, C('--accent'), 2);
+        else {
+          arrow(ctx, cx, yb + 1, cx, yb + 12, C('--accent'), 2);
+          arrow(ctx, cx, top - 13, cx, top - 1, C('--accent'), 2);
+        }
+      });
+      const steps = 2 * (p - 1);
+      oP.textContent = p; oK.textContent = k;
+      const phase = k === 0 ? '初始' : k <= p - 1 ? `reduce-scatter 第 ${k}/${p - 1} 步` : `all-gather 第 ${k - p + 1}/${p - 1} 步`;
+      rd.innerHTML = `<span>阶段 <b>${phase}</b></span><span>本步每卡发 <b>n/${p}</b></span><span>累计每卡发 <b>${k}/${p}·n</b></span><span>全程 <b>${steps}</b> 步，共 <b>${V4U.fmt(steps / p, 2)}n</b></span>`;
+    });
+    slP.addEventListener('input', () => { const p = +slP.value; slK.max = 2 * (p - 1); if (+slK.value > 2 * (p - 1)) slK.value = 2 * (p - 1); slK.value = Math.min(+slK.value, p - 1); redraw(); });
+    slK.addEventListener('input', redraw);
+    let anim = null; const bt = document.getElementById('bt-ring');
+    bt.addEventListener('click', () => {
+      if (anim) { anim.stop(); anim = null; bt.textContent = '播放'; return; }
+      bt.textContent = '停止'; slK.value = 0; redraw(); let acc = 0;
+      anim = V4U.loop(cv, (t, dt) => {
+        acc += dt; if (acc < 0.9) return; acc = 0;
+        const mx = +slK.max;
+        if (+slK.value >= mx) { anim.stop(); anim = null; bt.textContent = '播放'; return; }
+        slK.value = +slK.value + 1; redraw();
+      });
+    });
+  })();
+
+  /* ---------- 3. double binary tree ---------- */
+  (() => {
+    const cv = document.getElementById('cv-tree'), slP = document.getElementById('sl-tree-p'), slS = document.getElementById('sl-tree-s');
+    const oP = document.getElementById('o-tree-p'), oS = document.getElementById('o-tree-s'), rd = document.getElementById('rd-tree');
+    let sel = 3;
+    // in-order binary tree over positions 1..p
+    const parentPos = (m, p) => {
+      let R = 1; while (R * 2 <= p) R *= 2;
+      if (m === R) return 0;
+      let cur = m, guard = 0;
+      while (guard++ < 40) {
+        const lb = cur & -cur;
+        const up = (cur & (2 * lb)) ? cur - lb : cur + lb;
+        if (up <= p) return up;
+        cur = up;
+      }
+      return 0;
+    };
+    const build = (p) => {
+      const posA = (i) => i + 1, rankA = (m) => m - 1;
+      const posB = (i) => ((i + 1) % p) + 1, rankB = (m) => (m - 2 + p) % p;
+      const mk = (pos, rank) => {
+        const par = [...Array(p)].map((_, i) => { const pm = parentPos(pos(i), p); return pm ? rank(pm) : -1; });
+        const dep = par.map((_, i) => { let d = 0, c = i; while (par[c] >= 0 && d < 64) { c = par[c]; d++; } return d; });
+        const kids = [...Array(p)].map(() => []); par.forEach((q, i) => { if (q >= 0) kids[q].push(i); });
+        return { par, dep, kids, D: Math.max(...dep) };
+      };
+      return [mk(posA, rankA), mk(posB, rankB)];
+    };
+    const redraw = V4U.canvas(cv, (w) => Math.min(300, Math.max(220, w * 0.4)), (ctx, w, h) => {
+      const p = +slP.value; if (sel >= p) sel = p - 1;
+      const T = build(p), D = Math.max(T[0].D, T[1].D);
+      slS.max = 2 * D; if (+slS.value > 2 * D) slS.value = 2 * D;
+      const s = +slS.value;
+      const pad = 18, xs = (i) => pad + (i + 0.5) * (w - 2 * pad) / p, yMid = h / 2;
+      const rad = Math.max(7, Math.min(13, (w - 2 * pad) / p * 0.32));
+      const active = (tr, child) => {
+        if (s === 0) return false;
+        const d = tr.dep[child];
+        if (s <= D) return d === D - s + 1;          // reduce: deepest first
+        return d === s - D;                            // broadcast: shallow first
+      };
+      T.forEach((tr, ti) => {
+        const col = C(ti ? '--c2' : '--c1'), dir = ti ? 1 : -1;
+        tr.par.forEach((q, i) => {
+          if (q < 0) return;
+          const x1 = xs(i), x2 = xs(q), dx = Math.abs(x2 - x1);
+          const hgt = Math.min(h / 2 - rad - 8, 14 + dx * 0.42);
+          const on = active(tr, i), hl = i === sel || q === sel;
+          ctx.strokeStyle = col; ctx.globalAlpha = on || hl ? 1 : 0.45; ctx.lineWidth = on ? 4 : hl ? 2.6 : 1.6;
+          ctx.beginPath(); ctx.moveTo(x1, yMid + dir * rad); ctx.quadraticCurveTo((x1 + x2) / 2, yMid + dir * (rad + hgt * 2), x2, yMid + dir * rad); ctx.stroke();
+          if (on) {
+            const up = s <= D; const t0 = up ? [x1, yMid + dir * rad] : [x2, yMid + dir * rad];
+            const mid = [(x1 + x2) / 2, yMid + dir * (rad + hgt)];
+            ctx.fillStyle = col; ctx.beginPath(); ctx.arc(mid[0], mid[1], 3.5, 0, 2 * Math.PI); ctx.fill();
+            void t0;
+          }
+          ctx.globalAlpha = 1;
+        });
+      });
+      for (let i = 0; i < p; i++) {
+        const x = xs(i), isSel = i === sel;
+        ctx.fillStyle = isSel ? C('--accent-soft') : C('--surface');
+        ctx.beginPath(); ctx.arc(x, yMid, rad, 0, 2 * Math.PI); ctx.fill();
+        ctx.strokeStyle = isSel ? C('--accent') : C('--line-2'); ctx.lineWidth = isSel ? 2.5 : 1.2; ctx.stroke();
+        if (T[0].par[i] < 0 || T[1].par[i] < 0) { ctx.strokeStyle = C(T[0].par[i] < 0 ? '--c1' : '--c2'); ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(x, yMid, rad + 3.5, 0, 2 * Math.PI); ctx.stroke(); }
+        ctx.fillStyle = C('--ink'); ctx.font = mono(rad > 10 ? 12 : 10); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillText(String(i), x, yMid + 0.5);
+      }
+      const both = [...Array(p)].filter((_, i) => T[0].kids[i].length && T[1].kids[i].length).length;
+      const role = (tr) => tr.par[sel] < 0 ? `根，孩子 ${tr.kids[sel].join('、') || '无'}` : tr.kids[sel].length ? `内部节点，孩子 ${tr.kids[sel].join('、')}` : '叶子';
+      oP.textContent = p;
+      oS.textContent = s === 0 ? '0' : s <= D ? `归约 ${s}` : `广播 ${s - D}`;
+      rd.innerHTML = `<span>rank ${sel}：树 A <b>${role(T[0])}</b></span><span>树 B <b>${role(T[1])}</b></span><span>树高 <b>${T[0].D} / ${T[1].D}</b></span><span>两棵树都有孩子的 rank <b>${both}</b> 个</span><span>阶段数 tree <b>${2 * D}</b> vs ring <b>${2 * (p - 1)}</b></span>`;
+    });
+    V4U.drag(cv, (x, y, ph) => {
+      if (ph !== 'down') return;
+      const p = +slP.value, w = cv.clientWidth, pad = 18;
+      const i = Math.floor((x - pad) / ((w - 2 * pad) / p));
+      if (i >= 0 && i < p) { sel = i; redraw(); }
+    });
+    cv.style.touchAction = 'pan-y';
+    slP.addEventListener('input', redraw); slS.addEventListener('input', redraw);
+    let anim = null; const bt = document.getElementById('bt-tree');
+    bt.addEventListener('click', () => {
+      if (anim) { anim.stop(); anim = null; bt.textContent = '播放'; return; }
+      bt.textContent = '停止'; slS.value = 0; redraw(); let acc = 0;
+      anim = V4U.loop(cv, (t, dt) => {
+        acc += dt; if (acc < 0.8) return; acc = 0;
+        if (+slS.value >= +slS.max) { anim.stop(); anim = null; bt.textContent = '播放'; return; }
+        slS.value = +slS.value + 1; redraw();
+      });
+    });
+  })();
+
+  /* ---------- 4. cost plot ---------- */
+  (() => {
+    const cv = document.getElementById('cv-cost'), rd = document.getElementById('rd-cost');
+    const sp = document.getElementById('sl-cost-p'), sa = document.getElementById('sl-cost-a'), sb = document.getElementById('sl-cost-b'), sn = document.getElementById('sl-cost-n');
+    const NMIN = 1e3, NMAX = 4e9, TMIN = 1e-6, TMAX = 10;
+    const model = (p, a, beta, n) => {
+      const lg = Math.ceil(Math.log2(p));
+      return { ring: 2 * (p - 1) * a + 2 * (p - 1) / p * n * beta, tree: 2 * lg * a + 2 * n * beta, rh: 2 * lg * a + 2 * (p - 1) / p * n * beta };
+    };
+    const redraw = V4U.canvas(cv, (w) => Math.min(340, Math.max(240, w * 0.5)), (ctx, w, h) => {
+      const p = 2 ** +sp.value, a = +sa.value * 1e-6, B = +sb.value * 1e9, beta = 1 / B, nSel = 10 ** +sn.value;
+      const L = 58, R = w - 12, Tp = 10, Bt = h - 30;
+      const X = (n) => L + (Math.log10(n) - Math.log10(NMIN)) / (Math.log10(NMAX) - Math.log10(NMIN)) * (R - L);
+      const Y = (t) => Bt - (Math.log10(V4U.clamp(t, TMIN, TMAX)) - Math.log10(TMIN)) / (Math.log10(TMAX) - Math.log10(TMIN)) * (Bt - Tp);
+      ctx.font = mono(11); ctx.textBaseline = 'middle';
+      [[1e-6, '1µs'], [1e-5, '10µs'], [1e-4, '100µs'], [1e-3, '1ms'], [1e-2, '10ms'], [1e-1, '100ms'], [1, '1s'], [10, '10s']].forEach(([t, s]) => {
+        ctx.strokeStyle = C('--line'); ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(L, Y(t)); ctx.lineTo(R, Y(t)); ctx.stroke();
+        ctx.fillStyle = C('--muted'); ctx.textAlign = 'right'; ctx.fillText(s, L - 6, Y(t));
+      });
+      [[1e3, '1KB'], [1e6, '1MB'], [1e9, '1GB']].forEach(([n, s]) => {
+        ctx.strokeStyle = C('--line'); ctx.beginPath(); ctx.moveTo(X(n), Tp); ctx.lineTo(X(n), Bt); ctx.stroke();
+        ctx.fillStyle = C('--muted'); ctx.textAlign = 'center'; ctx.fillText(s, X(n), Bt + 14);
+      });
+      const curve = (key, col, dash) => {
+        ctx.strokeStyle = col; ctx.lineWidth = 2.4; ctx.setLineDash(dash || []); ctx.beginPath();
+        for (let i = 0; i <= 160; i++) { const n = NMIN * (NMAX / NMIN) ** (i / 160); const t = model(p, a, beta, n)[key]; const x = X(n), y = Y(t); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }
+        ctx.stroke(); ctx.setLineDash([]);
+      };
+      curve('tree', C('--c2')); curve('ring', C('--c1')); curve('rh', C('--c3'), [6, 5]);
+      const nStar = p * (p - 1 - Math.ceil(Math.log2(p))) * a / beta;
+      if (nStar > NMIN && nStar < NMAX) {
+        const t = model(p, a, beta, nStar).ring;
+        ctx.strokeStyle = C('--ink-2'); ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(X(nStar), Y(t), 5, 0, 2 * Math.PI); ctx.stroke();
+      }
+      ctx.strokeStyle = C('--accent'); ctx.lineWidth = 1.5; ctx.setLineDash([2, 3]); ctx.beginPath(); ctx.moveTo(X(nSel), Tp); ctx.lineTo(X(nSel), Bt); ctx.stroke(); ctx.setLineDash([]);
+      const m = model(p, a, beta, nSel);
+      [['ring', '--c1'], ['tree', '--c2'], ['rh', '--c3']].forEach(([k, c]) => { ctx.fillStyle = C(c); ctx.beginPath(); ctx.arc(X(nSel), Y(m[k]), 4, 0, 2 * Math.PI); ctx.fill(); });
+      document.getElementById('o-cost-p').textContent = p;
+      document.getElementById('o-cost-a').textContent = sa.value + ' µs';
+      document.getElementById('o-cost-b').textContent = sb.value + ' GB/s';
+      document.getElementById('o-cost-n').textContent = fmtBytes(nSel);
+      const best = m.ring < m.tree ? 'ring' : 'tree';
+      rd.innerHTML = `<span>ring <b>${fmtT(m.ring)}</b></span><span>tree <b>${fmtT(m.tree)}</b></span><span>递归减半倍增 <b>${fmtT(m.rh)}</b></span><span>ring 与 tree 交点 n* ≈ <b>${nStar > 0 ? fmtBytes(nStar) : '—'}</b>（圆圈）</span><span>此处 ring/tree 中更快：<b>${best}</b></span>`;
+    });
+    [sp, sa, sb, sn].forEach((el) => el.addEventListener('input', redraw));
+  })();
+
+  /* ---------- 5. algbw vs busbw ---------- */
+  (() => {
+    const cv = document.getElementById('cv-bw'), rd = document.getElementById('rd-bw'), sp = document.getElementById('sl-bw-p'), sb = document.getElementById('sl-bw-b');
+    let op = 'ar';
+    const fac = (p) => op === 'ar' ? 2 * (p - 1) / p : op === 'ag' ? (p - 1) / p : 1;
+    const facS = (p) => op === 'ar' ? `2(p−1)/p = ${V4U.fmt(fac(p), 3)}` : op === 'ag' ? `(p−1)/p = ${V4U.fmt(fac(p), 3)}` : '1';
+    const redraw = V4U.canvas(cv, (w) => Math.min(300, Math.max(220, w * 0.42)), (ctx, w, h) => {
+      const p = +sp.value, B = +sb.value;
+      const L = 52, R = w - 14, Tp = 12, Bt = h - 30, ymax = B * 2.1;
+      const X = (q) => L + (q - 2) / 62 * (R - L), Y = (v) => Bt - v / ymax * (Bt - Tp);
+      ctx.font = mono(11); ctx.textBaseline = 'middle';
+      for (let k = 0; k <= 4; k++) {
+        const v = B * k / 2;
+        ctx.strokeStyle = C('--line'); ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(L, Y(v)); ctx.lineTo(R, Y(v)); ctx.stroke();
+        ctx.fillStyle = C('--muted'); ctx.textAlign = 'right'; ctx.fillText(V4U.fmt(v, 0), L - 6, Y(v));
+      }
+      [2, 8, 16, 32, 48, 64].forEach((q) => { ctx.fillStyle = C('--muted'); ctx.textAlign = 'center'; ctx.fillText('p=' + q, X(q), Bt + 14); });
+      ctx.strokeStyle = C('--c1'); ctx.lineWidth = 2.6; ctx.beginPath(); ctx.moveTo(X(2), Y(B)); ctx.lineTo(X(64), Y(B)); ctx.stroke();
+      ctx.strokeStyle = C('--c2'); ctx.beginPath();
+      for (let q = 2; q <= 64; q++) { const x = X(q), y = Y(B / fac(q)); q === 2 ? ctx.moveTo(x, y) : ctx.lineTo(x, y); }
+      ctx.stroke();
+      ctx.fillStyle = C('--c2'); ctx.beginPath(); ctx.arc(X(p), Y(B / fac(p)), 5, 0, 2 * Math.PI); ctx.fill();
+      ctx.fillStyle = C('--c1'); ctx.beginPath(); ctx.arc(X(p), Y(B), 5, 0, 2 * Math.PI); ctx.fill();
+      document.getElementById('o-bw-p').textContent = p; document.getElementById('o-bw-b').textContent = B;
+      const alg = B / fac(p), S = 1e9, t = S / (alg * 1e9);
+      rd.innerHTML = `<span>修正因子 <b>${facS(p)}</b></span><span>理想 algbw <b>${V4U.fmt(alg, 0)} GB/s</b></span><span>busbw <b>${B} GB/s</b></span><span>S = 1 GB 时 t ≈ <b>${fmtT(t)}</b></span>`;
+    });
+    V4U.seg(document.getElementById('sg-bw'), (v) => { op = v; redraw(); });
+    sp.addEventListener('input', redraw); sb.addEventListener('input', redraw);
+  })();
+
+  /* ---------- 6. topology ---------- */
+  (() => {
+    const cv = document.getElementById('cv-topo'), rd = document.getElementById('rd-topo');
+    const sn = document.getElementById('sl-topo-n'), snv = document.getElementById('sl-topo-nv'), sib = document.getElementById('sl-topo-ib');
+    let mode = 'a';
+    const SN = [0, 1, 2, 3, 7, 6, 5, 4];
+    const cfg = {
+      a: { sel: [[0, 0], [0, 1], [0, 2], [0, 3], [0, 4], [0, 5], [0, 6], [0, 7]], ring: SN.map((g) => [0, g]) },
+      b: { sel: [0, 1, 2, 3].map((g) => [0, g]).concat([0, 1, 2, 3].map((g) => [1, g])), ring: [[0, 0], [0, 1], [0, 2], [0, 3], [1, 3], [1, 2], [1, 1], [1, 0]] },
+      c: { sel: [], ring: SN.map((g) => [0, g]).concat([4, 5, 6, 7, 3, 2, 1, 0].map((g) => [1, g])) },
+      d: { sel: [], ring: null },
+    };
+    const redraw = V4U.canvas(cv, (w) => { const nw = (w - 20) / 2, gs = Math.min(40, (nw - 18 - 3 * 8) / 4); return 26 + 2 * gs + 10 + 16 + 26 + 60; }, (ctx, w, h) => {
+      const mid = 20, nw = (w - mid) / 2, gs = Math.min(40, (nw - 18 - 3 * 8) / 4), gap = 8;
+      const ny = 4, nh = 26 + 2 * gs + 10 + 22, ibY = ny + nh + 22;
+      const gx = (k, g) => k * (nw + mid) + 9 + (g % 4) * (gs + gap) + ((nw - 18) - (4 * gs + 3 * gap)) / 2;
+      const gy = (g) => ny + 24 + Math.floor(g / 4) * (gs + 10);
+      const ctr = (k, g) => [gx(k, g) + gs / 2, gy(g) + gs / 2];
+      const all16 = mode === 'c' || mode === 'd';
+      const isSel = (k, g) => all16 || cfg[mode].sel.some(([a, b]) => a === k && b === g);
+      // IB switch bar
+      ctx.fillStyle = C('--surface-2'); rrect(ctx, 8, ibY, w - 16, 32, 5); ctx.fill(); ctx.strokeStyle = C('--line-2'); ctx.lineWidth = 1; ctx.stroke();
+      const ibPath = (a, b, off, col) => {
+        const [x1, y1] = ctr(a[0], a[1]), [x2, y2] = ctr(b[0], b[1]);
+        const yy = ibY + 4 + off;
+        ctx.strokeStyle = col; ctx.lineWidth = mode === 'd' ? 1.6 : 2.4; ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x1, yy); ctx.lineTo(x2, yy); ctx.lineTo(x2, y2); ctx.stroke();
+      };
+      const nvLine = (a, b) => { const [x1, y1] = ctr(a[0], a[1]), [x2, y2] = ctr(b[0], b[1]); ctx.strokeStyle = C('--c1'); ctx.lineWidth = 2.6; ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke(); };
+      // node frames
+      for (let k = 0; k < 2; k++) {
+        const x = k * (nw + mid);
+        ctx.fillStyle = C('--surface'); rrect(ctx, x + 1, ny, nw - 2, nh, 8); ctx.fill(); ctx.strokeStyle = C('--line-2'); ctx.lineWidth = 1.2; ctx.stroke();
+        ctx.fillStyle = C('--ink-2'); ctx.font = body(12, 700); ctx.textAlign = 'left'; ctx.fillText('节点 ' + k, x + 10, ny + 12);
+        ctx.fillStyle = C('--surface-2'); rrect(ctx, x + 9, ny + nh - 16, nw - 18, 10, 3); ctx.fill();
+        ctx.fillStyle = C('--muted'); ctx.font = mono(9); ctx.textAlign = 'center'; ctx.fillText('NVSwitch', x + nw / 2, ny + nh - 11);
+      }
+      // links (under GPUs)
+      if (mode === 'd') {
+        for (let g = 0; g < 8; g++) ibPath([0, g], [1, g], g * 3.4, C('--c2'));
+        for (let k = 0; k < 2; k++) for (let i = 0; i < 8; i++) nvLine([k, SN[i]], [k, SN[(i + 1) % 8]]);
+      } else {
+        const ring = cfg[mode].ring;
+        ring.forEach((a, i) => { const b = ring[(i + 1) % ring.length]; if (a[0] !== b[0]) ibPath(a, b, i === ring.length - 1 ? 14 : 4, C('--c2')); });
+        ring.forEach((a, i) => { const b = ring[(i + 1) % ring.length]; if (a[0] === b[0]) nvLine(a, b); });
+      }
+      ctx.font = mono(11); ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillStyle = C('--muted'); ctx.fillText('IB 交换机（节点间网络）', w / 2, ibY + 43);
+      for (let k = 0; k < 2; k++) for (let g = 0; g < 8; g++) {
+        const s = isSel(k, g), x = gx(k, g), y = gy(g);
+        ctx.fillStyle = s ? C('--accent-soft') : C('--surface-2'); rrect(ctx, x, y, gs, gs, 5); ctx.fill();
+        ctx.strokeStyle = s ? C('--accent') : C('--line-2'); ctx.lineWidth = s ? 2 : 1; ctx.stroke();
+        ctx.fillStyle = s ? C('--ink') : C('--muted'); ctx.font = mono(Math.min(12, gs * 0.4)); ctx.textAlign = 'center'; ctx.fillText('G' + g, x + gs / 2, y + gs / 2);
+      }
+      const n = 1e6 * 4 ** +sn.value, Bnv = +snv.value * 1e9, Bib = +sib.value * 1e9;
+      document.getElementById('o-topo-n').textContent = fmtBytes(n);
+      document.getElementById('o-topo-nv').textContent = snv.value;
+      document.getElementById('o-topo-ib').textContent = sib.value;
+      let html = '';
+      if (mode === 'a') { const t = 2 * 7 / 8 * n / Bnv; html = `<span>p = <b>8</b>，最慢一跳 <b>NVLink</b></span><span>T = 2·7/8·n / B<sub>nv</sub> = <b>${fmtT(t)}</b></span>`; }
+      if (mode === 'b') { const t = 2 * 7 / 8 * n / Bib, t0 = 2 * 7 / 8 * n / Bnv; html = `<span>p = <b>8</b>，最慢一跳 <b>网卡</b></span><span>T = 2·7/8·n / B<sub>ib</sub> = <b>${fmtT(t)}</b></span><span>是同节点放法的 <b>${V4U.fmt(t / t0, 1)}×</b></span>`; }
+      if (mode === 'c') { const t = 2 * 15 / 16 * n / Bib; html = `<span>p = <b>16</b>，单环，最慢一跳 <b>网卡</b></span><span>T = 2·15/16·n / B<sub>ib</sub> = <b>${fmtT(t)}</b></span>`; }
+      if (mode === 'd') {
+        const t1 = 7 / 8 * n / Bnv, t2 = 2 * (1 / 2) * (n / 8) / Bib, t3 = t1, tc = 2 * 15 / 16 * n / Bib;
+        html = `<span>① 节点内 RS <b>${fmtT(t1)}</b></span><span>② 8 组节点间 AR（各 n/8）<b>${fmtT(t2)}</b></span><span>③ 节点内 AG <b>${fmtT(t3)}</b></span><span>合计 <b>${fmtT(t1 + t2 + t3)}</b>，单环 ${fmtT(tc)}</span>`;
+      }
+      rd.innerHTML = html;
+    });
+    V4U.seg(document.getElementById('sg-topo'), (v) => { mode = v; redraw(); });
+    [sn, snv, sib].forEach((el) => el.addEventListener('input', redraw));
+  })();
+
+  /* ---------- 7. overlap timeline ---------- */
+  (() => {
+    const cv = document.getElementById('cv-ovl'), rd = document.getElementById('rd-ovl'), sl = document.getElementById('sl-ovl');
+    let mode = 'ovl';
+    const Lyr = 6;
+    const sched = (ratio, ovl) => {
+      const comp = [], comm = []; let t = 0;
+      for (let i = 0; i < Lyr; i++) { comp.push([t, t + 1, Lyr - i]); t += 1; }
+      let ce = ovl ? 0 : Lyr;
+      for (let i = 0; i < Lyr; i++) {
+        const ready = ovl ? comp[i][1] : Lyr;
+        const s = Math.max(ready, ce); comm.push([s, s + ratio, Lyr - i]); ce = s + ratio;
+      }
+      return { comp, comm, end: Math.max(Lyr, ce) };
+    };
+    const redraw = V4U.canvas(cv, 150, (ctx, w, h) => {
+      const ratio = +sl.value, S = sched(ratio, mode === 'ovl'), Smax = Lyr + Lyr * 2;
+      const L = 58, R = w - 10, X = (t) => L + t / Smax * (R - L);
+      const lanes = [[28, '计算流'], [74, '通信流']], lh = 34;
+      ctx.textBaseline = 'middle';
+      lanes.forEach(([y, s]) => { ctx.fillStyle = C('--ink-2'); ctx.font = body(12); ctx.textAlign = 'left'; ctx.fillText(s, 2, y + lh / 2); ctx.strokeStyle = C('--line'); ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(L, y + lh + 4); ctx.lineTo(R, y + lh + 4); ctx.stroke(); });
+      const blk = (a, b, y, c, cs, lab) => {
+        const x = X(a), ww = Math.max(1, X(b) - X(a) - 1.5);
+        ctx.fillStyle = C(cs); rrect(ctx, x, y, ww, lh, 4); ctx.fill(); ctx.strokeStyle = C(c); ctx.lineWidth = 1.5; ctx.stroke();
+        if (ww > 16) { ctx.fillStyle = C('--ink'); ctx.font = mono(ww > 26 ? 11 : 9); ctx.textAlign = 'center'; ctx.fillText(lab, x + ww / 2, y + lh / 2); }
+      };
+      S.comp.forEach(([a, b, l]) => blk(a, b, lanes[0][0], '--c1', '--c1s', 'L' + l));
+      S.comm.forEach(([a, b, l]) => blk(a, b, lanes[1][0], '--c2', '--c2s', '∇' + l));
+      ctx.strokeStyle = C('--accent'); ctx.lineWidth = 2; ctx.setLineDash([4, 3]); ctx.beginPath(); ctx.moveTo(X(S.end), 18); ctx.lineTo(X(S.end), 120); ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle = C('--muted'); ctx.font = mono(11); ctx.textAlign = 'center';
+      for (let t = 0; t <= Smax; t += 2) ctx.fillText(String(t), X(t), 132);
+      document.getElementById('o-ovl').textContent = V4U.fmt(ratio);
+      const ser = Lyr + Lyr * ratio;
+      rd.innerHTML = `<span>一步用时 <b>${V4U.fmt(S.end, 2)}</b></span><span>纯计算 <b>${Lyr}</b></span><span>露在外面的通信 <b>${V4U.fmt(S.end - Lyr, 2)}</b></span><span>串行时 <b>${V4U.fmt(ser, 2)}</b></span>`;
+    });
+    V4U.seg(document.getElementById('sg-ovl'), (v) => { mode = v; redraw(); });
+    sl.addEventListener('input', redraw);
+  })();
+});
+</script>
+</body>
+</html>

@@ -21,14 +21,20 @@
       "title": "Agentic RL",
       "en": "Agentic RL",
       "summary": "用强化学习训练多轮行动的智能体：先讲 LLM 上的策略梯度，再看 coding agent 和直接操控机器人的 robot-use agent。"
+    },
+    {
+      "id": "dist-train",
+      "no": "4",
+      "title": "分布式训练",
+      "en": "Distributed Training",
+      "summary": "模型一张卡放不下、一张卡算不完时怎么训：显存与算力的账、数值精度、集合通信、优化器、FlashAttention，以及 DP / FSDP / TP / SP / PP / CP / EP 等并行怎么切、怎么组合。"
     }
   ],
   "pages": [
     {
       "slug": "rotations",
       "section": "robotics",
-      "no": "0",
-      "extra": true,
+      "no": "i",
       "title": "旋转与位姿表示",
       "short": "旋转与位姿",
       "en": "Rotations & Poses",
@@ -37,7 +43,7 @@
     {
       "slug": "action-space",
       "section": "robotics",
-      "no": "i",
+      "no": "ii",
       "title": "机器人的运动空间",
       "short": "运动空间",
       "en": "Action Spaces, FK & IK",
@@ -46,7 +52,7 @@
     {
       "slug": "camera",
       "section": "robotics",
-      "no": "ii",
+      "no": "iii",
       "title": "相机模型与标定",
       "short": "相机",
       "en": "Camera Models & Calibration",
@@ -82,8 +88,7 @@
     {
       "slug": "llm-rl-basics",
       "section": "agentic-rl",
-      "no": "0",
-      "extra": true,
+      "no": "i",
       "title": "LLM 强化学习基础",
       "short": "RL 基础",
       "en": "Policy Gradients for LLMs",
@@ -92,7 +97,7 @@
     {
       "slug": "coding-agent",
       "section": "agentic-rl",
-      "no": "i",
+      "no": "ii",
       "title": "Coding Agent 的训练",
       "short": "Coding Agent",
       "en": "Training Coding Agents",
@@ -101,11 +106,83 @@
     {
       "slug": "robot-use-agent",
       "section": "agentic-rl",
-      "no": "ii",
+      "no": "iii",
       "title": "Robot-Use Agent 的训练",
       "short": "Robot-Use Agent",
       "en": "Training Robot-Use Agents",
       "summary": "让推理模型像操作电脑一样直接操作机器人：动作接口、仿真里只用成功信号的 RL（PEAR），和把动作写成语义步骤的 SFT（nanoAstra）。"
+    },
+    {
+      "slug": "gpu-memory-flops",
+      "section": "dist-train",
+      "no": "i",
+      "title": "训练的显存与算力账",
+      "short": "显存与算力",
+      "en": "GPU Memory & FLOPs",
+      "summary": "GPU 的存储层级与 roofline，一步训练要多少 FLOPs、MFU 怎么算，参数 / 梯度 / 优化器状态 / 激活各占多少显存，以及重计算和梯度累积。"
+    },
+    {
+      "slug": "numerics",
+      "section": "dist-train",
+      "no": "ii",
+      "title": "数值精度与混合精度",
+      "short": "数值精度",
+      "en": "Number Formats & Mixed Precision",
+      "summary": "FP32 / TF32 / FP16 / BF16 / FP8 / MXFP8 / MXFP4 / NVFP4 的位布局与取值范围，混合精度训练、loss scaling、FP8 与块缩放、随机舍入。"
+    },
+    {
+      "slug": "collectives",
+      "section": "dist-train",
+      "no": "iii",
+      "title": "集合通信",
+      "short": "集合通信",
+      "en": "Collective Communication",
+      "summary": "broadcast、reduce、all-reduce、all-gather、reduce-scatter、all-to-all 的语义与通信量，ring 与 tree 算法的 α-β 代价，NVLink / InfiniBand 拓扑与 NCCL。"
+    },
+    {
+      "slug": "optimizers",
+      "section": "dist-train",
+      "no": "iv",
+      "title": "优化器：从 Adam 到 Muon",
+      "short": "优化器",
+      "en": "Optimizers: Adam to Muon",
+      "summary": "动量 SGD、Adam、AdamW 的更新与状态，学习率调度与梯度裁剪，Muon 的 Newton–Schulz 正交化及其在大模型上的用法。"
+    },
+    {
+      "slug": "data-parallel",
+      "section": "dist-train",
+      "no": "v",
+      "title": "数据并行：DDP、ZeRO 与 FSDP",
+      "short": "DP / ZeRO / FSDP",
+      "en": "Data Parallelism, ZeRO & FSDP",
+      "summary": "梯度 all-reduce 与分桶重叠，ZeRO-1/2/3 把优化器状态、梯度、参数切到各卡，FSDP / FSDP2 / HSDP 的执行顺序，以及 offload。"
+    },
+    {
+      "slug": "flash-attention",
+      "section": "dist-train",
+      "no": "vi",
+      "title": "FlashAttention 系列",
+      "short": "FlashAttention",
+      "en": "FlashAttention 1–4",
+      "summary": "标准 attention 的显存读写瓶颈，online softmax 与分块，FlashAttention 1 / 2 / 3 / 4 各改了什么，以及 Flash-Decoding 和变长、掩码变体。"
+    },
+    {
+      "slug": "tp-pp",
+      "section": "dist-train",
+      "no": "vii",
+      "title": "张量并行与流水线并行",
+      "short": "TP / SP / PP",
+      "en": "Tensor, Sequence & Pipeline Parallelism",
+      "summary": "Megatron 的列切 / 行切与序列并行，流水线的气泡：GPipe、1F1B、交错调度、Zero Bubble 与 DualPipe。"
+    },
+    {
+      "slug": "cp-ep",
+      "section": "dist-train",
+      "no": "viii",
+      "title": "长序列与 MoE 并行，及多维组合",
+      "short": "CP / EP / 组合",
+      "en": "Context & Expert Parallelism, N-D Composition",
+      "summary": "Ring Attention 与 Ulysses 两种上下文并行，MoE 的专家并行与 all-to-all、专家张量并行（ETP），以及 DP×TP×PP×CP×EP 怎么排进集群、怎么选配置。"
     }
   ]
 }

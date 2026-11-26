@@ -9,7 +9,7 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700&family=Inter+Tight:wght@700&family=JetBrains+Mono:wght@400;700&family=Noto+Sans+SC:wght@400;700&display=swap">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
-<link rel="stylesheet" href="../../assets/v4u.css?v=4288b6c4">
+<link rel="stylesheet" href="../../assets/v4u.css?v=691854ab">
 <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
 <script src="../../assets/v4u.js?v=d6640e00"></script>
@@ -51,11 +51,11 @@
 </head>
 <body>
 <!-- v4u:nav -->
-<nav class="v4u-nav" aria-label="站点导航"><div class="v4u-nav-in"><span class="v4u-crumb"><a href="../../"><b>Vis4Und</b></a><span class="v4u-sep">/</span><a href="../../#agentic-rl">(3) Agentic RL</a></span><span class="v4u-links"><a href="../llm-rl-basics/">补充 RL 基础</a><a href="../coding-agent/" aria-current="page">(i) Coding Agent</a><a href="../robot-use-agent/">(ii) Robot-Use Agent</a><button type="button" class="v4u-theme" aria-label="切换深浅色">深色</button></span></div></nav>
+<nav class="v4u-nav" aria-label="站点导航"><div class="v4u-nav-in"><span class="v4u-crumb"><a href="../../"><b>Vis4Und</b></a><span class="v4u-sep">/</span><a href="../../#agentic-rl">(3) Agentic RL</a></span><span class="v4u-links"><a href="../llm-rl-basics/">(i) RL 基础</a><a href="../coding-agent/" aria-current="page">(ii) Coding Agent</a><a href="../robot-use-agent/">(iii) Robot-Use Agent</a><button type="button" class="v4u-theme" aria-label="切换深浅色">深色</button></span></div></nav>
 <!-- /v4u:nav -->
 
 <header class="hero"><div class="wrap">
-  <p class="kicker">(3) Agentic RL · (i)</p>
+  <p class="kicker">(3) Agentic RL · (ii)</p>
   <h1>Coding Agent 的训练</h1>
   <p class="lede">Coding agent = 语言模型 + 一套工具（bash、看文件、改文件）+ 一个循环。训练它要三样东西：能跑测试的任务环境、从强模型轨迹做的 SFT 冷启动、以测试是否通过为奖励的多轮 RL。策略梯度和 GRPO 的记号沿用<a href="../llm-rl-basics/">补充篇</a>。</p>
   <p class="asks-h">读完能回答</p>
@@ -224,7 +224,7 @@
     <li><p>轨迹概率是模型和环境交替的乘积：</p>$$p_\theta(\tau)=\prod_{k=1}^{K}\pi_\theta(a_k\mid h_k)\,P_\text{env}(o_k\mid h_k,a_k)$$</li>
     <li><p>取对数再对 $\theta$ 求导，环境项是常数，消失：</p>$$\nabla_\theta\log p_\theta(\tau)=\sum_{k=1}^{K}\nabla_\theta\log\pi_\theta(a_k\mid h_k)$$</li>
     <li><p>每个 $a_k$ 再拆成 token，正好是序列里 $m_t=1$ 的位置；观察 token 只作为条件出现在 $z_{&lt;t}$ 里：</p>$$\nabla_\theta\log p_\theta(\tau)=\sum_{t=1}^{L}m_t\,\nabla_\theta\log\pi_\theta(z_t\mid z_{&lt;t})$$</li>
-    <li><p>代入策略梯度（推导见<a href="../llm-rl-basics/#pg">补充篇</a>）：</p>$$\nabla_\theta J=\mathbb E_{\tau}\Big[R(\tau)\sum_{t}m_t\,\nabla_\theta\log\pi_\theta(z_t\mid z_{&lt;t})\Big]$$</li>
+    <li><p>代入策略梯度（推导见<a href="../llm-rl-basics/#pg">LLM 强化学习基础</a>）：</p>$$\nabla_\theta J=\mathbb E_{\tau}\Big[R(\tau)\sum_{t}m_t\,\nabla_\theta\log\pi_\theta(z_t\mid z_{&lt;t})\Big]$$</li>
     <li><p>同一任务采 $G$ 条轨迹，用组内基线、token-mean 聚合（只数 mask 内的 token），就是常见的多轮 GRPO / DAPO 目标：</p>$$\mathcal J=\mathbb E\Bigg[\frac{1}{\sum_i\sum_t m_{i,t}}\sum_{i=1}^{G}\sum_{t}m_{i,t}\min\big(\rho_{i,t}\hat A_i,\ \operatorname{clip}(\rho_{i,t},1-\epsilon_\text{low},1+\epsilon_\text{high})\hat A_i\big)\Bigg],\quad \hat A_i=\frac{R_i-\bar R}{\operatorname{std}(R)}$$</li>
   </ol>
   <div class="note pit"><b>易错</b>
