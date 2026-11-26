@@ -33,10 +33,8 @@ Visualize for Understanding：机器人学习研究要补的预备知识，每�
 - (ii) [数值精度与混合精度](https://gongshukai.github.io/Vis4Und/pages/numerics/) — FP32 / TF32 / FP16 / BF16 / FP8 / MXFP8 / MXFP4 / NVFP4 的位布局与取值范围，混合精度训练、loss scaling、FP8 与块缩放、随机舍入。
 - (iii) [集合通信](https://gongshukai.github.io/Vis4Und/pages/collectives/) — broadcast、reduce、all-reduce、all-gather、reduce-scatter、all-to-all 的语义与通信量，ring 与 tree 算法的 α-β 代价，NVLink / InfiniBand 拓扑与 NCCL。
 - (iv) [优化器：从 Adam 到 Muon](https://gongshukai.github.io/Vis4Und/pages/optimizers/) — 动量 SGD、Adam、AdamW 的更新与状态，学习率调度与梯度裁剪，Muon 的 Newton–Schulz 正交化及其在大模型上的用法。
-- (v) [数据并行：DDP、ZeRO 与 FSDP](https://gongshukai.github.io/Vis4Und/pages/data-parallel/) — 梯度 all-reduce 与分桶重叠，ZeRO-1/2/3 把优化器状态、梯度、参数切到各卡，FSDP / FSDP2 / HSDP 的执行顺序，以及 offload。
-- (vi) [FlashAttention 系列](https://gongshukai.github.io/Vis4Und/pages/flash-attention/) — 标准 attention 的显存读写瓶颈，online softmax 与分块，FlashAttention 1 / 2 / 3 / 4 各改了什么，以及 Flash-Decoding 和变长、掩码变体。
-- (vii) [张量并行与流水线并行](https://gongshukai.github.io/Vis4Und/pages/tp-pp/) — Megatron 的列切 / 行切与序列并行，流水线的气泡：GPipe、1F1B、交错调度、Zero Bubble 与 DualPipe。
-- (viii) [长序列与 MoE 并行，及多维组合](https://gongshukai.github.io/Vis4Und/pages/cp-ep/) — Ring Attention 与 Ulysses 两种上下文并行，MoE 的专家并行与 all-to-all、专家张量并行（ETP），以及 DP×TP×PP×CP×EP 怎么排进集群、怎么选配置。
+- (v) [FlashAttention 系列](https://gongshukai.github.io/Vis4Und/pages/flash-attention/) — 标准 attention 的显存读写瓶颈，online softmax 与分块，FlashAttention 1 / 2 / 3 / 4 各改了什么，以及 Flash-Decoding 和变长、掩码变体。
+- (vi) [并行策略](https://gongshukai.github.io/Vis4Und/pages/parallelism/) — 数据并行与 ZeRO / FSDP / HSDP，张量并行与序列并行，流水线的 GPipe / 1F1B / 交错 / Zero Bubble / DualPipe，上下文并行（Ring Attention、Ulysses），MoE 的专家并行与 ETP，以及多维组合与配置估算。
 <!-- catalog:end -->
 
 ## 添加专题

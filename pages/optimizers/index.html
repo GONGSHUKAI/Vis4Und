@@ -25,13 +25,13 @@
 </head>
 <body>
 <!-- v4u:nav -->
-<nav class="v4u-nav" aria-label="站点导航"><div class="v4u-nav-in"><span class="v4u-crumb"><a href="../../"><b>Vis4Und</b></a><span class="v4u-sep">/</span><a href="../../#dist-train">(4) 分布式训练</a></span><span class="v4u-links"><a href="../gpu-memory-flops/">(i) 显存与算力</a><a href="../numerics/">(ii) 数值精度</a><a href="../collectives/">(iii) 集合通信</a><a href="../optimizers/" aria-current="page">(iv) 优化器</a><a href="../data-parallel/">(v) DP / ZeRO / FSDP</a><a href="../flash-attention/">(vi) FlashAttention</a><a href="../tp-pp/">(vii) TP / SP / PP</a><a href="../cp-ep/">(viii) CP / EP / 组合</a><button type="button" class="v4u-theme" aria-label="切换深浅色">深色</button></span></div></nav>
+<nav class="v4u-nav" aria-label="站点导航"><div class="v4u-nav-in"><span class="v4u-crumb"><a href="../../"><b>Vis4Und</b></a><span class="v4u-sep">/</span><a href="../../#dist-train">(4) 分布式训练</a></span><span class="v4u-links"><a href="../gpu-memory-flops/">(i) 显存与算力</a><a href="../numerics/">(ii) 数值精度</a><a href="../collectives/">(iii) 集合通信</a><a href="../optimizers/" aria-current="page">(iv) 优化器</a><a href="../flash-attention/">(v) FlashAttention</a><a href="../parallelism/">(vi) 并行策略</a><button type="button" class="v4u-theme" aria-label="切换深浅色">深色</button></span></div></nav>
 <!-- /v4u:nav -->
 
 <header class="hero"><div class="wrap">
   <p class="kicker">(4) 分布式训练 · (iv)</p>
   <h1>优化器：从 Adam 到 Muon</h1>
-  <p class="lede">优化器决定怎样把梯度变成参数更新，也决定每个参数要额外存几份状态，后者正是 <a href="../data-parallel/#zero">ZeRO</a> 要切分的东西。这一页从动量 SGD 推到 Adam、AdamW，再到对整块矩阵做正交化的 Muon，以及把 Muon 放进千亿参数训练和 ZeRO 切分时要做的修改。</p>
+  <p class="lede">优化器决定怎样把梯度变成参数更新，也决定每个参数要额外存几份状态，后者正是 <a href="../parallelism/#zero">ZeRO</a> 要切分的东西。这一页从动量 SGD 推到 Adam、AdamW，再到对整块矩阵做正交化的 Muon，以及把 Muon 放进千亿参数训练和 ZeRO 切分时要做的修改。</p>
   <p class="asks-h">读完能回答</p>
   <ul class="asks">
     <li>损失乘以 10，SGD 和 Adam 的更新各变成多少？</li>
@@ -198,7 +198,7 @@
   <h3>梯度裁剪</h3>
   <div class="eq">$$\hat g=g\cdot\min\!\Big(1,\ \frac{c}{\|g\|_2}\Big)$$</div>
   <p>$\|g\|_2$ 是全模型所有参数拼在一起的范数。</p>
-  <p>分布式训练时每卡只有一部分梯度（<a href="../data-parallel/#zero">ZeRO</a> 切片、<a href="../tp-pp/#tp">张量并行</a>切块、<a href="../tp-pp/#pp">流水线</a>各段）。每卡先算本地平方和，<a href="../collectives/#primitives">all-reduce</a> 求和后开方，所有卡用同一个缩放系数，梯度方向不变：</p>
+  <p>分布式训练时每卡只有一部分梯度（<a href="../parallelism/#zero">ZeRO</a> 切片、<a href="../parallelism/#tp">张量并行</a>切块、<a href="../parallelism/#pp">流水线</a>各段）。每卡先算本地平方和，<a href="../collectives/#primitives">all-reduce</a> 求和后开方，所有卡用同一个缩放系数，梯度方向不变：</p>
   <div class="eq">$$\|g\|_2=\sqrt{\textstyle\sum_{r}\|g^{(r)}\|_2^2}$$</div>
 
   <figure class="viz" id="viz-clip">
@@ -229,12 +229,12 @@
       <label for="sl-nd">ZeRO-1 卡数 $N_d$ <input type="range" id="sl-nd" min="0" max="10" step="1" value="3"><output id="o-nd">8</output></label>
     </div>
     <ul class="chips"><li><i style="background:var(--c1)"></i>权重</li><li><i style="background:var(--c2)"></i>梯度</li><li><i style="background:var(--c3)"></i>FP32 主权重</li><li><i style="background:var(--c4)"></i>一阶矩 / 动量</li><li><i style="background:var(--c5)"></i>二阶矩</li></ul>
-    <figcaption>每行右侧是整个模型的总量，以及（窄屏上斜杠后面的数） <a href="../data-parallel/#zero">ZeRO-1</a> 把主权重和优化器状态切到 $N_d$ 张卡后每卡的量（权重和梯度仍是全量）。「FP32 梯度」一行对应 Megatron 默认的 FP32 梯度累加缓冲：$2+4+12=18$ 字节。Adafactor 的分解二阶矩只有 $O(n+m)$，图里按 0 画。</figcaption>
+    <figcaption>每行右侧是整个模型的总量，以及（窄屏上斜杠后面的数） <a href="../parallelism/#zero">ZeRO-1</a> 把主权重和优化器状态切到 $N_d$ 张卡后每卡的量（权重和梯度仍是全量）。「FP32 梯度」一行对应 Megatron 默认的 FP32 梯度累加缓冲：$2+4+12=18$ 字节。Adafactor 的分解二阶矩只有 $O(n+m)$，图里按 0 画。</figcaption>
   </figure>
 
   <p><b>8-bit Adam</b>（Dettmers et al., 2022）把 $m,v$ 分块量化到 8 bit，每块另存一个缩放系数，状态从 8 字节降到约 2 字节。</p>
   <p><b>Adafactor</b>（Shazeer &amp; Stern, 2018）对矩阵参数 $W\in\mathbb{R}^{n\times m}$ 只存二阶矩的行和 $R\in\mathbb{R}^n$ 与列和 $C\in\mathbb{R}^m$，用秩 1 的 $\hat V=RC^\top/(\mathbf 1^\top R)$ 近似，状态从 $nm$ 降到 $n+m$，常同时去掉一阶矩。</p>
-  <div class="note"><b>和 ZeRO 的关系</b><p>16 字节里的 12 字节（主权重、$m$、$v$）只在 <code>optimizer.step()</code> 里用到，而且 AdamW 是逐元素的，任意切分后各卡独立更新自己那段即可。这就是 <a href="../data-parallel/#zero">ZeRO-1</a> 先切它们的原因。</p></div>
+  <div class="note"><b>和 ZeRO 的关系</b><p>16 字节里的 12 字节（主权重、$m$、$v$）只在 <code>optimizer.step()</code> 里用到，而且 AdamW 是逐元素的，任意切分后各卡独立更新自己那段即可。这就是 <a href="../parallelism/#zero">ZeRO-1</a> 先切它们的原因。</p></div>
 </section>
 
 <!-- ============================== Muon ============================== -->
@@ -349,7 +349,7 @@ def newton_schulz5(G, steps=5, eps=1e-7):
 <!-- ============================== distributed Muon ============================== -->
 <section id="muon-dist">
   <h2>分布式 Muon</h2>
-  <p>AdamW 逐元素更新：参数被 <a href="../data-parallel/#zero">ZeRO</a> 按扁平缓冲区随便切开，每卡更新自己那段即可。Muon 的 NS 要整块矩阵：$XX^\top$ 把所有行混在一起，只拿一段行做正交化，得到的是另一个矩阵。</p>
+  <p>AdamW 逐元素更新：参数被 <a href="../parallelism/#zero">ZeRO</a> 按扁平缓冲区随便切开，每卡更新自己那段即可。Muon 的 NS 要整块矩阵：$XX^\top$ 把所有行混在一起，只拿一段行做正交化，得到的是另一个矩阵。</p>
   <ol class="derive">
     <li><p>把 $M$ 按行切成 $p$ 块，每卡各自正交化，得到的每块行向量各自正交：</p>$$\begin{gathered}M=\begin{bmatrix}M_1\\ \vdots\\ M_p\end{bmatrix}\\ O_i=\operatorname{orth}(M_i),\qquad O_iO_i^\top=I\end{gathered}$$</li>
     <li><p>拼起来的 $\tilde O$ 只有对角块是单位阵，交叉块 $O_iO_j^\top$ 一般不为 0：</p>$$\tilde O\tilde O^\top=\begin{bmatrix}I&O_1O_2^\top&\cdots\\ O_2O_1^\top&I&\cdots\\ \vdots&&\ddots\end{bmatrix}\ne I$$</li>
@@ -372,7 +372,7 @@ def newton_schulz5(G, steps=5, eps=1e-7):
   <ul>
     <li><b>聚合后重复计算</b>：Moonlight 的 Distributed Muon 建在 Megatron 的 ZeRO-1 上。梯度 reduce-scatter 后每卡更新自己那段动量，再在数据并行组内 <a href="../collectives/#primitives">all-gather</a> 拼出整块 $M$，每卡都算一遍 NS，只取自己那段更新。代价是一次额外的 all-gather 和组内重复的 NS 计算。</li>
     <li><b>按矩阵分工</b>：把不同矩阵的 NS 分给不同 rank 算，算完再 all-gather 回去，去掉重复计算。</li>
-    <li><b>张量并行</b>：被 <a href="../tp-pp/#tp">TP</a> 切开的矩阵同样要先在 TP 组内拼起来再正交化。</li>
+    <li><b>张量并行</b>：被 <a href="../parallelism/#tp">TP</a> 切开的矩阵同样要先在 TP 组内拼起来再正交化。</li>
     <li><b>换算法</b>：Dion（Ahn et al., 2025）用低秩的正交化更新，可以直接在 FSDP / TP 切分下计算。</li>
   </ul>
 </section>
@@ -419,7 +419,7 @@ def newton_schulz5(G, steps=5, eps=1e-7):
 </div>
 
 <!-- v4u:foot -->
-<footer class="v4u-foot"><div class="v4u-foot-in"><a class="pv" href="../collectives/"><span>上一篇</span>集合通信</a><a class="nx" href="../data-parallel/"><span>下一篇</span>数据并行：DDP、ZeRO 与 FSDP</a></div></footer>
+<footer class="v4u-foot"><div class="v4u-foot-in"><a class="pv" href="../collectives/"><span>上一篇</span>集合通信</a><a class="nx" href="../flash-attention/"><span>下一篇</span>FlashAttention 系列</a></div></footer>
 <!-- /v4u:foot -->
 
 <script>

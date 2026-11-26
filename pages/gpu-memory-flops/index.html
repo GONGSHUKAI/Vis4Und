@@ -28,7 +28,7 @@
 </head>
 <body>
 <!-- v4u:nav -->
-<nav class="v4u-nav" aria-label="站点导航"><div class="v4u-nav-in"><span class="v4u-crumb"><a href="../../"><b>Vis4Und</b></a><span class="v4u-sep">/</span><a href="../../#dist-train">(4) 分布式训练</a></span><span class="v4u-links"><a href="../gpu-memory-flops/" aria-current="page">(i) 显存与算力</a><a href="../numerics/">(ii) 数值精度</a><a href="../collectives/">(iii) 集合通信</a><a href="../optimizers/">(iv) 优化器</a><a href="../data-parallel/">(v) DP / ZeRO / FSDP</a><a href="../flash-attention/">(vi) FlashAttention</a><a href="../tp-pp/">(vii) TP / SP / PP</a><a href="../cp-ep/">(viii) CP / EP / 组合</a><button type="button" class="v4u-theme" aria-label="切换深浅色">深色</button></span></div></nav>
+<nav class="v4u-nav" aria-label="站点导航"><div class="v4u-nav-in"><span class="v4u-crumb"><a href="../../"><b>Vis4Und</b></a><span class="v4u-sep">/</span><a href="../../#dist-train">(4) 分布式训练</a></span><span class="v4u-links"><a href="../gpu-memory-flops/" aria-current="page">(i) 显存与算力</a><a href="../numerics/">(ii) 数值精度</a><a href="../collectives/">(iii) 集合通信</a><a href="../optimizers/">(iv) 优化器</a><a href="../flash-attention/">(v) FlashAttention</a><a href="../parallelism/">(vi) 并行策略</a><button type="button" class="v4u-theme" aria-label="切换深浅色">深色</button></span></div></nav>
 <!-- /v4u:nav -->
 
 <header class="hero"><div class="wrap">
@@ -187,7 +187,7 @@
     <li><p>$G$ 块卡、MFU 为 $u$，每秒完成的模型 FLOPs：</p>$$G\,\pi\,u$$</li>
     <li><p>总量 $6ND$ 除以速率就是训练时间：</p>$$T_\text{train}=\frac{6ND}{G\,\pi\,u}$$</li>
   </ol>
-  <p>MFU 到不了 100% 的原因：逐元素算子受带宽限制（上一节），通信没被计算完全盖住（<a href="../collectives/#nccl">集合通信</a>），流水线有气泡（<a href="../tp-pp/#pp">流水线并行</a>），以及 kernel 启动、数据加载、checkpoint 保存的开销。</p>
+  <p>MFU 到不了 100% 的原因：逐元素算子受带宽限制（上一节），通信没被计算完全盖住（<a href="../collectives/#nccl">集合通信</a>），流水线有气泡（<a href="../parallelism/#pp">流水线并行</a>），以及 kernel 启动、数据加载、checkpoint 保存的开销。</p>
 
   <figure class="viz" id="viz-mfu">
     <div class="viz-h"><b>一块 GPU 一秒钟的峰值算力花在了哪里</b><span>整条 = π × 1 s</span></div>
@@ -223,7 +223,7 @@
       <tr><td>合计</td><td></td><td class="num">16</td></tr>
     </tbody>
   </table></div>
-  <p>后三项合称优化器状态，ZeRO 论文记作 $K=12$。为什么要留一份 FP32 主权重见<a href="../numerics/#mixed">混合精度</a>，Adam 的两个矩见<a href="../optimizers/#adam">优化器</a>。7B 模型的模型状态就要 $16\times 7\times 10^9=112$ GB，一张 80 GB 的卡放不下，这是 <a href="../data-parallel/#zero">ZeRO / FSDP</a> 把它们切到多张卡上的原因。</p>
+  <p>后三项合称优化器状态，ZeRO 论文记作 $K=12$。为什么要留一份 FP32 主权重见<a href="../numerics/#mixed">混合精度</a>，Adam 的两个矩见<a href="../optimizers/#adam">优化器</a>。7B 模型的模型状态就要 $16\times 7\times 10^9=112$ GB，一张 80 GB 的卡放不下，这是 <a href="../parallelism/#zero">ZeRO / FSDP</a> 把它们切到多张卡上的原因。</p>
 
   <h3>激活：每层 $sbh(34+5as/h)$ 字节</h3>
   <p>反向要用前向的中间结果，它们从前向一直留到对应层的反向结束。下面按 Korthikanti et al.（2022）的方法，逐个数一层 GPT 式 Transformer 存了什么：激活 16 位（2 字节），dropout 掩码 1 字节，MLP 中间维 $4h$。</p>
@@ -310,7 +310,7 @@
     <li><p>常见写法是每个 micro-batch 先在自己内部取平均，再除以 $m$。每个 token 的权重变成：</p>$$w_i=\frac{1}{m\,T_j}\ \neq\ \frac{1}{\sum_j T_j}\quad(\text{除非各 }T_j\text{ 相等})$$</li>
     <li><p>修正：每个 micro-batch 只求和，最后除以全局有效 token 数（多卡时这个数也要 all-reduce）。</p></li>
   </ol>
-  <p>前 $m-1$ 个 micro-batch 不需要同步梯度，DDP 用 <code>no_sync()</code> 跳过这几次 all-reduce，只在最后一次通信，见 <a href="../data-parallel/#ddp">DDP</a>。流水线并行里 micro-batch 还决定气泡大小，见 <a href="../tp-pp/#pp">流水线并行</a>。</p>
+  <p>前 $m-1$ 个 micro-batch 不需要同步梯度，DDP 用 <code>no_sync()</code> 跳过这几次 all-reduce，只在最后一次通信，见 <a href="../parallelism/#ddp">DDP</a>。流水线并行里 micro-batch 还决定气泡大小，见 <a href="../parallelism/#pp">流水线并行</a>。</p>
 
   <figure class="viz" id="viz-accum">
     <div class="viz-h"><b>每个 token 在累积梯度里的权重</b><span>每个 micro-batch 2 条序列，长度随机</span></div>

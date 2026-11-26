@@ -24,11 +24,11 @@
 </head>
 <body>
 <!-- v4u:nav -->
-<nav class="v4u-nav" aria-label="站点导航"><div class="v4u-nav-in"><span class="v4u-crumb"><a href="../../"><b>Vis4Und</b></a><span class="v4u-sep">/</span><a href="../../#dist-train">(4) 分布式训练</a></span><span class="v4u-links"><a href="../gpu-memory-flops/">(i) 显存与算力</a><a href="../numerics/">(ii) 数值精度</a><a href="../collectives/">(iii) 集合通信</a><a href="../optimizers/">(iv) 优化器</a><a href="../data-parallel/">(v) DP / ZeRO / FSDP</a><a href="../flash-attention/" aria-current="page">(vi) FlashAttention</a><a href="../tp-pp/">(vii) TP / SP / PP</a><a href="../cp-ep/">(viii) CP / EP / 组合</a><button type="button" class="v4u-theme" aria-label="切换深浅色">深色</button></span></div></nav>
+<nav class="v4u-nav" aria-label="站点导航"><div class="v4u-nav-in"><span class="v4u-crumb"><a href="../../"><b>Vis4Und</b></a><span class="v4u-sep">/</span><a href="../../#dist-train">(4) 分布式训练</a></span><span class="v4u-links"><a href="../gpu-memory-flops/">(i) 显存与算力</a><a href="../numerics/">(ii) 数值精度</a><a href="../collectives/">(iii) 集合通信</a><a href="../optimizers/">(iv) 优化器</a><a href="../flash-attention/" aria-current="page">(v) FlashAttention</a><a href="../parallelism/">(vi) 并行策略</a><button type="button" class="v4u-theme" aria-label="切换深浅色">深色</button></span></div></nav>
 <!-- /v4u:nav -->
 
 <header class="hero"><div class="wrap">
-  <p class="kicker">(4) 分布式训练 · (vi)</p>
+  <p class="kicker">(4) 分布式训练 · (v)</p>
   <h1>FlashAttention 系列</h1>
   <p class="lede">注意力的瓶颈往往不在算力，而在把 $N\times N$ 的分数矩阵写进显存再读出来。FlashAttention 用 online softmax 把注意力切成小块，在片上 SRAM 里算完，结果与标准实现精确相等；后面三代分别针对 A100、H100、B200 重新安排计算。</p>
   <p class="asks-h">读完能回答</p>
@@ -130,7 +130,7 @@
     <figcaption>第二排画的是 $e^{x_k-m}$，$m$ 用的是当前最大值：最大值变大时，之前各块的柱子一起变矮，这就是乘 $e^{m_\text{old}-m_\text{new}}$。最后一块处理完，第三排的实心柱与空心框完全重合，读数里的差在 $10^{-16}$ 量级（双精度舍入）。</figcaption>
   </figure>
 
-  <div class="note"><b>只要三个量</b><p>合并只需要 $(m,\ell,\tilde o)$，块的大小和顺序都不影响结果（除浮点舍入外）。这个性质后面反复出现：FA 的分块、反向只存 $L$、Flash-Decoding 的切分合并，以及 Ring Attention 在多卡之间传 KV 块（<a href="../cp-ep/#cp">上下文并行</a>）。</p></div>
+  <div class="note"><b>只要三个量</b><p>合并只需要 $(m,\ell,\tilde o)$，块的大小和顺序都不影响结果（除浮点舍入外）。这个性质后面反复出现：FA 的分块、反向只存 $L$、Flash-Decoding 的切分合并，以及 Ring Attention 在多卡之间传 KV 块（<a href="../parallelism/#cp">上下文并行</a>）。</p></div>
 </section>
 
 <section id="fa1">
@@ -394,7 +394,7 @@
 </div>
 
 <!-- v4u:foot -->
-<footer class="v4u-foot"><div class="v4u-foot-in"><a class="pv" href="../data-parallel/"><span>上一篇</span>数据并行：DDP、ZeRO 与 FSDP</a><a class="nx" href="../tp-pp/"><span>下一篇</span>张量并行与流水线并行</a></div></footer>
+<footer class="v4u-foot"><div class="v4u-foot-in"><a class="pv" href="../optimizers/"><span>上一篇</span>优化器：从 Adam 到 Muon</a><a class="nx" href="../parallelism/"><span>下一篇</span>并行策略</a></div></footer>
 <!-- /v4u:foot -->
 
 <script>

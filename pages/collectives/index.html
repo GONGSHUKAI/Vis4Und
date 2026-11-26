@@ -24,7 +24,7 @@
 </head>
 <body>
 <!-- v4u:nav -->
-<nav class="v4u-nav" aria-label="站点导航"><div class="v4u-nav-in"><span class="v4u-crumb"><a href="../../"><b>Vis4Und</b></a><span class="v4u-sep">/</span><a href="../../#dist-train">(4) 分布式训练</a></span><span class="v4u-links"><a href="../gpu-memory-flops/">(i) 显存与算力</a><a href="../numerics/">(ii) 数值精度</a><a href="../collectives/" aria-current="page">(iii) 集合通信</a><a href="../optimizers/">(iv) 优化器</a><a href="../data-parallel/">(v) DP / ZeRO / FSDP</a><a href="../flash-attention/">(vi) FlashAttention</a><a href="../tp-pp/">(vii) TP / SP / PP</a><a href="../cp-ep/">(viii) CP / EP / 组合</a><button type="button" class="v4u-theme" aria-label="切换深浅色">深色</button></span></div></nav>
+<nav class="v4u-nav" aria-label="站点导航"><div class="v4u-nav-in"><span class="v4u-crumb"><a href="../../"><b>Vis4Und</b></a><span class="v4u-sep">/</span><a href="../../#dist-train">(4) 分布式训练</a></span><span class="v4u-links"><a href="../gpu-memory-flops/">(i) 显存与算力</a><a href="../numerics/">(ii) 数值精度</a><a href="../collectives/" aria-current="page">(iii) 集合通信</a><a href="../optimizers/">(iv) 优化器</a><a href="../flash-attention/">(v) FlashAttention</a><a href="../parallelism/">(vi) 并行策略</a><button type="button" class="v4u-theme" aria-label="切换深浅色">深色</button></span></div></nav>
 <!-- /v4u:nav -->
 
 <header class="hero"><div class="wrap">
@@ -99,7 +99,7 @@
     <li><p>all-reduce 先按块求和、再把和发给所有人，正好是两者串联：</p>$$\text{AllReduce}(x) = \text{AllGather}\big(\text{ReduceScatter}(x)\big),\qquad V_\text{AR} = 2\,\frac{p-1}{p}\,n$$</li>
     <li><p>Patarasuk 与 Yuan（2009）证明任何 all-reduce 都至少有一个 rank 发出、一个 rank 收进 $2\frac{p-1}{p}n$，所以「reduce-scatter + all-gather」在带宽上是最优的。同理，大消息的 broadcast 常做成 scatter + all-gather，reduce 做成 reduce-scatter + gather。</p></li>
   </ol>
-  <div class="note"><b>为什么 FSDP 不用 all-reduce</b><p>FSDP / ZeRO 每张卡只存 $1/p$ 的参数和优化器状态，所以只需要「自己那一块」的梯度和：一次 reduce-scatter 就够，通信量是 all-reduce 的一半；前向前再 all-gather 取回整块参数。两次加起来和一次 all-reduce 一样多，见 <a href="../data-parallel/#zero">ZeRO 的通信量</a>。</p></div>
+  <div class="note"><b>为什么 FSDP 不用 all-reduce</b><p>FSDP / ZeRO 每张卡只存 $1/p$ 的参数和优化器状态，所以只需要「自己那一块」的梯度和：一次 reduce-scatter 就够，通信量是 all-reduce 的一半；前向前再 all-gather 取回整块参数。两次加起来和一次 all-reduce 一样多，见 <a href="../parallelism/#zero">ZeRO 的通信量</a>。</p></div>
 </section>
 
 <section id="cost">
@@ -250,7 +250,7 @@
     <figcaption>只算带宽项。单个环的速度由最慢的一跳决定：8 卡只要有一跳出节点，整个环就降到网卡速度。两个带宽滑块是 NVLink 与网卡的单方向带宽 $B_\text{nv}$、$B_\text{ib}$（GB/s），默认值对应 H100 + NDR。</figcaption>
   </figure>
   <div class="note"><b>NCCL 实际怎么做</b><p>NCCL 会建多个环（channel），不同的环走不同网卡，节点间流量同样被多张网卡分摊，所以真实的「平铺」all-reduce 接近层次化的数字；上图的单环只用来说明瓶颈在哪一跳。集群网络通常按「轨道」（rail）布线：各节点的第 $i$ 号网卡接到同一组交换机，层次化第 2 步里的第 $i$ 号卡之间只隔一跳。</p></div>
-  <p>这就是并行维度的摆放规则：通信最频繁、消息又在关键路径上的维度（<a href="../tp-pp/#tp-comm">张量并行</a>，每层都要 all-reduce 激活）放在节点内；通信能和计算重叠的维度（数据并行、<a href="../tp-pp/#pp">流水线并行</a>的点对点）放到节点间。完整的排法见 <a href="../cp-ep/#compose">多维组合</a>。</p>
+  <p>这就是并行维度的摆放规则：通信最频繁、消息又在关键路径上的维度（<a href="../parallelism/#tp-comm">张量并行</a>，每层都要 all-reduce 激活）放在节点内；通信能和计算重叠的维度（数据并行、<a href="../parallelism/#pp">流水线并行</a>的点对点）放到节点间。完整的排法见 <a href="../parallelism/#compose">多维组合</a>。</p>
 </section>
 
 <section id="nccl">
@@ -278,7 +278,7 @@ dist.all_to_all_single(z, x)                             # 第 j 块发给 rank 
 work = dist.all_reduce(x, async_op=True)   # 立即返回，通信排在 NCCL 的流上
 # ... 这里可以继续排不依赖 x 的计算 ...
 work.wait()                                # 让当前 CUDA 流等通信完成（不阻塞 CPU）</code></pre>
-  <p>子组用 <code>dist.new_group(ranks)</code> 建；多维并行用 <code>init_device_mesh("cuda", (dp, tp), mesh_dim_names=("dp", "tp"))</code> 一次建好每一维的组，见 <a href="../cp-ep/#compose">多维组合</a>。</p>
+  <p>子组用 <code>dist.new_group(ranks)</code> 建；多维并行用 <code>init_device_mesh("cuda", (dp, tp), mesh_dim_names=("dp", "tp"))</code> 一次建好每一维的组，见 <a href="../parallelism/#compose">多维组合</a>。</p>
 
   <figure class="viz" id="viz-ovl">
     <div class="viz-h"><b>通信放在单独的流上，和反向计算重叠</b><span>6 层反向，时间单位 = 一层反向的计算时间</span></div>
@@ -289,7 +289,7 @@ work.wait()                                # 让当前 CUDA 流等通信完成�
     </div>
     <div class="viz-read" id="rd-ovl"></div>
     <ul class="chips"><li><i style="background:var(--c1)"></i>第 l 层反向计算（计算流）</li><li><i style="background:var(--c2)"></i>第 l 层梯度的 all-reduce（通信流）</li></ul>
-    <figcaption>反向从最后一层往前算，第 $l$ 层梯度一算完就可以发出去，同时计算流接着算第 $l-1$ 层。通信 / 计算比小于 1 时，只有最后一层的通信露在外面；大于 1 时通信流成为瓶颈。DDP 把多个参数的梯度攒成桶再发，见 <a href="../data-parallel/#ddp">DDP 的分桶</a>。</figcaption>
+    <figcaption>反向从最后一层往前算，第 $l$ 层梯度一算完就可以发出去，同时计算流接着算第 $l-1$ 层。通信 / 计算比小于 1 时，只有最后一层的通信露在外面；大于 1 时通信流成为瓶颈。DDP 把多个参数的梯度攒成桶再发，见 <a href="../parallelism/#ddp">DDP 的分桶</a>。</figcaption>
   </figure>
   <div class="note pit"><b>易错：卡住不动</b><p>同一组里的所有 rank 必须以相同顺序调用相同的集合通信，张量大小也要一致。某个 rank 因为分支条件少调一次 <code>all_reduce</code>，其它 rank 不会报错，而是一直等，直到超时（<code>init_process_group</code> 的 <code>timeout</code>）后 watchdog 才把进程杀掉。常见诱因：只在 rank 0 上做的评测里调用了集合通信、各 rank 的 batch 数不同、MoE 里某些专家没收到 token 就跳过了通信。</p></div>
 </section>
@@ -299,15 +299,15 @@ work.wait()                                # 让当前 CUDA 流等通信完成�
   <div class="tbl"><table class="wide">
     <thead><tr><th>并行方式</th><th>原语</th><th>传什么</th><th>每步频率</th><th>详见</th></tr></thead>
     <tbody>
-      <tr><td>DDP</td><td>all-reduce</td><td>梯度（分桶）</td><td>每个 step 一轮，和反向重叠</td><td><a href="../data-parallel/#ddp">DDP</a></td></tr>
-      <tr><td>ZeRO-1 / 2</td><td>reduce-scatter + all-gather</td><td>梯度求和后每人留 1/p；更新后取回参数</td><td>每个 step 一轮</td><td><a href="../data-parallel/#zero">ZeRO</a></td></tr>
-      <tr><td>FSDP / ZeRO-3</td><td>all-gather + reduce-scatter</td><td>前向、反向前取回整块参数；梯度切片求和</td><td>每层前向 1 次 AG，反向 1 次 AG + 1 次 RS</td><td><a href="../data-parallel/#fsdp">FSDP</a></td></tr>
-      <tr><td>张量并行</td><td>all-reduce</td><td>激活及其梯度</td><td>每层前向 2 次、反向 2 次，在关键路径上</td><td><a href="../tp-pp/#tp">TP</a></td></tr>
-      <tr><td>TP + 序列并行</td><td>reduce-scatter + all-gather</td><td>同上，拆开以便沿序列切 LayerNorm 段</td><td>同上</td><td><a href="../tp-pp/#sp">SP</a></td></tr>
-      <tr><td>流水线并行</td><td>send / recv</td><td>stage 边界的激活与梯度</td><td>每个 micro-batch</td><td><a href="../tp-pp/#pp">PP</a></td></tr>
-      <tr><td>Ring Attention（CP）</td><td>send / recv</td><td>K、V 分块绕环</td><td>每层 attention</td><td><a href="../cp-ep/#cp">CP</a></td></tr>
-      <tr><td>Ulysses</td><td>all-to-all</td><td>序列切分 ↔ 头切分</td><td>每层 attention 前后各一次</td><td><a href="../cp-ep/#ulysses">Ulysses</a></td></tr>
-      <tr><td>专家并行（EP）</td><td>all-to-all</td><td>token 发往专家（dispatch）、结果收回（combine）</td><td>每个 MoE 层前向 2 次、反向 2 次</td><td><a href="../cp-ep/#ep">EP</a></td></tr>
+      <tr><td>DDP</td><td>all-reduce</td><td>梯度（分桶）</td><td>每个 step 一轮，和反向重叠</td><td><a href="../parallelism/#ddp">DDP</a></td></tr>
+      <tr><td>ZeRO-1 / 2</td><td>reduce-scatter + all-gather</td><td>梯度求和后每人留 1/p；更新后取回参数</td><td>每个 step 一轮</td><td><a href="../parallelism/#zero">ZeRO</a></td></tr>
+      <tr><td>FSDP / ZeRO-3</td><td>all-gather + reduce-scatter</td><td>前向、反向前取回整块参数；梯度切片求和</td><td>每层前向 1 次 AG，反向 1 次 AG + 1 次 RS</td><td><a href="../parallelism/#fsdp">FSDP</a></td></tr>
+      <tr><td>张量并行</td><td>all-reduce</td><td>激活及其梯度</td><td>每层前向 2 次、反向 2 次，在关键路径上</td><td><a href="../parallelism/#tp">TP</a></td></tr>
+      <tr><td>TP + 序列并行</td><td>reduce-scatter + all-gather</td><td>同上，拆开以便沿序列切 LayerNorm 段</td><td>同上</td><td><a href="../parallelism/#sp">SP</a></td></tr>
+      <tr><td>流水线并行</td><td>send / recv</td><td>stage 边界的激活与梯度</td><td>每个 micro-batch</td><td><a href="../parallelism/#pp">PP</a></td></tr>
+      <tr><td>Ring Attention（CP）</td><td>send / recv</td><td>K、V 分块绕环</td><td>每层 attention</td><td><a href="../parallelism/#cp">CP</a></td></tr>
+      <tr><td>Ulysses</td><td>all-to-all</td><td>序列切分 ↔ 头切分</td><td>每层 attention 前后各一次</td><td><a href="../parallelism/#ulysses">Ulysses</a></td></tr>
+      <tr><td>专家并行（EP）</td><td>all-to-all</td><td>token 发往专家（dispatch）、结果收回（combine）</td><td>每个 MoE 层前向 2 次、反向 2 次</td><td><a href="../parallelism/#ep">EP</a></td></tr>
       <tr><td>分布式 Muon</td><td>gather / all-gather</td><td>把切开的矩阵拼整再做正交化</td><td>每个 step</td><td><a href="../optimizers/#muon-dist">Muon</a></td></tr>
       <tr><td>日志、梯度裁剪</td><td>all-reduce</td><td>loss、梯度范数等标量</td><td>每个 step，延迟受限</td><td>—</td></tr>
     </tbody>

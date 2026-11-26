@@ -37,7 +37,7 @@
 </head>
 <body>
 <!-- v4u:nav -->
-<nav class="v4u-nav" aria-label="站点导航"><div class="v4u-nav-in"><span class="v4u-crumb"><a href="../../"><b>Vis4Und</b></a><span class="v4u-sep">/</span><a href="../../#dist-train">(4) 分布式训练</a></span><span class="v4u-links"><a href="../gpu-memory-flops/">(i) 显存与算力</a><a href="../numerics/" aria-current="page">(ii) 数值精度</a><a href="../collectives/">(iii) 集合通信</a><a href="../optimizers/">(iv) 优化器</a><a href="../data-parallel/">(v) DP / ZeRO / FSDP</a><a href="../flash-attention/">(vi) FlashAttention</a><a href="../tp-pp/">(vii) TP / SP / PP</a><a href="../cp-ep/">(viii) CP / EP / 组合</a><button type="button" class="v4u-theme" aria-label="切换深浅色">深色</button></span></div></nav>
+<nav class="v4u-nav" aria-label="站点导航"><div class="v4u-nav-in"><span class="v4u-crumb"><a href="../../"><b>Vis4Und</b></a><span class="v4u-sep">/</span><a href="../../#dist-train">(4) 分布式训练</a></span><span class="v4u-links"><a href="../gpu-memory-flops/">(i) 显存与算力</a><a href="../numerics/" aria-current="page">(ii) 数值精度</a><a href="../collectives/">(iii) 集合通信</a><a href="../optimizers/">(iv) 优化器</a><a href="../flash-attention/">(v) FlashAttention</a><a href="../parallelism/">(vi) 并行策略</a><button type="button" class="v4u-theme" aria-label="切换深浅色">深色</button></span></div></nav>
 <!-- /v4u:nav -->
 
 <header class="hero"><div class="wrap">
@@ -196,7 +196,7 @@
     <figcaption>「权重更新」：$w_0=1$，每步加同一个 $\Delta$，共 2000 步。默认 $\Delta\approx3.2\times10^{-4}$，BF16 和 FP16 一步也没加上。把 $\Delta$ 调到 $10^{-3}$ 附近，FP16 每步被舍入成 $2^{-10}$ 或 $2^{-9}$，曲线斜率不对。「点积累加」：$K$ 个 $[0,1)$ 里的 BF16 随机数顺序求和，BF16 累加器在 256 附近停住。</figcaption>
   </figure>
 
-  <p><b>PyTorch 里</b>：<code>torch.autocast("cuda", dtype=torch.bfloat16)</code> 把 matmul、卷积换成 BF16，把 softmax、log_softmax、layer_norm、损失函数等留在 FP32；参数本身仍是 FP32，就是主权重。分布式框架里参数通常以 BF16 存、FP32 副本放在优化器里；FSDP 用 <code>MixedPrecision(param_dtype, reduce_dtype)</code> 分别设计算和归约的精度，见 <a href="../data-parallel/#fsdp">FSDP</a>。</p>
+  <p><b>PyTorch 里</b>：<code>torch.autocast("cuda", dtype=torch.bfloat16)</code> 把 matmul、卷积换成 BF16，把 softmax、log_softmax、layer_norm、损失函数等留在 FP32；参数本身仍是 FP32，就是主权重。分布式框架里参数通常以 BF16 存、FP32 副本放在优化器里；FSDP 用 <code>MixedPrecision(param_dtype, reduce_dtype)</code> 分别设计算和归约的精度，见 <a href="../parallelism/#fsdp">FSDP</a>。</p>
 </section>
 
 <section id="loss-scaling">

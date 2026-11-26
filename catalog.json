@@ -149,40 +149,22 @@
       "summary": "动量 SGD、Adam、AdamW 的更新与状态，学习率调度与梯度裁剪，Muon 的 Newton–Schulz 正交化及其在大模型上的用法。"
     },
     {
-      "slug": "data-parallel",
-      "section": "dist-train",
-      "no": "v",
-      "title": "数据并行：DDP、ZeRO 与 FSDP",
-      "short": "DP / ZeRO / FSDP",
-      "en": "Data Parallelism, ZeRO & FSDP",
-      "summary": "梯度 all-reduce 与分桶重叠，ZeRO-1/2/3 把优化器状态、梯度、参数切到各卡，FSDP / FSDP2 / HSDP 的执行顺序，以及 offload。"
-    },
-    {
       "slug": "flash-attention",
       "section": "dist-train",
-      "no": "vi",
+      "no": "v",
       "title": "FlashAttention 系列",
       "short": "FlashAttention",
       "en": "FlashAttention 1–4",
       "summary": "标准 attention 的显存读写瓶颈，online softmax 与分块，FlashAttention 1 / 2 / 3 / 4 各改了什么，以及 Flash-Decoding 和变长、掩码变体。"
     },
     {
-      "slug": "tp-pp",
+      "slug": "parallelism",
       "section": "dist-train",
-      "no": "vii",
-      "title": "张量并行与流水线并行",
-      "short": "TP / SP / PP",
-      "en": "Tensor, Sequence & Pipeline Parallelism",
-      "summary": "Megatron 的列切 / 行切与序列并行，流水线的气泡：GPipe、1F1B、交错调度、Zero Bubble 与 DualPipe。"
-    },
-    {
-      "slug": "cp-ep",
-      "section": "dist-train",
-      "no": "viii",
-      "title": "长序列与 MoE 并行，及多维组合",
-      "short": "CP / EP / 组合",
-      "en": "Context & Expert Parallelism, N-D Composition",
-      "summary": "Ring Attention 与 Ulysses 两种上下文并行，MoE 的专家并行与 all-to-all、专家张量并行（ETP），以及 DP×TP×PP×CP×EP 怎么排进集群、怎么选配置。"
+      "no": "vi",
+      "title": "并行策略",
+      "short": "并行策略",
+      "en": "Parallelism: DP, FSDP, TP, SP, PP, CP, EP",
+      "summary": "数据并行与 ZeRO / FSDP / HSDP，张量并行与序列并行，流水线的 GPipe / 1F1B / 交错 / Zero Bubble / DualPipe，上下文并行（Ring Attention、Ulysses），MoE 的专家并行与 ETP，以及多维组合与配置估算。"
     }
   ]
 }
