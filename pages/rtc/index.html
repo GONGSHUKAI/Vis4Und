@@ -1,0 +1,1531 @@
+<!doctype html>
+<html lang="zh-CN" data-sec="robotics">
+<head>
+<!-- v4u:head -->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="icon" href="data:,">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700&family=Inter+Tight:wght@700&family=JetBrains+Mono:wght@400;700&family=Noto+Sans+SC:wght@400;700&display=swap">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<link rel="stylesheet" href="../../assets/v4u.css?v=691854ab">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
+<script src="../../assets/v4u.js?v=d6640e00"></script>
+<!-- /v4u:head -->
+<title>实时分块执行（RTC） · Vis4Und</title>
+<meta name="description" content="推理有延迟时动作块怎么衔接：同步执行、时间集成、异步队列，推理期 RTC 的冻结前缀与软掩码引导，训练期 RTC 的前缀条件化。">
+<style>
+.pane-t{font:700 13px/1.4 var(--f-body);color:var(--ink-2);margin:0 0 6px}
+.viz-read .ok{color:var(--ok)}
+.viz-read .bad{color:var(--bad)}
+.viz-read .warn{color:var(--warn)}
+#compare .tbl table{min-width:760px}
+#problem .notation{min-width:0}
+</style>
+</head>
+<body>
+<!-- v4u:nav -->
+<nav class="v4u-nav" aria-label="站点导航"><div class="v4u-nav-in"><span class="v4u-crumb"><a href="../../"><b>Vis4Und</b></a><span class="v4u-sep">/</span><a href="../../#robotics">(1) 机器人学</a></span><span class="v4u-links"><a href="../rotations/">(i) 旋转与位姿</a><a href="../action-space/">(ii) 运动空间</a><a href="../camera/">(iii) 相机</a><a href="../pi-series/">(iv) π 系列</a><a href="../rtc/" aria-current="page">(v) RTC</a><a href="../sim-rl/">(vi) 仿真 RL</a><button type="button" class="v4u-theme" aria-label="切换深浅色">深色</button></span></div></nav>
+<!-- /v4u:nav -->
+
+<header class="hero"><div class="wrap">
+  <p class="kicker">(1) 机器人学 · (v)</p>
+  <h1>实时分块执行（RTC）</h1>
+  <p class="lede">VLA 一次预测一段未来动作，单次推理却要几十到上百毫秒。停下来等推理会让机器人卡顿，边执行边推理会在块边界跳变或撞进障碍物。这页从推理延迟出发，依次看同步执行、朴素异步与时间集成、SmolVLA 异步队列、推理期 RTC（冻结前缀、软掩码与 ΠGDM 引导）和训练期 RTC（前缀条件化）。</p>
+  <p class="asks-h">读完能回答</p>
+  <ul class="asks">
+    <li>推理延迟 $\delta$ 怎么换算成控制步数 $d$？同步执行的停顿占比和平均控制频率是多少？</li>
+    <li>朴素异步的直接切换和 ACT 的 temporal ensembling 各自怎样在多模态任务里失效？</li>
+    <li>SmolVLA 的队列阈值 $g$ 在什么条件下仍然会耗空队列？</li>
+    <li>推理期 RTC 的软掩码 $W_i$、约束 $d\le s\le H-d$、引导方向 $\mathbf g=-\nabla_{A^\tau}L$ 和权重裁剪 $\beta$ 各起什么作用？</li>
+    <li>训练期 RTC 怎样去掉推理期反传开销，为什么在大延迟下更稳？</li>
+  </ul>
+</div></header>
+
+<div class="wrap layout">
+<nav class="toc" id="toc" aria-label="本页目录"></nav>
+<main>
+
+<section id="problem">
+  <h2 data-toc="动作块与延迟">问题：动作块与推理延迟</h2>
+  <p class="def"><b>动作分块（action chunking）</b>让策略根据时刻 $t$ 的观测 $o_t$ 一次预测未来 $H$ 步动作 $A_t=[a_t,\dots,a_{t+H-1}]$，机器人执行其中 $s\le H$ 步后再用新观测重新推理。分块与时序抽象的基础见 <a href="../action-space/#temporal">机器人的运动空间 · 时序抽象</a>，flow matching 动作生成见 <a href="../pi-series/#flow">π 系列 · flow matching</a>。</p>
+  <p>高频率真机控制下，底层控制周期 $\Delta t$ 只有几十毫秒（50 Hz 对应 20 ms，20 Hz 对应 50 ms），大型 VLA 的单次推理延迟 $\delta$ 却显著大于 $\Delta t$：</p>
+  <ul>
+    <li><b>$\pi_0$</b>（3B 级 flow VLA，RTX 4090）：π0 论文报告 3 路相机时板载推理 <b>73 ms</b>（图像编码 14 ms、前缀前向 32 ms、10 步动作专家共 27 ms），经网络放在板外为 86 ms。</li>
+    <li><b>$\pi_{0.5}$</b>（RTX 4090，50 Hz，$\Delta t=20\text{ ms}$，$H=50$，$n=5$ 去噪步，RTC 论文实测）：基线前向推理 <b>76 ms</b>；加推理期 RTC 引导后 <b>97 ms</b>；叠加局域网通信（10–20 ms）端到端约 <b>108–120 ms</b>。</li>
+    <li><b>$\pi_{0.6}$</b>（远端 H100，$n=5$，训练期 RTC 论文实测）：无引导的训练期 RTC 端到端平均 <b>108 ms</b>，带反传引导的推理期 RTC 平均 <b>135 ms</b>。</li>
+  </ul>
+  <p>将推理耗时换算成控制步数，记为以步计的推理延迟：</p>
+  <div class="eq">$$d = \left\lceil \frac{\delta}{\Delta t} \right\rceil$$</div>
+  <p>例如 50 Hz（$\Delta t=20\text{ ms}$）下 $\delta=108\text{ ms}$ 对应 $d=6$ 步。RTC 原论文在「发出 $a_{-1}$ 后立即读观测、下一控制节拍在 $\Delta t$ 后到来」的时序约定下写 $d=\lfloor\delta/\Delta t\rfloor$（于是 $\delta\lt\Delta t$ 时 $d=0$）；两者至多差 1 步，部署时按 $\lceil\delta/\Delta t\rceil$ 或多留 1 步安全余量可防止新块超时未到。</p>
+
+  <table class="notation">
+    <caption>全页记号</caption>
+    <thead><tr><th>符号</th><th>含义</th><th>形状 / 单位</th></tr></thead>
+    <tbody>
+      <tr><td>$\Delta t$</td><td>控制周期（控制频率 $f=1/\Delta t$ 的倒数）</td><td>s（或 ms）</td></tr>
+      <tr><td>$H$</td><td>动作块长（prediction horizon），每次推理输出的动作步数</td><td>正整数</td></tr>
+      <tr><td>$s$</td><td>执行步数（execution horizon），两次推理之间执行的步数</td><td>整数，$1\le s\le H$</td></tr>
+      <tr><td>$\delta,\ d$</td><td>端到端推理延迟；以控制步计的延迟 $d=\lceil\delta/\Delta t\rceil$</td><td>s（或 ms）；非负整数</td></tr>
+      <tr><td>$A_t=[a_t,\dots,a_{t+H-1}]$</td><td>时刻 $t$ 推理出的动作块；$D$ 为单步动作维数</td><td>$H\times D$</td></tr>
+      <tr><td>$A_{\text{prev}}$</td><td>上一个动作块对齐到本次推理起点后的剩余部分（论文亦记 $\mathbf Y$，不足 $H$ 步右侧补零）</td><td>$H\times D$</td></tr>
+      <tr><td>$o_t$</td><td>推理开始时刻的观测（图像、语言与本体状态）</td><td>多模态输入</td></tr>
+      <tr><td>$\tau$</td><td>flow matching 时间（与 <a href="../pi-series/#flow">π 系列</a> 一致）：$\tau=0$ 为噪声 $A^0\sim\mathcal N(0,I)$，$\tau=1$ 为动作 $A^1$</td><td>标量，$\tau\in[0,1]$</td></tr>
+      <tr><td>$v_\pi(A^\tau,o,\tau)$</td><td>flow 策略预测的速度场</td><td>$H\times D$</td></tr>
+      <tr><td>$n$</td><td>flow 欧拉积分的去噪步数，步长 $1/n$</td><td>正整数</td></tr>
+      <tr><td>$W$</td><td>推理期 RTC 的软掩码权重向量，第 $i$ 步为 $W_i\in[0,1]$</td><td>$\mathbb R^H$</td></tr>
+      <tr><td>$\lambda_\tau,\ \beta$</td><td>时刻 $\tau$ 的引导权重及其裁剪上限</td><td>非负标量</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="sync">
+  <h2>同步执行：停下来等推理</h2>
+  <p class="def"><b>同步执行（synchronous execution）</b>按「执行 $s$ 步 → 停住等待推理 $\delta$ → 拿新块再执行 $s$ 步」交替推进，模型推理期间机器人静止或保持上一目标不动。</p>
+  <p>每轮执行耗时 $s\,\Delta t$、等待耗时 $\delta$，一个完整周期为 $s\,\Delta t+\delta$。停顿占比与平均有效控制频率分别为：</p>
+  <div class="eq">$$\begin{gathered}\eta_{\text{idle}} = \frac{\delta}{s\,\Delta t+\delta} \\[4pt] f_{\text{eff}} = \frac{s}{s\,\Delta t+\delta} = \frac{1}{\Delta t}\,(1-\eta_{\text{idle}})\end{gathered}$$</div>
+  <p>当 $s$ 调小以提高对环境变化的反应速度时，$\eta_{\text{idle}}$ 迅速升高，机械臂频繁启停；把 $s$ 调大（接近 $H$）虽能摊薄停顿，但中间长达 $s\Delta t$ 的时间完全开环，无法响应扰动。对于抛接、平衡、擦火柴这类连续动态任务，物理世界不会在推理期间暂停。</p>
+
+  <figure class="viz" id="viz-sync">
+    <div class="viz-h"><b>同步执行时间轴：执行段、等待停顿与有效进度</b><span>总窗口 2.5 s</span></div>
+    <div class="viz-stage"><canvas id="cv-sync" aria-label="同步执行与理想异步的进度曲线以及执行和等待时间轴"></canvas></div>
+    <div class="viz-ctrl">
+      <div class="seg" id="sg-sy-f" role="group" aria-label="控制频率"><button type="button" data-v="20">20 Hz</button><button type="button" data-v="50" aria-pressed="true">50 Hz</button></div>
+      <label for="sl-sy-h">H <input type="range" id="sl-sy-h" min="10" max="60" step="2" value="50"><output id="o-sy-h">50</output></label>
+      <label for="sl-sy-s">s <input type="range" id="sl-sy-s" min="1" max="50" step="1" value="25"><output id="o-sy-s">25</output></label>
+      <label for="sl-sy-d">δ <input type="range" id="sl-sy-d" min="0" max="400" step="5" value="120"><output id="o-sy-d">120 ms</output></label>
+      <button type="button" class="btn ghost" id="bt-sy-play">播放</button>
+    </div>
+    <div class="viz-read" id="rd-sync"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>执行动作段（s·Δt）</li><li><i style="background:var(--bad)"></i>等待推理停顿（δ）</li><li><i style="background:var(--line-2)"></i>该块未执行的剩余 H−s 步</li><li><i style="background:var(--c3)"></i>无停顿理想异步进度</li></ul>
+    <figcaption>上方曲线对比相同墙钟时间内已执行的动作步数：同步执行在每个等待段水平拉平（机器人卡顿），2.5 s 结束后明显落后于无停顿基线。试着把 $s$ 降到 5、$\delta$ 调到 120 ms：停顿占比超过 54%，一半以上时间都在原地等待。</figcaption>
+  </figure>
+</section>
+
+<section id="naive-async">
+  <h2 data-toc="朴素异步与时间集成">朴素异步与时间集成：多模态陷阱</h2>
+  <p>消除停顿的直觉做法是<b>异步执行</b>：继续执行旧块 $A_{\text{prev}}$，同时后台用推理起点处的观测 $o_t$ 算新块 $A_{\text{new}}$，经过 $d$ 步后拿到结果。问题在于人类示教往往是<b>多模态</b>的（例如绕过障碍物既可走上方也可走下方），而且经过 $d$ 步执行后机器人已经沿旧块走出一段距离，后台独立采样的新块很可能落进与旧块不同的模式。</p>
+  <ul>
+    <li><b>直接切换（naive async）</b>：第 $d$ 步推理一完成立刻切到新块对应步 $a'_d$。若旧块走上路、新块走下路，切换瞬间目标位置猛跳，产生极大速度和加速度尖峰，导致剧烈抖动甚至触发关节保护停机。</li>
+    <li><b>时间集成（temporal ensembling，ACT，Zhao et al., RSS 2023）</b>：对同一时刻重叠的多个历史块按 $w_i=\exp(-m\,i)$ 加权平均（见 <a href="../action-space/#temporal">时序抽象</a>）。把「绕上方」和「绕下方」两条各自合法的轨迹求平均，合成轨迹反而落在低概率的中间区域——直接穿过障碍物。</li>
+    <li><b>RTC</b>：在生成新块时把已经注定要执行的前 $d$ 步固定为条件，迫使新块留在与旧块一致的模式内，既无跳变也不穿障。</li>
+  </ul>
+
+  <figure class="viz" id="viz-async">
+    <div class="viz-h"><b>二维绕障：旧块走上方、新块采到下方时的三种衔接</b><span>旧块在 a₃ 后启动推理，d 步后新块返回</span></div>
+    <div class="viz-grid">
+      <div class="viz-stage"><p class="pane-t">末端二维轨迹</p><canvas id="cv-as-xy" aria-label="障碍物周围旧块、新块和实际执行轨迹的二维对比"></canvas></div>
+      <div class="viz-stage"><p class="pane-t">每步加速度幅值 ‖Δ²p‖</p><canvas id="cv-as-acc" aria-label="每个控制步的加速度幅值柱状图"></canvas></div>
+    </div>
+    <div class="viz-ctrl">
+      <div class="seg" id="sg-as-m" role="group" aria-label="衔接方式"><button type="button" data-v="naive" aria-pressed="true">直接切换</button><button type="button" data-v="te">时间集成平均</button><button type="button" data-v="rtc">RTC（模式一致）</button></div>
+      <label for="sl-as-d">延迟 d <input type="range" id="sl-as-d" min="2" max="8" step="1" value="6"><output id="o-as-d">6 步</output></label>
+      <label for="sl-as-div">模式分歧 <input type="range" id="sl-as-div" min="0" max="100" step="5" value="100"><output id="o-as-div">100%</output></label>
+      <button type="button" class="btn ghost" id="bt-as-play">播放</button>
+    </div>
+    <div class="viz-read" id="rd-async"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>旧块 A<sub>prev</sub>（已执行前缀为实线）</li><li><i style="background:var(--c2)"></i>无引导新块 A<sub>new</sub>（不同模式）</li><li><i style="background:var(--c3)"></i>实际执行轨迹（碰撞时标红）</li><li><i style="background:var(--muted)"></i>障碍物</li></ul>
+    <figcaption>推理在 $a_3$ 后启动，耗时 $d$ 步，于 $a_{3+d}$ 处完成切换。模式分歧为 100% 时，新块落入下方绕行模式：直接切换在切换点出现巨大加速度尖峰；时间集成把上下两路平均后直接穿进障碍物；RTC 保持在上方模式内平滑接续，仅在后续步响应微小偏移。</figcaption>
+  </figure>
+</section>
+
+<section id="smolvla">
+  <h2 data-toc="SmolVLA 异步队列">SmolVLA 的异步动作队列</h2>
+  <p class="def"><b>SmolVLA 异步推理</b>（Shukor et al., 2025, arXiv:2506.01844，实现于 LeRobot）把<b>机器人客户端（RobotClient）</b>与<b>远端策略服务器（PolicyServer）</b>解耦：客户端按控制周期从本地队列取动作执行，在队列剩余比例低于阈值 $g\in[0,1]$ 时异步发送最新观测请求新块。</p>
+  <p>触发条件（LeRobot 参数名 <code>chunk_size_threshold</code>）为：</p>
+  <div class="eq">$$\frac{L_{\text{queue}}}{H} \lt g$$</div>
+  <ul>
+    <li><b>$g$ 的含义与取值</b>：$g=0$ 等价于队列耗空后再请求（退化为同步执行）；$g=1$ 每执行一步都发起请求，反应最快但计算与通信负载最大。论文实验常用 $g=0.7$（队列消耗约 30% 即提前发观测），LeRobot 文档推荐从 $g=0.5$ 起按实际延迟微调。</li>
+    <li><b>到达与聚合</b>：服务器算完长度 $H$ 的新块返回时，客户端丢弃已流逝的前 $d$ 步，将剩余 $H-d$ 步与旧队列中尚未执行的重叠部分按时间对齐聚合（支持直接覆盖，或按权重加权平均）。论文报告该异步栈可将任务完成时间缩短约 30%、吞吐提升最高约 2×。</li>
+    <li><b>队列不耗空的条件</b>：设触发瞬间队列剩余 $L_{\text{trig}}$ 步（$L_{\text{trig}}=\lceil gH\rceil-1$，当 $g\gt 0$），且服务器串行处理单条在途请求。一次推理耗时 $d$ 步，返回后队列补满至 $H-d$ 步。若 $H-d\ge L_{\text{trig}}$，下一次仍从 $L_{\text{trig}}$ 触发，不耗空需要 $d\le L_{\text{trig}}$；若 $H-d\lt L_{\text{trig}}$，新块刚到就已低于阈值并立即再次触发，不耗空需要 $H-d\ge d$，即 $d\le H/2$。合起来无停顿条件为 $d\le\min(L_{\text{trig}},\,\lfloor H/2\rfloor)$。</li>
+  </ul>
+  <p>这一方案的优点是纯工程解耦、不依赖模型结构（扩散、flow、自回归策略均可用）、无需重训也无额外反传开销；缺点是策略在生成新块时并不知道旧队列正在执行什么，只能在返回后事后覆盖或加权融合，多模态冲突和调参敏感问题依然存在。</p>
+
+  <figure class="viz" id="viz-smolvla">
+    <div class="viz-h"><b>SmolVLA 队列长度锯齿图</b><span>50 Hz（Δt = 20 ms），单在途请求，总窗口 140 步（2.8 s）</span></div>
+    <div class="viz-stage"><canvas id="cv-smol" aria-label="SmolVLA 动作队列长度随控制步变化的锯齿曲线"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="sl-sm-g">阈值 g <input type="range" id="sl-sm-g" min="0" max="0.95" step="0.05" value="0.70"><output id="o-sm-g">0.70</output></label>
+      <label for="sl-sm-d">延迟 δ <input type="range" id="sl-sm-d" min="20" max="640" step="20" value="180"><output id="o-sm-d">180 ms</output></label>
+      <label for="sl-sm-h">块长 H <input type="range" id="sl-sm-h" min="20" max="60" step="5" value="50"><output id="o-sm-h">50</output></label>
+      <div class="seg" id="sg-sm-agg" role="group" aria-label="重叠聚合"><button type="button" data-v="overwrite" aria-pressed="true">直接覆盖</button><button type="button" data-v="blend">加权融合</button></div>
+    </div>
+    <div class="viz-read" id="rd-smol"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>队列剩余长度 L(t)</li><li><i style="background:var(--c5)"></i>触发阈值 g·H</li><li><i style="background:var(--c4s)"></i>服务器推理中</li><li><i style="background:var(--bad)"></i>队列耗空（停顿）</li></ul>
+    <figcaption>队列长度每步减 1，跌破虚线 $gH$ 且无在途请求时发新观测，经过 $d$ 步后新块返回并补齐至 $H-d$（丢弃已过时的前 $d$ 步）。两种耗空机制：把 $g$ 降到 $0.15$ 触发太晚会耗空；把 $\delta$ 拉到 $540\text{ ms}$（$d=27\gt H/2$）即使 $g=0.95$ 也会耗空。选「加权融合」时绿色竖条标出新旧队列发生重叠、需要事后混合的步数。</figcaption>
+  </figure>
+</section>
+
+<section id="inpainting">
+  <h2 data-toc="推理期 RTC：软掩码">推理期 RTC：把衔接写成 Inpainting</h2>
+  <p class="def"><b>推理期 RTC</b>（Real-Time Chunking，Black, Galliker, Levine, NeurIPS 2025, arXiv:2506.07339）把新动作块的生成建模为对旧块前缀的<b>补全（inpainting）</b>：已经来不及修改的前 $d$ 步完全冻结，与旧块重叠的中间段施加指数衰减软约束，超出旧块末尾的 $s$ 步完全自由生成。</p>
+  <p>以本次推理开始时刻为新块下标 $i=0$（此时上一块刚执行完 $s$ 步 $a_{-s},\dots,a_{-1}$，还剩 $H-s$ 步 $A_{\text{prev}}[0..H-s-1]$），长度 $H$ 的新块按 $i\in\{0,\dots,H-1\}$ 分为三段：</p>
+  <ul>
+    <li><b>冻结区（$0\le i\lt d$）</b>：推理完成时机器人已按旧块执行完这 $d$ 步，无法更改，强约束 $W_i=1$。</li>
+    <li><b>过渡区（$d\le i\lt H-s$）</b>：新块返回时尚未执行，旧块也有对应预测；允许依新观测调整，同时用递减软掩码拉住旧块轨迹，防止模式跳变。</li>
+    <li><b>自由生成区（$H-s\le i\lt H$）</b>：超出旧块覆盖范围的 $s$ 步，$W_i=0$，完全由新观测生成。</li>
+  </ul>
+  <p>为保证连续串行推理不断档，执行步数 $s$ 必须满足：</p>
+  <div class="eq">$$d \le s \le H - d$$</div>
+  <p>下界 $s\ge d$ 保证本次推理在下一次推理启动前算完；上界 $s\le H-d$ 保证本次推理启动时旧块至少还剩 $d$ 步用于覆盖冻结区。若 $s=H-d$，过渡区长度为 0，退化为只冻结前 $d$ 步的硬掩码；若 $d\gt H/2$，可行区间为空。</p>
+  <p>论文 Eq. 5（及官方实现 <code>get_prefix_weights</code>）给出的指数软掩码权重为：</p>
+  <div class="eq">$$\begin{gathered}W_i = \begin{cases} 1 & i \lt d \\ c_i\,\dfrac{e^{c_i}-1}{e-1} & d \le i \lt H-s \\ 0 & i \ge H-s \end{cases} \\[6pt] c_i = \frac{H-s-i}{H-s-d+1},\qquad i\in\{0,\dots,H-1\}\end{gathered}$$</div>
+  <p>其中 $c_i$ 在过渡区内从 $\frac{H-s-d}{H-s-d+1}$ 线性递减至 $\frac{1}{H-s-d+1}$；凸函数 $c\frac{e^c-1}{e-1}$ 满足端点 $0\mapsto 0,\ 1\mapsto 1$，使约束紧贴冻结边界、平滑落向自由区。论文消融表明，指数衰减软掩码在大延迟下优于硬掩码和线性衰减掩码。</p>
+
+  <figure class="viz" id="viz-mask">
+    <div class="viz-h"><b>软掩码 W<sub>i</sub> 与旧块 / 新块对齐关系</b><span>下标 i = 0 对应本次推理启动时刻</span></div>
+    <div class="viz-stage"><canvas id="cv-mask" aria-label="软掩码权重柱状图以及旧块和新块各区间对齐图"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="sl-mk-h">H <input type="range" id="sl-mk-h" min="8" max="50" step="1" value="16"><output id="o-mk-h">16</output></label>
+      <label for="sl-mk-s">s <input type="range" id="sl-mk-s" min="0" max="50" step="1" value="5"><output id="o-mk-s">5</output></label>
+      <label for="sl-mk-d">d <input type="range" id="sl-mk-d" min="0" max="25" step="1" value="4"><output id="o-mk-d">4</output></label>
+      <div class="seg" id="sg-mk-sch" role="group" aria-label="掩码曲线"><button type="button" data-v="exp" aria-pressed="true">指数软掩码</button><button type="button" data-v="lin">线性衰减</button><button type="button" data-v="hard">硬掩码</button></div>
+      <button type="button" class="btn ghost" id="bt-mk-p1">论文 Fig.3</button>
+      <button type="button" class="btn ghost" id="bt-mk-p2">π0.5 真机</button>
+    </div>
+    <div class="viz-read" id="rd-mask"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>冻结区（i &lt; d，W<sub>i</sub> = 1）</li><li><i style="background:var(--c2)"></i>过渡区（d ≤ i &lt; H−s）</li><li><i style="background:var(--surface-2)"></i>自由区（i ≥ H−s，W<sub>i</sub> = 0）</li><li><i style="background:var(--muted)"></i>旧块已执行的 s 步</li></ul>
+    <figcaption>默认参数 $H=16,\ s=5,\ d=4$ 对应论文 Figure 3。拖动 $H,s,d$ 时 $s$ 自动限制在可行范围 $[d,\,H-d]$ 内。把 $s$ 拖到 $H-d$：过渡区消失，指数软掩码与硬掩码重合；点「π0.5 真机」切换到 $H=50,\ s=25,\ d=6$。</figcaption>
+  </figure>
+</section>
+
+<section id="guidance">
+  <h2 data-toc="引导去噪与 VJP">引导去噪：ΠGDM 与 VJP 推导</h2>
+  <p>推理期 RTC 不修改已训练的 flow 策略权重 $v_\pi$，而是借助 <b>ΠGDM</b>（Pseudoinverse-Guided Diffusion Models，Song et al., ICLR 2023）的伪逆引导思想，在每一步欧拉去噪中加上指向 $A_{\text{prev}}$ 的修正速度。</p>
+
+  <table class="notation">
+    <caption>本节新增记号（向量推导中将 $H\times D$ 块展平为 $\mathbb R^{HD}$ 列向量）</caption>
+    <thead><tr><th>符号</th><th>含义</th><th>形状</th></tr></thead>
+    <tbody>
+      <tr><td>$A^\tau$</td><td>flow 时间 $\tau$ 处的含噪动作块</td><td>$H\times D$</td></tr>
+      <tr><td>$\hat A^1(A^\tau)$</td><td>从 $A^\tau$ 一步线性外推得到的干净动作估计</td><td>$H\times D$</td></tr>
+      <tr><td>$r_\tau^2$</td><td>ΠGDM 高斯近似下后验 $p(A^1\mid A^\tau)$ 的方差</td><td>标量</td></tr>
+      <tr><td>$\mathbf e$</td><td>干净动作空间内的加权残差（行向量）</td><td>$1\times HD$</td></tr>
+      <tr><td>$\mathbf g$</td><td>经 VJP 反传回 $A^\tau$ 空间的引导方向，$-\nabla_{A^\tau}L$</td><td>$H\times D$</td></tr>
+    </tbody>
+  </table>
+
+  <h3>分步推导</h3>
+  <ol class="derive">
+    <li><p>无引导的 flow 策略从标准高斯噪声 $A^0\sim\mathcal N(0,I)$ 出发，分 $n$ 步欧拉积分到 $\tau=1$：</p>$$A^{\tau+1/n} = A^\tau + \frac{1}{n}\,v_\pi(A^\tau,o,\tau)$$</li>
+    <li><p>在任意中间时刻 $\tau$，沿当前速度场直线走完剩余的 $1-\tau$，得到一步预测的干净终点（流匹配下的 Tweedie 估计）：</p>$$\hat A^1(A^\tau) = A^\tau + (1-\tau)\,v_\pi(A^\tau,o,\tau)$$</li>
+    <li><p>将 $A_{\text{prev}}$ 右侧补零至长度 $H$（补零位满足 $W_i=0$，不影响误差），在干净动作空间定义加权匹配损失：</p>$$L(A^\tau) = \frac{1}{2}\,\big\|\operatorname{diag}(W)^{1/2}\big(\hat A^1(A^\tau) - A_{\text{prev}}\big)\big\|_2^2$$</li>
+    <li><p>误差在 $\hat A^1$ 空间测得，不能直接加到含噪的 $A^\tau$ 上，需按链式法则反传。为<b>减小</b> $L$，引导方向取<b>负梯度</b> $\mathbf g=-\nabla_{A^\tau}L$；令加权残差 $\mathbf e=(A_{\text{prev}}-\hat A^1)^\top\operatorname{diag}(W)$，写为一次向量-雅可比积（VJP）：</p>$$\mathbf g^\top = -\frac{\partial L}{\partial A^\tau} = (A_{\text{prev}} - \hat A^1)^\top\operatorname{diag}(W)\,\frac{\partial \hat A^1}{\partial A^\tau} = \mathbf e\cdot\frac{\partial \hat A^1}{\partial A^\tau}$$</li>
+    <li><p>套用 ΠGDM 对条件得分 $\nabla_{A^\tau}\log p(A_{\text{prev}}\mid A^\tau)$ 的高斯后验近似（取标准正态先验 $A^1\sim\mathcal N(0,I)$，结合 $A^\tau=\tau A^1+(1-\tau)A^0$ 得后验方差 $r_\tau^2$），乘以流匹配中得分到速度场的换算系数 $\frac{1-\tau}{\tau}$，并用上限 $\beta$ 裁剪：</p>$$\begin{gathered}r_\tau^2 = \frac{(1-\tau)^2}{\tau^2+(1-\tau)^2} \\[4pt] \lambda_\tau = \min\!\left(\beta,\ \frac{1-\tau}{\tau\,r_\tau^2}\right)\end{gathered}$$</li>
+    <li><p>将原速度场 $v_\pi$（响应新观测）与引导项 $\lambda_\tau\mathbf g$（贴合旧块）叠加，完成一步去噪积分：</p>$$\begin{gathered}v_{\text{guided}}(A^\tau,o,\tau) = v_\pi(A^\tau,o,\tau) + \lambda_\tau\,\mathbf g \\[4pt] A^{\tau+1/n} = A^\tau + \frac{1}{n}\,v_{\text{guided}}(A^\tau,o,\tau)\end{gathered}$$</li>
+  </ol>
+
+  <div class="note pit"><b>易错：引导方向是负梯度，且必须裁剪 $\lambda_\tau$</b><p>对 $L=\frac{1}{2}\|\operatorname{diag}(W)^{1/2}(\hat A^1-A_{\text{prev}})\|_2^2$ 直接求导得到 $\nabla_{A^\tau}L=(\hat A^1-A_{\text{prev}})^\top\operatorname{diag}(W)\frac{\partial\hat A^1}{\partial A^\tau}$；带 $(A_{\text{prev}}-\hat A^1)$ 的 $\mathbf g$ 是<b>负梯度</b> $-\nabla_{A^\tau}L$，把符号写反会把轨迹推离旧块。另外化简可得 $\frac{1-\tau}{\tau r_\tau^2}=\frac{\tau^2+(1-\tau)^2}{\tau(1-\tau)}$，在 $\tau\to 0$ 与 $\tau\to 1$ 两端都会发散；机器人控制常只用 $n=5$–$10$ 步去噪，不加 $\beta$ 裁剪会过冲发散。论文保守取 $\beta=5$（消融显示高于 5 不再有增益）。</p></div>
+
+  <p><b>计算代价</b>：不需要显式构造完整雅可比，自动微分（如 <code>jax.vjp</code> / <code>torch.autograd.grad</code>）一次反向传播即可算出 $\mathbf g$；视觉-语言主干的 KV cache 在去噪前只算一次，反传只穿过较小的动作专家（action expert）。即便如此，每个去噪步仍多出一次反向传播：$\pi_{0.5}$ 在 RTX 4090 上（$H=50,\ n=5$）模型推理从 <b>76 ms</b> 升至 <b>97 ms</b>（+21 ms）；$\pi_{0.6}$ 在远端 H100 上（$n=5$）推理期 RTC 端到端平均 <b>135 ms</b>，比无反传的训练期 RTC（<b>108 ms</b>）多约 27 ms。</p>
+
+  <figure class="viz" id="viz-guidance">
+    <div class="viz-h"><b>双模态玩具 Flow 策略：逐步去噪与 RTC VJP 引导</b><span>H = 12，s = 4，n = 10 步欧拉积分，解析速度场与解析 VJP</span></div>
+    <div class="viz-grid">
+      <div class="viz-stage"><p class="pane-t">动作块演化：A<sup>τ</sup> 与各步一步终点估计 Â<sup>1</sup></p><canvas id="cv-gd-tr" aria-label="双模态玩具 flow 策略在有无 RTC 引导下的逐步去噪轨迹"></canvas></div>
+      <div class="viz-stage"><p class="pane-t">引导权重 λ<sub>τ</sub> = min(β, (1−τ)/(τ·r<sub>τ</sub><sup>2</sup>))</p><canvas id="cv-gd-lam" aria-label="未裁剪和裁剪后的引导权重随 flow 时间 τ 变化的曲线"></canvas></div>
+    </div>
+    <div class="viz-ctrl">
+      <div class="seg" id="sg-gd-on" role="group" aria-label="是否开启引导"><button type="button" data-v="on" aria-pressed="true">有 RTC 引导</button><button type="button" data-v="off">无引导</button></div>
+      <label for="sl-gd-b">β <input type="range" id="sl-gd-b" min="0" max="12" step="0.25" value="5"><output id="o-gd-b">5.00</output></label>
+      <label for="sl-gd-d">d <input type="range" id="sl-gd-d" min="1" max="6" step="1" value="4"><output id="o-gd-d">4</output></label>
+      <label for="sl-gd-k">步 k <input type="range" id="sl-gd-k" min="0" max="10" step="1" value="10"><output id="o-gd-k">10 / 10</output></label>
+      <button type="button" class="btn ghost" id="bt-gd-play">逐步播放</button>
+      <button type="button" class="btn ghost" id="bt-gd-seed">换噪声种子</button>
+    </div>
+    <div class="viz-read" id="rd-gd"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>旧块 A<sub>prev</sub>（冻结区实线、过渡区虚线）</li><li><i style="background:var(--c2)"></i>当前步预测终点 Â<sup>1</sup>（浅色为历史步）</li><li><i style="background:var(--c3)"></i>最终新块 A<sup>1</sup>（或拼接执行轨迹）</li><li><i style="background:var(--c4)"></i>当前含噪块 A<sup>τ</sup></li><li><i style="background:var(--surface-2)"></i>策略的两个合法模式走廊</li></ul>
+    <figcaption>策略的干净分布是上下两个对称轨迹模式的等权高斯混合（$\sigma_0=0.08$），速度场 $v_\pi$ 与雅可比-向量积 $\mathbf e\cdot\partial\hat A^1/\partial A^\tau$ 均为闭式解析解。默认噪声种子在无引导时会落入下方模式，在 $i=d$ 接缝处产生巨大跳变；开启 RTC 引导（$\beta=5$）后，即使只在前 $H-s$ 步上给权重，VJP 通过多步耦合把整条轨迹（含自由区）拉回上方模式。把 $\beta$ 从 0 慢慢拉到 5 可观察模式翻转的临界点。</figcaption>
+  </figure>
+</section>
+
+<section id="training">
+  <h2 data-toc="训练期 RTC">训练期 RTC：前缀条件化</h2>
+  <p class="def"><b>训练期 RTC（Training-Time Action Conditioning）</b>（Black, Ren, Equi, Levine, 2025-12, arXiv:2512.05964）不在推理阶段用反传近似补全，而是在训练阶段随机模拟推理延迟 $d$，直接把真值动作块的前 $d$ 步作为干净前缀输入模型，原生学习条件分布 $p(A_{t+d:t+H}\mid o_t, A_{t:t+d})$。</p>
+  <p>实现无需改动网络架构或机器人运行时，在标准 flow matching 训练循环中只改三处（对照论文 Algorithm 1）：</p>
+  <ol class="derive">
+    <li><p><b>采样模拟延迟 $d$</b>：为每条训练样本从延迟分布采样 $d$（例如均匀分布 $d\sim\mathcal U\{0,\dots,d_{\max}\}$ 或随 $d$ 指数衰减的离散分布；真机 50 Hz 实验常覆盖到 $d_{\max}=10$–$12$ 步，对应 200–240 ms）：</p>$$d \sim p_{\text{delay}}\big(\{0,\dots,d_{\max}\}\big)$$</li>
+    <li><p><b>逐 token 分配 flow 时间</b>：先采后缀共享时间 $\tau\sim p(\tau)$，再把前 $d$ 步的时间强制置 1，使前缀输入保持无噪声真值 $A^1_{0:d}$，后缀正常按 $\tau$ 与高斯噪声插值：</p>$$\begin{gathered}\tau_i = \begin{cases} 1 & i \lt d \\ \tau & i \ge d \end{cases} \\[4pt] A_i^{\tau_i} = \tau_i\,A_i^1 + (1-\tau_i)\,A_i^0\end{gathered}$$</li>
+    <li><p><b>仅对后缀算 flow 损失</b>：整段长度 $H$ 的 $A^{\boldsymbol\tau}$ 与时间向量 $\boldsymbol\tau$ 一起送入动作专家（前缀与后缀通过自注意力互相看见），MSE 损失屏蔽前缀，只对 $i\ge d$ 求平均：</p>$$\mathcal L = \frac{1}{H-d}\sum_{i=d}^{H-1}\big\|v_{\pi,i}(A^{\boldsymbol\tau},o,\boldsymbol\tau) - (A_i^1 - A_i^0)\big\|_2^2$$</li>
+  </ol>
+  <p>部署时把旧块已经承诺要执行的前 $d$ 步直接填入前缀位并设 $\tau_i=1$，后 $H-d$ 步从高斯噪声做常规前向欧拉积分，<b>完全消除 VJP 反传开销</b>。</p>
+  <ul>
+    <li><b>对比推理期 RTC</b>：在 $\pi_{0.6}$（远端 H100，$n=5$）的折纸箱（box building）和制作浓缩咖啡（espresso making）真机任务上，端到端延迟从推理期 RTC 的 <b>135 ms</b>（$d\approx 7$）降至 <b>108 ms</b>（$d\approx 5$），任务表现持平或更优；在 Kinetix 仿真大延迟区间，训练期直接学到的条件分布明显比推理期硬拉前缀更稳。</li>
+    <li><b>代价与边界</b>：需要修改训练或微调配方；若部署时的真实延迟或延迟抖动超出训练采样的 $d_{\max}$ 范围，前缀外推会退化。</li>
+  </ul>
+
+  <figure class="viz" id="viz-train">
+    <div class="viz-h"><b>训练期 RTC：逐 token 的前缀条件化与损失掩码</b><span>同一条真值动作块，按采样延迟 d 切分</span></div>
+    <div class="viz-stage"><canvas id="cv-tr" aria-label="动作 token 行着色为干净前缀和加噪后缀，下方显示对应含噪动作曲线"></canvas></div>
+    <div class="viz-ctrl">
+      <div class="seg" id="sg-tr-h" role="group" aria-label="块长 H"><button type="button" data-v="12">H = 12</button><button type="button" data-v="16" aria-pressed="true">H = 16</button><button type="button" data-v="24">H = 24</button></div>
+      <label for="sl-tr-d">延迟 d <input type="range" id="sl-tr-d" min="0" max="15" step="1" value="5"><output id="o-tr-d">5</output></label>
+      <label for="sl-tr-t">后缀 τ <input type="range" id="sl-tr-t" min="0" max="1" step="0.01" value="0.35"><output id="o-tr-t">0.35</output></label>
+      <div class="seg" id="sg-tr-dist" role="group" aria-label="延迟采样分布"><button type="button" data-v="unif" aria-pressed="true">均匀采样</button><button type="button" data-v="exp">指数衰减</button></div>
+      <button type="button" class="btn ghost" id="bt-tr-samp">重采样 d 与噪声</button>
+    </div>
+    <div class="viz-read" id="rd-tr"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>干净前缀（i &lt; d，τ<sub>i</sub> = 1，不计入损失）</li><li><i style="background:var(--c2)"></i>加噪后缀（i ≥ d，τ<sub>i</sub> = τ，计入 MSE 损失）</li><li><i style="background:var(--muted)"></i>真值动作 A<sup>1</sup></li></ul>
+    <figcaption>上方每个格子是一个动作 token，下方对应它在当前 $\tau_i$ 下的实际输入值 $A_i^{\tau_i}$。前 $d$ 步始终紧贴真值曲线且不产生损失梯度；后 $H-d$ 步随 $\tau$ 减小被噪声打散，红色竖线标出计入 flow matching 损失的每个位置。当 $d=0$ 时退化为常规无前缀训练。</figcaption>
+  </figure>
+</section>
+
+<section id="compare">
+  <h2 data-toc="方法对照与实验">方法对照与关键实验</h2>
+  <p>下表对照各实时分块方案的机制权衡（截至 2026-11）：</p>
+  <div class="tbl"><table>
+    <thead><tr><th>方法</th><th>停顿</th><th>接缝跳变 / 穿障</th><th>额外推理开销</th><th>需要重训</th><th>适用延迟范围</th></tr></thead>
+    <tbody>
+      <tr><td>同步执行</td><td>每 $s$ 步停顿 $\delta$</td><td>无跨块混合，但频繁启停</td><td>无</td><td>否</td><td>仅极小延迟（$\delta\ll s\Delta t$）</td></tr>
+      <tr><td>朴素异步（直接切换）</td><td>无（$d\le H/2$）</td><td>多模态切换处严重跳变</td><td>无</td><td>否</td><td>单模态、小延迟</td></tr>
+      <tr><td>时间集成（ACT）</td><td>每步推理时无</td><td>平均多模态会穿过障碍物</td><td>高（每步都要推理）</td><td>否</td><td>弱多模态、小模型</td></tr>
+      <tr><td>SmolVLA 异步队列</td><td>$d\le\min(L_{\text{trig}},\lfloor H/2\rfloor)$ 时无</td><td>事后覆盖/融合，仍有模式冲突</td><td>几乎无（工程队列）</td><td>否</td><td>中小延迟，策略无关</td></tr>
+      <tr><td>推理期 RTC</td><td>无（$d\le s\le H-d$）</td><td>软掩码引导，极小跳变、不穿障</td><td>每去噪步 1 次 VJP 反传（约 +20–30 ms）</td><td>否（即插即用）</td><td>中等至较大延迟（实测 &gt;300 ms）</td></tr>
+      <tr><td>训练期 RTC</td><td>无（$d\le d_{\max}$）</td><td>原生条件分布，大延迟更稳</td><td>无（与基线前向相同）</td><td>是（改损失微调）</td><td>训练覆盖的大延迟（$d\le d_{\max}$）</td></tr>
+      <tr><td>BID（ICLR 2025）</td><td>取决于是否异步</td><td>多样本选块，平衡连贯与反应</td><td>需一次采样多条候选块</td><td>否</td><td>偏重闭环重采样，非专门隐延迟</td></tr>
+      <tr><td>A2C2（2025-09）</td><td>与异步调度正交</td><td>轻量修正头每步用新观测纠偏</td><td>很低（轻量修正头每步前向）</td><td>只训外挂头，基座冻结</td><td>与 RTC 互补，补足开环期间扰动</td></tr>
+      <tr><td>VLASH（2025-12）</td><td>无</td><td>前推本体状态对齐执行时刻</td><td>无（与基线前向相同）</td><td>是（未来状态微调）</td><td>高动态短周期任务（如乒乓球）</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>论文里的关键实验数字</h3>
+  <ul>
+    <li><b>推理期 RTC（Black et al., NeurIPS 2025, arXiv:2506.07339）</b>：
+      <ul>
+        <li><b>Kinetix 仿真基准</b>：12 个高动态物理任务（抛接、平衡等），4 层 MLP-Mixer flow 策略，$H=8$，每数据点 2048 次 rollout，扫 $d\in\{0,1,2,3,4\}$。随着 $d$ 增大，同步执行与朴素异步成功率快速下降，时间集成在多模态任务上失效，RTC 在各延迟下均保持显著领先。</li>
+        <li><b>真机双臂评测</b>：6 项精细任务（点亮火柴/蜡烛、插网线、叠衬衫、批量叠衣、铺床、把餐具放到水槽），使用 $\pi_{0.5}$（50 Hz，$H=50$，$n=5$，RTX 4090 模型推理 97 ms vs 基线 76 ms，加 LAN 端到端约 108–120 ms），并额外注入 +100 ms 与 +200 ms 延迟（$d\approx 11$–$16$）。RTC 可稳健应对超过 <b>300 ms</b>（超预测窗口 30%）的延迟，任务吞吐比同步执行快约 <b>20%</b> 以上。</li>
+      </ul>
+    </li>
+    <li><b>训练期 RTC（Black et al., 2025-12, arXiv:2512.05964）</b>：在 Kinetix 仿真大延迟段成功率超过推理期 RTC；在 $\pi_{0.6}$（远端 H100，$n=5$）折纸箱与制作浓缩咖啡真机任务上，平均端到端延迟从 <b>135 ms</b>（推理期 RTC，$d\approx 7$）降到 <b>108 ms</b>（训练期 RTC，$d\approx 5$），任务表现持平或更优。</li>
+    <li><b>SmolVLA（Shukor et al., 2025, arXiv:2506.01844）</b>：450M 轻量 VLA，开启异步队列（常用 $g=0.7$）比同步推理减少约 <b>30%</b> 任务完成时间，吞吐提升最高约 <b>2×</b>。</li>
+    <li><b>VLASH（Tang et al., 2025-12, arXiv:2512.01031）</b>：通过未来状态前推与异步推理，相比同步基线取得最高 <b>2.03×</b> 速度提升，并将反应延迟降低最高 <b>17.4×</b>。</li>
+  </ul>
+</section>
+
+<section id="quiz">
+  <h2>自测</h2>
+  <details class="q"><summary>控制频率 50 Hz（$\Delta t=20\text{ ms}$），$H=50,\ s=25,\ \delta=120\text{ ms}$：同步执行的停顿占比和平均控制频率是多少？$d$ 是多少步？</summary><div><p>$d=\lceil 120/20\rceil=6$ 步。同步每轮执行 $s\Delta t=500\text{ ms}$、停顿 $\delta=120\text{ ms}$，停顿占比 $\eta_{\text{idle}}=120/(500+120)\approx 19.4\%$，平均控制频率 $f_{\text{eff}}=25/0.62\text{ s}\approx 40.3\text{ Hz}$。</p></div></details>
+  <details class="q"><summary>为什么 ACT 的 temporal ensembling 在多模态策略上可能比直接切换更危险？</summary><div><p>直接切换只是跳到另一条合法轨迹上（产生加速度尖峰但终点仍合法）；temporal ensembling 对两条不同模式的合法轨迹做线性加权平均，结果往往落在动作分布的低概率空洞里，例如直接穿过障碍物中心。</p></div></details>
+  <details class="q"><summary>SmolVLA 异步队列中，若 $H=50,\ g=0.5,\ d=30$，队列会耗空吗？把 $g$ 调大到 $0.9$ 能解决吗？</summary><div><p>都会耗空。单在途请求不耗空要求 $d\le\min(L_{\text{trig}},\lfloor H/2\rfloor)$。当 $d=30\gt H/2=25$ 时，每次新块到达并丢弃前 30 步后，队列最多只能补到 $H-d=20$ 步，远少于下一次推理所需的 30 步，调高 $g$ 也无法避免停顿。</p></div></details>
+  <details class="q"><summary>推理期 RTC 为什么要求 $d\le s\le H-d$？两端极值 $s=d$ 和 $s=H-d$ 分别意味什么？</summary><div><p>$s\ge d$ 保证一次推理在下一次推理发起前完成，取 $s=d$ 是推理服务器满负荷无缝连轴转的最高更新率；$s\le H-d$ 保证发起推理时旧块至少还剩 $d$ 步顶过冻结区，取 $s=H-d$ 时过渡区长度为 0，软掩码退化为只约束前 $d$ 步的硬掩码。</p></div></details>
+  <details class="q"><summary>推理期 RTC 的引导方向 $\mathbf g$ 为什么不能直接把终点误差 $\mathbf e$ 加到 $A^\tau$ 上，而要做一次 VJP？为什么是负梯度？</summary><div><p>$\mathbf e$ 是在干净终点 $\hat A^1$ 空间里测得的误差，必须通过 $\partial\hat A^1/\partial A^\tau$ 反传回含噪空间 $A^\tau$，并且正是这个雅可比把前缀步的误差耦合传播到整个动作块（包括自由区）。匹配损失 $L=\frac{1}{2}\|\operatorname{diag}(W)^{1/2}(\hat A^1-A_{\text{prev}})\|_2^2$ 越小越贴合，所以要沿负梯度 $\mathbf g=-\nabla_{A^\tau}L$ 移动。</p></div></details>
+  <details class="q"><summary>为什么引导权重 $\lambda_\tau=\min\!\big(\beta,\frac{1-\tau}{\tau r_\tau^2}\big)$ 必须设置裁剪上限 $\beta$？</summary><div><p>代入 $r_\tau^2=\frac{(1-\tau)^2}{\tau^2+(1-\tau)^2}$ 得未裁剪权重为 $\frac{\tau^2+(1-\tau)^2}{\tau(1-\tau)}$，在 $\tau\to 0$ 和 $\tau\to 1$ 两端都会趋于无穷。机器人控制只用 $n=5$–$10$ 步粗步长欧拉积分，不裁剪会让单步引导严重过冲、轨迹发散。</p></div></details>
+  <details class="q"><summary>训练期 RTC 省掉了什么计算？什么情况下仍应选推理期 RTC？</summary><div><p>训练期 RTC 在训练时对前 $d$ 步置 $\tau_i=1$ 并屏蔽前缀损失，推理时只需常规前向，完全省掉每去噪步一次的 VJP 反传开销（$\pi_{0.6}$ 实测省约 27 ms）。若拿到的是现成冻结的 flow / 扩散 checkpoint、无法重训微调，或者部署延迟会大幅超出训练设定的 $d_{\max}$，则仍需使用推理期 RTC。</p></div></details>
+</section>
+
+<section id="refs">
+  <h2>延伸阅读</h2>
+  <ol class="refs">
+    <li><b>Black, Galliker, Levine. Real-Time Execution of Action Chunking Flow Policies</b>（推理期 RTC）, NeurIPS 2025. <a href="https://arxiv.org/abs/2506.07339">arXiv:2506.07339</a>；仿真代码 <a href="https://github.com/Physical-Intelligence/real-time-chunking-kinetix">real-time-chunking-kinetix</a></li>
+    <li><b>Black, Ren, Equi, Levine. Training-Time Action Conditioning for Efficient Real-Time Chunking</b>（训练期 RTC）, 2025. <a href="https://arxiv.org/abs/2512.05964">arXiv:2512.05964</a></li>
+    <li><b>Shukor et al. SmolVLA: A Vision-Language-Action Model for Affordable and Efficient Robotics</b>, 2025. <a href="https://arxiv.org/abs/2506.01844">arXiv:2506.01844</a>；异步推理栈代码 <a href="https://github.com/huggingface/lerobot">lerobot</a></li>
+    <li><b>Zhao, Kumar, Levine, Finn. Learning Fine-Grained Bimanual Manipulation with Low-Cost Hardware</b>（ACT / temporal ensembling）, RSS 2023. <a href="https://arxiv.org/abs/2304.13705">arXiv:2304.13705</a></li>
+    <li><b>Song, Vahdat, Mardani, Kautz. Pseudoinverse-Guided Diffusion Models for Inverse Problems</b>（ΠGDM）, ICLR 2023. <a href="https://openreview.net/forum?id=9_gsMA8MRKQ">OpenReview</a></li>
+    <li><b>Liu, Hamid, Xie, Lee, Du, Finn. Bidirectional Decoding: Improving Action Chunking via Guided Test-Time Sampling</b>（BID）, ICLR 2025. <a href="https://arxiv.org/abs/2408.17355">arXiv:2408.17355</a>；代码 <a href="https://github.com/YuejiangLIU/bid_diffusion">bid_diffusion</a></li>
+    <li><b>Sendai, Alvarez, Matsushima, Matsuo, Iwasawa. Leave No Observation Behind: Real-time Correction for VLA Action Chunks</b>（A2C2）, 2025. <a href="https://arxiv.org/abs/2509.23224">arXiv:2509.23224</a></li>
+    <li><b>Tang, Sun, Zhao, Yang, Lin, Zhang, Hou, Lu, Liu, Han. VLASH: Real-Time VLAs via Future-State-Aware Asynchronous Inference</b>, 2025. <a href="https://arxiv.org/abs/2512.01031">arXiv:2512.01031</a>；代码 <a href="https://github.com/mit-han-lab/vlash">vlash</a></li>
+    <li><b>Black et al. π0: A Vision-Language-Action Flow Model for General Robot Control</b>, 2024. <a href="https://arxiv.org/abs/2410.24164">arXiv:2410.24164</a>；<b>Physical Intelligence. π0.5</b>, 2025. <a href="https://arxiv.org/abs/2504.16054">arXiv:2504.16054</a>；代码 <a href="https://github.com/Physical-Intelligence/openpi">openpi</a></li>
+  </ol>
+</section>
+
+</main>
+</div>
+
+<!-- v4u:foot -->
+<footer class="v4u-foot"><div class="v4u-foot-in"><a class="pv" href="../pi-series/"><span>上一篇</span>π 系列 VLA</a><a class="nx" href="../sim-rl/"><span>下一篇</span>仿真 RL 与行为克隆</a></div></footer>
+<!-- /v4u:foot -->
+
+<script>
+V4U.ready(() => {
+  const $ = (id) => document.getElementById(id);
+  const C = (n) => V4U.css(n);
+  const { PI, sin, cos, exp, E, abs, min, max, floor, ceil, sqrt, hypot, pow } = Math;
+  const f = (x, d = 2) => V4U.fmt(x, d);
+  const mono = (px = 11) => px + 'px ' + C('--f-mono');
+  const body = (px = 12) => px + 'px ' + C('--f-body');
+  const dashed = (ctx, fn, pat = [5, 4]) => { ctx.save(); ctx.setLineDash(pat); fn(); ctx.restore(); };
+  const rngOf = (seed) => () => {
+    seed = (seed + 0x6D2B79F5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  const gaussOf = (r) => () => sqrt(-2 * Math.log(r() || 1e-9)) * cos(2 * PI * r());
+
+  function softMask(H, s, d, sched = 'exp') {
+    const W = new Array(H).fill(0);
+    const denom = max(1, H - s - d + 1);
+    for (let i = 0; i < H; i++) {
+      if (i < d) W[i] = 1;
+      else if (i < H - s) {
+        const c = (H - s - i) / denom;
+        if (sched === 'hard') W[i] = 0;
+        else if (sched === 'lin') W[i] = c;
+        else W[i] = c * (exp(c) - 1) / (E - 1);
+      } else W[i] = 0;
+    }
+    return W;
+  }
+
+  /* ==================== 1. #sync timeline ==================== */
+  {
+    const slH = $('sl-sy-h'), slS = $('sl-sy-s'), slD = $('sl-sy-d');
+    const oH = $('o-sy-h'), oS = $('o-sy-s'), oD = $('o-sy-d'), rd = $('rd-sync');
+    const bt = $('bt-sy-play');
+    let freq = 50, playT = null, anim = null;
+    const TMAX = 2.5;
+
+    const redraw = V4U.canvas($('cv-sync'), (w) => (w < 460 ? 270 : 250), (ctx, w, h) => {
+      const H = +slH.value;
+      if (+slS.value > H) slS.value = H;
+      slS.max = H;
+      const s = +slS.value, deltaMs = +slD.value;
+      const dt = 1 / freq, delta = deltaMs / 1000;
+      const dSteps = ceil(delta / dt - 1e-9);
+      const execT = s * dt, cyc = execT + delta;
+      const idle = cyc > 0 ? delta / cyc : 0;
+      const fEff = cyc > 0 ? s / cyc : freq;
+
+      oH.textContent = H; oS.textContent = s; oD.textContent = deltaMs + ' ms';
+
+      const padL = w < 460 ? 38 : 48, padR = 16, padT = 16, padB = 26;
+      const pw = w - padL - padR;
+      const X = (t) => padL + (t / TMAX) * pw;
+
+      // Top chart: executed steps vs wall-clock time
+      const topH = h * 0.44, topY0 = padT, topY1 = topY0 + topH;
+      const maxSteps = TMAX * freq;
+      const Ys = (st) => topY1 - (st / maxSteps) * topH;
+
+      // Grid
+      ctx.strokeStyle = C('--line'); ctx.lineWidth = 1;
+      for (let t = 0; t <= TMAX + 1e-6; t += 0.5) {
+        const x = X(t);
+        ctx.beginPath(); ctx.moveTo(x, topY0); ctx.lineTo(x, h - padB); ctx.stroke();
+      }
+      ctx.beginPath(); ctx.moveTo(padL, topY1); ctx.lineTo(w - padR, topY1); ctx.stroke();
+
+      // Ideal async reference line
+      dashed(ctx, () => {
+        ctx.strokeStyle = C('--c3'); ctx.lineWidth = 1.8;
+        ctx.beginPath(); ctx.moveTo(X(0), Ys(0)); ctx.lineTo(X(TMAX), Ys(maxSteps)); ctx.stroke();
+      }, [6, 4]);
+
+      // Build sync progress polyline & segments
+      const segs = [];
+      let t = 0, steps = 0, idx = 0;
+      ctx.beginPath(); ctx.moveTo(X(0), Ys(0));
+      while (t < TMAX - 1e-6 && idx < 400) {
+        const tExecEnd = min(TMAX, t + execT);
+        const dtExec = tExecEnd - t;
+        const ds = dtExec / dt;
+        segs.push({ type: 'exec', t0: t, t1: tExecEnd, k: idx, fullEnd: t + H * dt });
+        steps += ds;
+        ctx.lineTo(X(tExecEnd), Ys(steps));
+        t = tExecEnd;
+        if (t >= TMAX - 1e-6) break;
+        if (delta > 0) {
+          const tWaitEnd = min(TMAX, t + delta);
+          segs.push({ type: 'wait', t0: t, t1: tWaitEnd, k: idx });
+          ctx.lineTo(X(tWaitEnd), Ys(steps));
+          t = tWaitEnd;
+        }
+        idx++;
+      }
+      ctx.strokeStyle = C('--c1'); ctx.lineWidth = 2.6; ctx.stroke();
+
+      // Highlight flat wait segments on progress curve
+      ctx.strokeStyle = C('--bad'); ctx.lineWidth = 3;
+      let stWalk = 0;
+      for (const sg of segs) {
+        if (sg.type === 'exec') stWalk += (sg.t1 - sg.t0) / dt;
+        else {
+          ctx.beginPath(); ctx.moveTo(X(sg.t0), Ys(stWalk)); ctx.lineTo(X(sg.t1), Ys(stWalk)); ctx.stroke();
+        }
+      }
+
+      // Y-axis label (top)
+      ctx.fillStyle = C('--muted'); ctx.font = mono(10.5); ctx.textAlign = 'right';
+      ctx.fillText(Math.round(maxSteps), padL - 6, topY0 + 8);
+      ctx.fillText('0', padL - 6, topY1 + 3);
+      ctx.textAlign = 'left';
+      ctx.fillText('已执行步数', padL + 4, topY0 + 10);
+
+      // Bottom strip: execution vs wait bars
+      const barY = topY1 + 26, barH = max(24, h - padB - barY - 12);
+      for (const sg of segs) {
+        const x0 = X(sg.t0), x1 = X(sg.t1), bw = max(1, x1 - x0);
+        if (sg.type === 'exec') {
+          // Unused H - s tail ghost on first chunk if visible
+          if (sg.k === 0 && H > s) {
+            const gx1 = X(min(TMAX, sg.fullEnd));
+            ctx.fillStyle = C('--surface-2');
+            ctx.fillRect(x1, barY + barH - 7, max(0, gx1 - x1), 7);
+          }
+          ctx.fillStyle = C('--c1s'); ctx.fillRect(x0, barY, bw, barH);
+          ctx.strokeStyle = C('--c1'); ctx.lineWidth = 1.5; ctx.strokeRect(x0 + 0.5, barY + 0.5, max(0, bw - 1), barH - 1);
+          if (bw > 34) {
+            ctx.fillStyle = C('--c1'); ctx.font = mono(10.5); ctx.textAlign = 'center';
+            ctx.fillText('C' + sg.k, (x0 + x1) / 2, barY + barH / 2 + 4);
+          }
+        } else {
+          ctx.fillStyle = C('--bad-soft'); ctx.fillRect(x0, barY, bw, barH);
+          ctx.strokeStyle = C('--bad'); ctx.lineWidth = 1.5; ctx.strokeRect(x0 + 0.5, barY + 0.5, max(0, bw - 1), barH - 1);
+          if (bw > 24) {
+            ctx.fillStyle = C('--bad'); ctx.font = mono(10); ctx.textAlign = 'center';
+            ctx.fillText('δ', (x0 + x1) / 2, barY + barH / 2 + 4);
+          }
+        }
+      }
+
+      // Time cursor during animation
+      if (playT !== null) {
+        const cx = X(playT);
+        ctx.strokeStyle = C('--ink'); ctx.lineWidth = 1.6;
+        ctx.beginPath(); ctx.moveTo(cx, topY0); ctx.lineTo(cx, barY + barH); ctx.stroke();
+        // Find if waiting or executing at playT
+        const curSeg = segs.find((sg) => playT >= sg.t0 && playT <= sg.t1);
+        const curSteps = (() => {
+          let acc = 0;
+          for (const sg of segs) {
+            if (playT <= sg.t0) break;
+            if (sg.type === 'exec') acc += (min(playT, sg.t1) - sg.t0) / dt;
+          }
+          return acc;
+        })();
+        ctx.fillStyle = curSeg && curSeg.type === 'wait' ? C('--bad') : C('--c1');
+        ctx.beginPath(); ctx.arc(cx, Ys(curSteps), 5, 0, 2 * PI); ctx.fill();
+      }
+
+      // X-axis ticks
+      ctx.fillStyle = C('--muted'); ctx.font = mono(10.5); ctx.textAlign = 'center';
+      for (let t = 0; t <= TMAX + 1e-6; t += 0.5) {
+        ctx.fillText(f(t, 1) + 's', X(t), h - 7);
+      }
+
+      const cls = idle > 0.3 ? 'bad' : (idle > 0.12 ? 'warn' : 'ok');
+      rd.innerHTML =
+        `<span>Δt = <b>${Math.round(dt * 1000)} ms</b></span>` +
+        `<span>d = ⌈δ/Δt⌉ = <b>${dSteps} 步</b></span>` +
+        `<span>停顿占比 = <b class="${cls}">${f(idle * 100, 1)}%</b></span>` +
+        `<span>平均频率 f<sub>eff</sub> = <b>${f(fEff, 1)} Hz</b></span>` +
+        `<span>2.5 s 步数 = <b>${Math.round(steps)}</b> / ${Math.round(maxSteps)}</span>`;
+    });
+
+    V4U.seg($('sg-sy-f'), (v) => { freq = +v; redraw(); });
+    [slH, slS, slD].forEach((el) => el.addEventListener('input', redraw));
+    bt.addEventListener('click', () => {
+      if (anim) { anim.stop(); anim = null; playT = null; bt.textContent = '播放'; redraw(); return; }
+      playT = 0; bt.textContent = '暂停';
+      anim = V4U.loop(bt, (t, dt) => {
+        playT = (playT + dt * 0.7) % TMAX;
+        redraw();
+      });
+    });
+  }
+
+  /* ==================== 2. #naive-async 2D trajectory ==================== */
+  {
+    const slD = $('sl-as-d'), slDiv = $('sl-as-div');
+    const oD = $('o-as-d'), oDiv = $('o-as-div'), rd = $('rd-async');
+    const bt = $('bt-as-play');
+    let mode = 'naive', playK = null, anim = null;
+
+    const N = 16; // indices 0..15; inference starts after index 3
+    const tStart = 3;
+    const obs = { x: 0.77, y: 0.01, rx: 0.105, ry: 0.21 };
+
+    function buildTrajs(d, divFrac) {
+      // Old chunk A_prev: smooth path curving ABOVE obstacle centered at x=0.77
+      const oldPts = [];
+      for (let i = 0; i < N; i++) {
+        const u = i / (N - 1);
+        const x = 0.05 + 0.90 * u;
+        const bump = 0.42 * exp(-pow((x - 0.73) / 0.28, 2));
+        const y = 0.01 + bump;
+        oldPts.push([x, y]);
+      }
+      // New chunk A_new generated from obs at tStart=3 (branches DOWNWARD to pass below obstacle)
+      const newPts = [];
+      for (let i = 0; i < N; i++) {
+        if (i < tStart) { newPts.push(null); continue; }
+        const u = (i - tStart) / (N - 1 - tStart);
+        const x = oldPts[i][0];
+        const yUp = oldPts[i][1] + 0.04 * sin(PI * u);
+        const yDown = oldPts[tStart][1] * (1 - pow(u, 0.65)) - 0.41 * exp(-pow((x - 0.75) / 0.27, 2)) * (1 - exp(-u * 6));
+        const y = V4U.lerp(yUp, yDown, divFrac);
+        newPts.push([x, y]);
+      }
+
+      const sw = min(N - 2, tStart + d); // last old index executed before switching: execute old up to sw, then sw+1 from new
+      // Executed path
+      const execPts = [];
+      for (let i = 0; i < N; i++) {
+        if (i <= sw) execPts.push(oldPts[i].slice());
+        else if (mode === 'naive') execPts.push(newPts[i].slice());
+        else if (mode === 'te') {
+          // Equal/exponential weighted blend of old chunk and new chunk (classic 2-chunk overlap average)
+          const wNew = 0.52;
+          execPts.push([
+            (1 - wNew) * oldPts[i][0] + wNew * newPts[i][0],
+            (1 - wNew) * oldPts[i][1] + wNew * newPts[i][1],
+          ]);
+        } else {
+          // RTC: stays in upper mode, smoothly incorporates slight reactivity correction after sw
+          const r = (i - sw) / max(1, N - 1 - sw);
+          const corr = 0.055 * (1 - exp(-2.5 * r)) * sin(PI * r * 0.85);
+          execPts.push([oldPts[i][0], oldPts[i][1] + corr]);
+        }
+      }
+
+      // Compute step accelerations ||p[i+1] - 2p[i] + p[i-1]|| and velocities
+      const acc = new Array(N).fill(0);
+      const vel = new Array(N).fill(0);
+      for (let i = 1; i < N; i++) vel[i] = hypot(execPts[i][0] - execPts[i - 1][0], execPts[i][1] - execPts[i - 1][1]);
+      for (let i = 1; i < N - 1; i++) {
+        const ax = execPts[i + 1][0] - 2 * execPts[i][0] + execPts[i - 1][0];
+        const ay = execPts[i + 1][1] - 2 * execPts[i][1] + execPts[i - 1][1];
+        acc[i] = hypot(ax, ay);
+      }
+      // Jump velocity at switch step (sw -> sw+1)
+      const jumpDv = sw + 1 < N ? hypot(
+        (execPts[sw + 1][0] - execPts[sw][0]) - (execPts[sw][0] - execPts[sw - 1][0]),
+        (execPts[sw + 1][1] - execPts[sw][1]) - (execPts[sw][1] - execPts[sw - 1][1])
+      ) : 0;
+
+      // Signed distance to elliptical obstacle along executed path segments
+      let minClear = Infinity;
+      let hit = false;
+      const distObs = (px, py) => {
+        const nx = (px - obs.x) / obs.rx, ny = (py - obs.y) / obs.ry;
+        const r = hypot(nx, ny);
+        return (r - 1) * min(obs.rx, obs.ry);
+      };
+      for (let i = 0; i < N - 1; i++) {
+        for (let k = 0; k <= 12; k++) {
+          const u = k / 12;
+          const px = V4U.lerp(execPts[i][0], execPts[i + 1][0], u);
+          const py = V4U.lerp(execPts[i][1], execPts[i + 1][1], u);
+          const d0 = distObs(px, py);
+          if (d0 < minClear) minClear = d0;
+          if (d0 < 0) hit = true;
+        }
+      }
+      return { oldPts, newPts, execPts, acc, sw, jumpDv, maxAcc: max(...acc), minClear, hit };
+    }
+
+    let state = null;
+    const drawXY = V4U.canvas($('cv-as-xy'), (w) => max(240, min(300, w * 0.62)), (ctx, w, h) => {
+      const d = +slD.value, div = +slDiv.value / 100;
+      oD.textContent = d + ' 步'; oDiv.textContent = Math.round(div * 100) + '%';
+      state = buildTrajs(d, div);
+      const { oldPts, newPts, execPts, sw, hit } = state;
+
+      const pad = 22;
+      const X = (x) => pad + x * (w - 2 * pad);
+      const Y = (y) => h * 0.5 - y * (h - 2 * pad) * 0.88;
+
+      // Subtle grid
+      ctx.strokeStyle = C('--line'); ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(pad, Y(0)); ctx.lineTo(w - pad, Y(0)); ctx.stroke();
+
+      // Obstacle
+      ctx.save();
+      ctx.fillStyle = hit ? C('--bad-soft') : C('--surface-2');
+      ctx.strokeStyle = hit ? C('--bad') : C('--line-2');
+      ctx.lineWidth = 1.8;
+      ctx.beginPath();
+      ctx.ellipse(X(obs.x), Y(obs.y), obs.rx * (w - 2 * pad), obs.ry * (h - 2 * pad) * 0.88, 0, 0, 2 * PI);
+      ctx.fill(); ctx.stroke();
+      ctx.fillStyle = hit ? C('--bad') : C('--muted');
+      ctx.font = body(12); ctx.textAlign = 'center';
+      ctx.fillText('障碍物', X(obs.x), Y(obs.y) + 4);
+      ctx.restore();
+
+      // Old chunk remaining tail (faded)
+      ctx.strokeStyle = C('--c1'); ctx.globalAlpha = 0.28; ctx.lineWidth = 2;
+      ctx.beginPath();
+      oldPts.forEach((p, i) => (i ? ctx.lineTo(X(p[0]), Y(p[1])) : ctx.moveTo(X(p[0]), Y(p[1]))));
+      ctx.stroke(); ctx.globalAlpha = 1;
+
+      // New unguided chunk (dashed orange)
+      dashed(ctx, () => {
+        ctx.strokeStyle = C('--c2'); ctx.globalAlpha = 0.55; ctx.lineWidth = 2;
+        ctx.beginPath();
+        let started = false;
+        newPts.forEach((p) => {
+          if (!p) return;
+          if (!started) { ctx.moveTo(X(p[0]), Y(p[1])); started = true; }
+          else ctx.lineTo(X(p[0]), Y(p[1]));
+        });
+        ctx.stroke(); ctx.globalAlpha = 1;
+      }, [5, 4]);
+      newPts.forEach((p, i) => {
+        if (!p || i <= sw) return;
+        ctx.fillStyle = C('--c2'); ctx.globalAlpha = 0.5;
+        ctx.beginPath(); ctx.arc(X(p[0]), Y(p[1]), 3, 0, 2 * PI); ctx.fill();
+      });
+      ctx.globalAlpha = 1;
+
+      // Executed trajectory
+      const execCol = hit ? C('--bad') : C('--c3');
+      // Prefix up to sw in c1
+      ctx.strokeStyle = C('--c1'); ctx.lineWidth = 2.8;
+      ctx.beginPath();
+      for (let i = 0; i <= sw; i++) {
+        const p = execPts[i];
+        i ? ctx.lineTo(X(p[0]), Y(p[1])) : ctx.moveTo(X(p[0]), Y(p[1]));
+      }
+      ctx.stroke();
+      // Post-switch executed segment
+      ctx.strokeStyle = execCol; ctx.lineWidth = 3;
+      ctx.beginPath();
+      for (let i = sw; i < N; i++) {
+        const p = execPts[i];
+        i === sw ? ctx.moveTo(X(p[0]), Y(p[1])) : ctx.lineTo(X(p[0]), Y(p[1]));
+      }
+      ctx.stroke();
+
+      // Dots
+      execPts.forEach((p, i) => {
+        ctx.fillStyle = i <= sw ? C('--c1') : execCol;
+        ctx.beginPath(); ctx.arc(X(p[0]), Y(p[1]), i === sw ? 5 : 3.4, 0, 2 * PI); ctx.fill();
+      });
+
+      // Labels: inference start & switch
+      const ps = oldPts[tStart], psw = execPts[sw];
+      ctx.strokeStyle = C('--muted'); ctx.lineWidth = 1.2;
+      ctx.beginPath(); ctx.moveTo(X(ps[0]), Y(ps[1]) - 10); ctx.lineTo(X(ps[0]), Y(ps[1]) - 30); ctx.stroke();
+      ctx.fillStyle = C('--ink-2'); ctx.font = mono(10.5); ctx.textAlign = 'center';
+      ctx.fillText('a₃ 推理启动', X(ps[0]), Y(ps[1]) - 34);
+
+      ctx.strokeStyle = execCol; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.arc(X(psw[0]), Y(psw[1]), 8.5, 0, 2 * PI); ctx.stroke();
+      ctx.fillStyle = C('--ink'); ctx.textAlign = 'center';
+      ctx.fillText('a' + sw + ' 切换', X(psw[0]), Y(psw[1]) - 14);
+
+      // Animated robot marker
+      if (playK !== null) {
+        const i0 = min(N - 2, floor(playK)), frac = playK - i0;
+        const rx = V4U.lerp(execPts[i0][0], execPts[i0 + 1][0], frac);
+        const ry = V4U.lerp(execPts[i0][1], execPts[i0 + 1][1], frac);
+        ctx.fillStyle = C('--ink');
+        ctx.beginPath(); ctx.arc(X(rx), Y(ry), 6.5, 0, 2 * PI); ctx.fill();
+        ctx.fillStyle = C('--surface');
+        ctx.beginPath(); ctx.arc(X(rx), Y(ry), 2.5, 0, 2 * PI); ctx.fill();
+      }
+    });
+
+    const drawAcc = V4U.canvas($('cv-as-acc'), (w) => max(240, min(300, w * 0.62)), (ctx, w, h) => {
+      if (!state) state = buildTrajs(+slD.value, +slDiv.value / 100);
+      const { acc, sw, jumpDv, maxAcc, minClear, hit } = state;
+      const padL = 38, padR = 14, padT = 18, padB = 28;
+      const pw = w - padL - padR, ph = h - padT - padB;
+      const yMax = 0.85;
+      const Y = (v) => padT + ph - min(1, v / yMax) * ph;
+
+      // Grid
+      ctx.strokeStyle = C('--line'); ctx.lineWidth = 1;
+      for (const v of [0, 0.25, 0.5, 0.75]) {
+        const y = Y(v);
+        ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(w - padR, y); ctx.stroke();
+        ctx.fillStyle = C('--muted'); ctx.font = mono(10); ctx.textAlign = 'right';
+        ctx.fillText(f(v, 2), padL - 5, y + 3);
+      }
+
+      const bw = pw / N;
+      for (let i = 0; i < N; i++) {
+        const x = padL + i * bw + 2, bh = max(1, (min(yMax, acc[i]) / yMax) * ph);
+        const isSw = (i === sw || i === sw + 1);
+        ctx.fillStyle = (isSw && acc[i] > 0.15) ? C('--bad') : (i <= sw ? C('--c1') : C('--c3'));
+        ctx.fillRect(x, padT + ph - bh, max(2, bw - 4), bh);
+        if (i % 3 === 0 || i === sw) {
+          ctx.fillStyle = isSw ? C('--ink') : C('--muted'); ctx.font = mono(10); ctx.textAlign = 'center';
+          ctx.fillText(i, x + (bw - 4) / 2, h - 9);
+        }
+      }
+
+      // Switch divider
+      const xSw = padL + (sw + 0.5) * bw;
+      dashed(ctx, () => {
+        ctx.strokeStyle = C('--ink-2'); ctx.lineWidth = 1.2;
+        ctx.beginPath(); ctx.moveTo(xSw, padT); ctx.lineTo(xSw, padT + ph); ctx.stroke();
+      }, [4, 3]);
+
+      const accCls = maxAcc > 0.2 ? 'bad' : 'ok';
+      const obsCls = hit ? 'bad' : 'ok';
+      rd.innerHTML =
+        `<span>切换步 = <b>a<sub>${sw}</sub> → a<sub>${sw + 1}</sub></b></span>` +
+        `<span>切换速度跳变 = <b class="${accCls}">${f(jumpDv, 3)}</b></span>` +
+        `<span>峰值加速度 = <b class="${accCls}">${f(maxAcc, 3)}</b></span>` +
+        `<span>障碍物净距 = <b class="${obsCls}">${hit ? '碰撞 (' + f(minClear, 3) + ')' : '+' + f(minClear, 3)}</b></span>`;
+    });
+
+    const redrawAll = () => { state = buildTrajs(+slD.value, +slDiv.value / 100); drawXY(); drawAcc(); };
+    V4U.seg($('sg-as-m'), (v) => { mode = v; redrawAll(); });
+    [slD, slDiv].forEach((el) => el.addEventListener('input', redrawAll));
+    bt.addEventListener('click', () => {
+      if (anim) { anim.stop(); anim = null; playK = null; bt.textContent = '播放'; redrawAll(); return; }
+      playK = 0; bt.textContent = '暂停';
+      anim = V4U.loop(bt, (t, dt) => {
+        playK += dt * 4.5;
+        if (playK >= N - 1) playK = 0;
+        drawXY();
+      });
+    });
+  }
+
+  /* ==================== 3. #smolvla queue sawtooth ==================== */
+  {
+    const slG = $('sl-sm-g'), slD = $('sl-sm-d'), slH = $('sl-sm-h');
+    const oG = $('o-sm-g'), oD = $('o-sm-d'), oH = $('o-sm-h'), rd = $('rd-smol');
+    let aggMode = 'overwrite';
+    const STEPS = 140, DT_MS = 20;
+
+    function simQueue(H, g, d) {
+      let q = H; // initial chunk loaded at t=0
+      let inFlight = null; // { start, arrive }
+      const qHist = [q];
+      const stalls = [];
+      const flights = [];
+      const arrivals = [];
+      const thresh = g * H;
+
+      for (let t = 0; t < STEPS; t++) {
+        // Check arrival at start of step t
+        if (inFlight && t >= inFlight.arrive) {
+          const usable = max(0, H - d);
+          const overlap = min(q, usable);
+          arrivals.push({ t, before: q, after: usable, overlap });
+          q = usable;
+          flights.push({ t0: inFlight.start, t1: t });
+          inFlight = null;
+        }
+        // Trigger request if queue fraction < g and no request in flight
+        if (!inFlight && (q / H < g - 1e-9 || (g === 0 && q === 0))) {
+          inFlight = { start: t, arrive: t + d };
+        }
+        // Execute one action if queue non-empty
+        if (q > 0) {
+          q -= 1;
+        } else {
+          stalls.push(t);
+        }
+        qHist.push(q);
+      }
+      if (inFlight) flights.push({ t0: inFlight.start, t1: STEPS });
+      return { qHist, stalls, flights, arrivals, thresh };
+    }
+
+    const redraw = V4U.canvas($('cv-smol'), (w) => (w < 460 ? 250 : 230), (ctx, w, h) => {
+      const g = +slG.value, dMs = +slD.value, H = +slH.value;
+      const d = ceil(dMs / DT_MS);
+      oG.textContent = f(g, 2); oD.textContent = dMs + ' ms'; oH.textContent = H;
+
+      const { qHist, stalls, flights, arrivals, thresh } = simQueue(H, g, d);
+      const padL = 40, padR = 14, padT = 18, padB = 28;
+      const pw = w - padL - padR, ph = h - padT - padB;
+      const X = (t) => padL + (t / STEPS) * pw;
+      const Y = (q) => padT + ph - (q / H) * ph;
+
+      // Server busy shading
+      ctx.fillStyle = C('--c4s');
+      for (const fl of flights) {
+        ctx.fillRect(X(fl.t0), padT, max(1, X(fl.t1) - X(fl.t0)), ph);
+      }
+
+      // Stall red shading
+      ctx.fillStyle = C('--bad-soft');
+      for (const st of stalls) {
+        ctx.fillRect(X(st), padT, max(1.5, pw / STEPS + 0.5), ph);
+      }
+
+      // Horizontal grid
+      ctx.strokeStyle = C('--line'); ctx.lineWidth = 1;
+      for (const frac of [0, 0.25, 0.5, 0.75, 1]) {
+        const y = Y(frac * H);
+        ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(w - padR, y); ctx.stroke();
+        if (frac === 0 || frac === 0.5 || frac === 1) {
+          ctx.fillStyle = C('--muted'); ctx.font = mono(10.5); ctx.textAlign = 'right';
+          ctx.fillText(Math.round(frac * H), padL - 6, y + 3.5);
+        }
+      }
+
+      // Threshold line g*H
+      dashed(ctx, () => {
+        ctx.strokeStyle = C('--c5'); ctx.lineWidth = 1.8;
+        ctx.beginPath(); ctx.moveTo(padL, Y(thresh)); ctx.lineTo(w - padR, Y(thresh)); ctx.stroke();
+      }, [6, 4]);
+      const gLbl = 'gH=' + f(thresh, 1);
+      ctx.font = mono(10.5);
+      const tw = ctx.measureText(gLbl).width;
+      const ly = max(padT + 12, Y(thresh) - 6);
+      ctx.fillStyle = C('--surface'); ctx.globalAlpha = 0.88;
+      ctx.fillRect(w - padR - tw - 6, ly - 10, tw + 6, 13);
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = C('--c5'); ctx.textAlign = 'right';
+      ctx.fillText(gLbl, w - padR - 2, ly);
+
+      // Overlap bars if blend mode selected
+      if (aggMode === 'blend') {
+        ctx.strokeStyle = C('--c3'); ctx.lineWidth = 3.5;
+        for (const a of arrivals) {
+          if (a.overlap > 0) {
+            ctx.beginPath(); ctx.moveTo(X(a.t), Y(0)); ctx.lineTo(X(a.t), Y(a.overlap)); ctx.stroke();
+          }
+        }
+      }
+
+      // Queue length sawtooth polyline (stepped on arrival)
+      ctx.strokeStyle = C('--c1'); ctx.lineWidth = 2.4;
+      ctx.beginPath();
+      const arrMap = new Map(arrivals.map((a) => [a.t, a]));
+      for (let t = 0; t <= STEPS; t++) {
+        const a = arrMap.get(t);
+        if (a && t > 0) {
+          ctx.lineTo(X(t), Y(a.before));
+          ctx.lineTo(X(t), Y(a.after));
+        }
+        const y = Y(qHist[t]);
+        t === 0 ? ctx.moveTo(X(t), y) : ctx.lineTo(X(t), y);
+      }
+      ctx.stroke();
+
+      // Highlight zero-queue flat segments
+      if (stalls.length) {
+        ctx.strokeStyle = C('--bad'); ctx.lineWidth = 3;
+        for (const st of stalls) {
+          ctx.beginPath(); ctx.moveTo(X(st), Y(0)); ctx.lineTo(X(st + 1), Y(0)); ctx.stroke();
+        }
+      }
+
+      // X-axis ticks (steps & seconds)
+      ctx.fillStyle = C('--muted'); ctx.font = mono(10.5); ctx.textAlign = 'center';
+      for (let t = 0; t <= STEPS; t += 20) {
+        ctx.fillText(t + '步', X(t), h - 8);
+      }
+
+      const minQ = min(...qHist);
+      const stallPct = (stalls.length / STEPS) * 100;
+      const avgOverlap = arrivals.length ? arrivals.reduce((a, b) => a + b.overlap, 0) / arrivals.length : 0;
+      const reqHz = flights.length / (STEPS * DT_MS / 1000);
+      const cls = stalls.length > 0 ? 'bad' : 'ok';
+      rd.innerHTML =
+        `<span>d = <b>${d} 步</b></span>` +
+        `<span>阈值 gH = <b>${f(thresh, 1)} 步</b></span>` +
+        `<span>最低队列 = <b class="${cls}">${minQ} 步</b></span>` +
+        `<span>状态 = <b class="${cls}">${stalls.length ? '耗空停顿 ' + f(stallPct, 1) + '%' : '队列不断档'}</b></span>` +
+        `<span>平均重叠 = <b>${f(avgOverlap, 1)} 步</b></span>` +
+        `<span>推理频率 ≈ <b>${f(reqHz, 1)} Hz</b></span>`;
+    });
+
+    [slG, slD, slH].forEach((el) => el.addEventListener('input', redraw));
+    V4U.seg($('sg-sm-agg'), (v) => { aggMode = v; redraw(); });
+  }
+
+  /* ==================== 4. #inpainting soft mask & chunk alignment ==================== */
+  {
+    const slH = $('sl-mk-h'), slS = $('sl-mk-s'), slD = $('sl-mk-d');
+    const oH = $('o-mk-h'), oS = $('o-mk-s'), oD = $('o-mk-d'), rd = $('rd-mask');
+    let sched = 'exp';
+
+    function clampParams() {
+      const H = +slH.value;
+      const dMax = floor(H / 2);
+      slD.max = dMax;
+      let d = min(+slD.value, dMax);
+      slD.value = d;
+      slS.min = d;
+      slS.max = H - d;
+      let s = V4U.clamp(+slS.value, d, H - d);
+      slS.value = s;
+      return { H, s, d };
+    }
+
+    const redraw = V4U.canvas($('cv-mask'), (w) => (w < 460 ? 310 : 295), (ctx, w, h) => {
+      const { H, s, d } = clampParams();
+      oH.textContent = H; oS.textContent = s; oD.textContent = d;
+
+      const W = softMask(H, s, d, sched);
+      const Wexp = softMask(H, s, d, 'exp');
+      const transLen = H - s - d;
+
+      const padL = w < 460 ? 34 : 44, padR = 16, padT = 24;
+      // Show s past executed steps on left (capped visually when H is huge so new chunk stays legible)
+      const sVis = min(s, max(3, floor(H * 0.25)));
+      const totCols = sVis + H;
+      const pw = w - padL - padR;
+      const colW = pw / totCols;
+      const xCol = (idx) => padL + (sVis + idx) * colW; // idx in [-sVis .. H-1]
+
+      // Top bar chart: W_i for i = 0..H-1
+      const barTop = padT, barH = h * 0.42, barBot = barTop + barH;
+      ctx.strokeStyle = C('--line'); ctx.lineWidth = 1;
+      for (const v of [0, 0.5, 1]) {
+        const y = barBot - v * barH;
+        ctx.beginPath(); ctx.moveTo(xCol(0), y); ctx.lineTo(xCol(H), y); ctx.stroke();
+        ctx.fillStyle = C('--muted'); ctx.font = mono(10); ctx.textAlign = 'right';
+        ctx.fillText(f(v, 1), xCol(0) - 5, y + 3.5);
+      }
+
+      // Draw bars
+      for (let i = 0; i < H; i++) {
+        const x = xCol(i), bw = max(1.5, colW - (H > 32 ? 1 : 2.5));
+        const bh = W[i] * barH;
+        if (i < d) {
+          ctx.fillStyle = C('--c1');
+          ctx.fillRect(x + 0.5, barBot - bh, bw, bh);
+        } else if (i < H - s) {
+          ctx.fillStyle = C('--c2');
+          ctx.fillRect(x + 0.5, barBot - bh, bw, max(1.5, bh));
+        } else {
+          ctx.fillStyle = C('--surface-2');
+          ctx.fillRect(x + 0.5, barBot - 3, bw, 3);
+        }
+      }
+
+      // Reference exp curve when comparing lin/hard
+      if (sched !== 'exp') {
+        dashed(ctx, () => {
+          ctx.strokeStyle = C('--ink-2'); ctx.lineWidth = 1.4;
+          ctx.beginPath();
+          for (let i = 0; i < H; i++) {
+            const cx = xCol(i) + colW / 2, cy = barBot - Wexp[i] * barH;
+            i === 0 ? ctx.moveTo(cx, cy) : ctx.lineTo(cx, cy);
+          }
+          ctx.stroke();
+        }, [4, 3]);
+      }
+
+      // Vertical boundary lines at i=0, i=d, i=H-s
+      const drawMark = (idx, label, col, yOff = 0) => {
+        const x = xCol(idx);
+        dashed(ctx, () => {
+          ctx.strokeStyle = col; ctx.lineWidth = 1.3;
+          ctx.beginPath(); ctx.moveTo(x, barTop - 2); ctx.lineTo(x, h - 22); ctx.stroke();
+        }, [4, 3]);
+        ctx.fillStyle = col; ctx.font = mono(10); ctx.textAlign = 'center';
+        ctx.fillText(label, x, barTop - 6 - yOff);
+      };
+      drawMark(0, w < 460 ? '起点' : '推理开始', C('--ink'), 0);
+      if (d > 0) {
+        const close0 = (xCol(d) - xCol(0)) < 36;
+        drawMark(d, 'i=d', C('--c1'), close0 ? 11 : 0);
+      }
+      if (H - s > d) drawMark(H - s, 'i=H−s', C('--c2'), 0);
+
+      // Bottom alignment rows: Old chunk A_prev (row 1) & New chunk A_new (row 2)
+      const row1Y = barBot + 28, rowH = 26, row2Y = row1Y + rowH + 14;
+      ctx.fillStyle = C('--muted'); ctx.font = mono(10.5); ctx.textAlign = 'right';
+      ctx.fillText('旧块', padL - 5, row1Y + rowH / 2 + 4);
+      ctx.fillText('新块', padL - 5, row2Y + rowH / 2 + 4);
+
+      // Old chunk executed prefix (-sVis .. -1)
+      for (let i = -sVis; i < 0; i++) {
+        const x = xCol(i);
+        ctx.fillStyle = C('--surface-2'); ctx.fillRect(x + 0.5, row1Y, max(1, colW - 1), rowH);
+        ctx.strokeStyle = C('--line-2'); ctx.lineWidth = 1; ctx.strokeRect(x + 0.5, row1Y + 0.5, max(0, colW - 1), rowH - 1);
+      }
+      // Old chunk remaining (0 .. H-s-1)
+      for (let i = 0; i < H - s; i++) {
+        const x = xCol(i), frozen = i < d;
+        ctx.fillStyle = frozen ? C('--c1s') : C('--c2s');
+        ctx.fillRect(x + 0.5, row1Y, max(1, colW - 1), rowH);
+        ctx.strokeStyle = frozen ? C('--c1') : C('--c2');
+        ctx.lineWidth = 1; ctx.strokeRect(x + 0.5, row1Y + 0.5, max(0, colW - 1), rowH - 1);
+      }
+      // New chunk (0 .. H-1)
+      for (let i = 0; i < H; i++) {
+        const x = xCol(i);
+        const fill = i < d ? C('--c1s') : (i < H - s ? C('--c2s') : C('--surface-2'));
+        const st = i < d ? C('--c1') : (i < H - s ? C('--c2') : C('--line-2'));
+        ctx.fillStyle = fill; ctx.fillRect(x + 0.5, row2Y, max(1, colW - 1), rowH);
+        ctx.strokeStyle = st; ctx.lineWidth = 1; ctx.strokeRect(x + 0.5, row2Y + 0.5, max(0, colW - 1), rowH - 1);
+        if (colW > 18) {
+          ctx.fillStyle = C('--ink-2'); ctx.font = mono(9.5); ctx.textAlign = 'center';
+          ctx.fillText(i, x + colW / 2, row2Y + rowH / 2 + 3.5);
+        }
+      }
+
+      // Next inference start marker at i = s
+      if (s > 0 && s < H) {
+        const xs = xCol(s);
+        ctx.strokeStyle = C('--c3'); ctx.lineWidth = 1.6;
+        ctx.beginPath(); ctx.moveTo(xs, row2Y + rowH + 2); ctx.lineTo(xs, row2Y + rowH + 14); ctx.stroke();
+        ctx.fillStyle = C('--c3'); ctx.font = mono(10); ctx.textAlign = 'center';
+        ctx.fillText('下次推理 i=s', xs, row2Y + rowH + 25);
+      }
+
+      // Region text on bars if wide enough
+      const putSpan = (i0, i1, txt, shortTxt, col, y) => {
+        const px = (i1 - i0) * colW;
+        if (px < 26) return;
+        const label = px >= 58 ? txt : shortTxt;
+        if (!label) return;
+        ctx.fillStyle = col; ctx.font = body(10.5); ctx.textAlign = 'center';
+        ctx.fillText(label, xCol(i0) + px / 2, y);
+      };
+      putSpan(-sVis, 0, '已执行 s=' + s, 's=' + s, C('--muted'), row1Y - 6);
+      putSpan(0, d, '冻结 ' + d, '冻' + d, C('--c1'), row1Y - 6);
+      putSpan(d, H - s, '过渡 ' + transLen, '过' + transLen, C('--c2'), row1Y - 6);
+      putSpan(H - s, H, '自由 ' + s, '自由', C('--muted'), row2Y - 4);
+
+      const sumW = W.reduce((a, b) => a + b, 0);
+      rd.innerHTML =
+        `<span>冻结区 d = <b>${d}</b></span>` +
+        `<span>过渡区 H−s−d = <b>${transLen}</b></span>` +
+        `<span>自由区 s = <b>${s}</b></span>` +
+        `<span>可行范围 s ∈ <b>[${d}, ${H - d}]</b></span>` +
+        `<span>权重和 ΣW<sub>i</sub> = <b>${f(sumW, 2)}</b></span>`;
+    });
+
+    [slH, slS, slD].forEach((el) => el.addEventListener('input', redraw));
+    V4U.seg($('sg-mk-sch'), (v) => { sched = v; redraw(); });
+    $('bt-mk-p1').addEventListener('click', () => { slH.value = 16; slD.value = 4; slS.value = 5; redraw(); });
+    $('bt-mk-p2').addEventListener('click', () => { slH.value = 50; slD.value = 6; slS.value = 25; redraw(); });
+  }
+
+  /* ==================== 5. #guidance toy bimodal flow + VJP ==================== */
+  {
+    const H = 12, S = 4, NSTEP = 10, SIG0 = 0.08;
+    const muP = Array.from({ length: H }, (_, i) => 0.15 + 0.95 * sin(PI * pow(i / (H - 1), 0.85)));
+    const muM = Array.from({ length: H }, (_, i) => 0.15 - 0.95 * sin(PI * pow(i / (H - 1), 0.85)));
+    const Aprev = muP.map((v, i) => v + 0.04 * sin(i * 0.7));
+
+    // Pre-curated noise seeds that naturally drift to lower mode without guidance
+    const SEEDS = [
+      [-0.20, -0.50, -0.80, -0.90, -0.70, -0.60, -0.50, -0.40, -0.30, -0.20, -0.10, 0.10],
+      [-0.35, -0.45, -0.65, -1.05, -0.85, -0.70, -0.45, -0.35, -0.50, -0.25, -0.15, 0.05],
+      [0.05, -0.30, -0.75, -0.80, -0.95, -0.80, -0.65, -0.55, -0.35, -0.20, -0.05, -0.10],
+      [-0.10, -0.60, -0.65, -0.70, -0.60, -0.85, -0.75, -0.60, -0.40, -0.30, -0.20, 0.00],
+    ];
+    let seedIdx = 0, guidedOn = true, anim = null;
+    const slB = $('sl-gd-b'), slD = $('sl-gd-d'), slK = $('sl-gd-k');
+    const oB = $('o-gd-b'), oD = $('o-gd-d'), oK = $('o-gd-k'), rd = $('rd-gd');
+    const btPlay = $('bt-gd-play');
+
+    function evalFlow(A, tau) {
+      const sig2 = tau * tau * SIG0 * SIG0 + (1 - tau) * (1 - tau);
+      let dP = 0, dM = 0;
+      for (let i = 0; i < H; i++) {
+        const eP = A[i] - tau * muP[i], eM = A[i] - tau * muM[i];
+        dP += eP * eP; dM += eM * eM;
+      }
+      const m = min(dP, dM);
+      const uP = exp(-(dP - m) / (2 * sig2)), uM = exp(-(dM - m) / (2 * sig2));
+      const wP = uP / (uP + uM), wM = 1 - wP;
+      const alpha = (tau * SIG0 * SIG0) / sig2;
+      const mP = new Array(H), mM = new Array(H), A1 = new Array(H), v = new Array(H);
+      for (let i = 0; i < H; i++) {
+        mP[i] = muP[i] + alpha * (A[i] - tau * muP[i]);
+        mM[i] = muM[i] + alpha * (A[i] - tau * muM[i]);
+        A1[i] = wP * mP[i] + wM * mM[i];
+        const vP = ((1 - tau) * muP[i] + (tau * SIG0 * SIG0 - 1 + tau) * A[i]) / sig2;
+        const vM = ((1 - tau) * muM[i] + (tau * SIG0 * SIG0 - 1 + tau) * A[i]) / sig2;
+        v[i] = wP * vP + wM * vM;
+      }
+      return { v, A1, wP, wM, alpha, sig2, mP, mM };
+    }
+
+    function vjpGrad(st, tau, e) {
+      const { wP, wM, alpha, sig2, mP, mM } = st;
+      let dotDiff = 0;
+      for (let i = 0; i < H; i++) dotDiff += e[i] * (mP[i] - mM[i]);
+      const coef = (tau / sig2) * wP * wM * dotDiff;
+      const g = new Array(H);
+      for (let i = 0; i < H; i++) g[i] = alpha * e[i] + coef * (muP[i] - muM[i]);
+      return g;
+    }
+
+    function rawLambda(tau) {
+      if (tau <= 1e-4 || tau >= 1 - 1e-4) return Infinity;
+      const r2 = ((1 - tau) * (1 - tau)) / (tau * tau + (1 - tau) * (1 - tau));
+      return (1 - tau) / (tau * r2);
+    }
+
+    function runRollout(A0, d, beta, guided) {
+      const W = softMask(H, S, d, 'exp');
+      let A = A0.slice();
+      const hist = [];
+      for (let k = 0; k < NSTEP; k++) {
+        const tau = k / NSTEP;
+        const st = evalFlow(A, tau);
+        const lam = guided ? min(beta, rawLambda(tau)) : 0;
+        const e = Aprev.map((p, i) => W[i] * (p - st.A1[i]));
+        const g = guided ? vjpGrad(st, tau, e) : new Array(H).fill(0);
+        hist.push({ k, tau, A: A.slice(), A1: st.A1.slice(), lam, wP: st.wP });
+        A = A.map((val, i) => val + (st.v[i] + lam * g[i]) / NSTEP);
+      }
+      const endSt = evalFlow(A, 0.999);
+      hist.push({ k: NSTEP, tau: 1, A: A.slice(), A1: A.slice(), lam: 0, wP: endSt.wP });
+      return hist;
+    }
+
+    let curHist = null, refUnguided = null;
+    function computeState() {
+      const d = +slD.value, beta = +slB.value, A0 = SEEDS[seedIdx];
+      curHist = runRollout(A0, d, beta, guidedOn);
+      refUnguided = runRollout(A0, d, beta, false);
+    }
+
+    const drawTr = V4U.canvas($('cv-gd-tr'), (w) => max(250, min(300, w * 0.65)), (ctx, w, h) => {
+      if (!curHist) computeState();
+      const d = +slD.value, beta = +slB.value, k = +slK.value;
+      oB.textContent = f(beta, 2); oD.textContent = d; oK.textContent = k + ' / ' + NSTEP;
+
+      const padL = 36, padR = 14, padT = 18, padB = 26;
+      const pw = w - padL - padR, ph = h - padT - padB;
+      const yMin = -1.25, yMax = 1.50;
+      const X = (i) => padL + (i / (H - 1)) * pw;
+      const Y = (v) => padT + ph - ((v - yMin) / (yMax - yMin)) * ph;
+
+      // Frozen / transition shaded regions
+      ctx.fillStyle = C('--c1s'); ctx.globalAlpha = 0.55;
+      ctx.fillRect(X(0), padT, X(max(0, d - 1)) - X(0) + (pw / (H - 1)) * 0.5, ph);
+      ctx.globalAlpha = 1;
+
+      // Horizontal grid
+      ctx.strokeStyle = C('--line'); ctx.lineWidth = 1;
+      for (const yv of [-1, 0, 1]) {
+        const y = Y(yv);
+        ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(w - padR, y); ctx.stroke();
+        ctx.fillStyle = C('--muted'); ctx.font = mono(10); ctx.textAlign = 'right';
+        ctx.fillText(f(yv, 0), padL - 5, y + 3.5);
+      }
+
+      // Draw two mode corridors
+      const drawBand = (mu) => {
+        ctx.fillStyle = C('--surface-2');
+        ctx.beginPath();
+        for (let i = 0; i < H; i++) i ? ctx.lineTo(X(i), Y(mu[i] + 0.14)) : ctx.moveTo(X(i), Y(mu[i] + 0.14));
+        for (let i = H - 1; i >= 0; i--) ctx.lineTo(X(i), Y(mu[i] - 0.14));
+        ctx.closePath(); ctx.fill();
+      };
+      drawBand(muP); drawBand(muM);
+
+      // Vertical seam boundary at i = d - 0.5
+      const xSeam = (X(d - 1) + X(d)) / 2;
+      dashed(ctx, () => {
+        ctx.strokeStyle = C('--c1'); ctx.lineWidth = 1.3;
+        ctx.beginPath(); ctx.moveTo(xSeam, padT); ctx.lineTo(xSeam, padT + ph); ctx.stroke();
+      }, [4, 3]);
+      ctx.fillStyle = C('--c1'); ctx.font = mono(10); ctx.textAlign = 'center';
+      ctx.fillText('接缝 d=' + d, xSeam, padT + 11);
+
+      // Historical Â¹ curves up to k
+      for (let j = 0; j < k; j++) {
+        const a1 = curHist[j].A1;
+        ctx.strokeStyle = C('--c2'); ctx.globalAlpha = 0.14 + 0.25 * (j / NSTEP); ctx.lineWidth = 1.4;
+        ctx.beginPath();
+        for (let i = 0; i < H; i++) i ? ctx.lineTo(X(i), Y(a1[i])) : ctx.moveTo(X(i), Y(a1[i]));
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+
+      // Old chunk A_prev (frozen solid, transition dashed)
+      ctx.strokeStyle = C('--c1'); ctx.lineWidth = 2.6;
+      ctx.beginPath();
+      for (let i = 0; i < d; i++) i ? ctx.lineTo(X(i), Y(Aprev[i])) : ctx.moveTo(X(i), Y(Aprev[i]));
+      ctx.stroke();
+      dashed(ctx, () => {
+        ctx.strokeStyle = C('--c1'); ctx.lineWidth = 2;
+        ctx.beginPath();
+        for (let i = max(0, d - 1); i < H - S; i++) i === max(0, d - 1) ? ctx.moveTo(X(i), Y(Aprev[i])) : ctx.lineTo(X(i), Y(Aprev[i]));
+        ctx.stroke();
+      }, [5, 3]);
+      for (let i = 0; i < d; i++) {
+        ctx.fillStyle = C('--c1'); ctx.beginPath(); ctx.arc(X(i), Y(Aprev[i]), 3.5, 0, 2 * PI); ctx.fill();
+      }
+
+      const cur = curHist[k];
+      // Current noisy A^tau (purple) if k < NSTEP
+      if (k < NSTEP) {
+        dashed(ctx, () => {
+          ctx.strokeStyle = C('--c4'); ctx.lineWidth = 1.8;
+          ctx.beginPath();
+          for (let i = 0; i < H; i++) i ? ctx.lineTo(X(i), Y(cur.A[i])) : ctx.moveTo(X(i), Y(cur.A[i]));
+          ctx.stroke();
+        }, [3, 3]);
+      }
+
+      // Current Â¹ (or final A¹ at k=NSTEP)
+      const col = k === NSTEP ? C('--c3') : C('--c2');
+      ctx.strokeStyle = col; ctx.lineWidth = 2.8;
+      ctx.beginPath();
+      for (let i = 0; i < H; i++) i ? ctx.lineTo(X(i), Y(cur.A1[i])) : ctx.moveTo(X(i), Y(cur.A1[i]));
+      ctx.stroke();
+      for (let i = 0; i < H; i++) {
+        ctx.fillStyle = col; ctx.beginPath(); ctx.arc(X(i), Y(cur.A1[i]), 3.2, 0, 2 * PI); ctx.fill();
+      }
+
+      // Seam jump connector between Aprev[d-1] and cur.A1[d]
+      const seamVal = abs(cur.A1[d] - Aprev[d - 1]);
+      if (seamVal > 0.25) {
+        ctx.strokeStyle = C('--bad'); ctx.lineWidth = 2.4;
+        ctx.beginPath(); ctx.moveTo(X(d - 1), Y(Aprev[d - 1])); ctx.lineTo(X(d), Y(cur.A1[d])); ctx.stroke();
+      }
+
+      // X-axis step indices
+      ctx.fillStyle = C('--muted'); ctx.font = mono(10); ctx.textAlign = 'center';
+      for (let i = 0; i < H; i += 2) ctx.fillText(i, X(i), h - 8);
+    });
+
+    const drawLam = V4U.canvas($('cv-gd-lam'), (w) => max(250, min(300, w * 0.65)), (ctx, w, h) => {
+      if (!curHist) computeState();
+      const d = +slD.value, beta = +slB.value, k = +slK.value;
+      const padL = 36, padR = 14, padT = 18, padB = 26;
+      const pw = w - padL - padR, ph = h - padT - padB;
+      const yMax = 14;
+      const X = (tau) => padL + tau * pw;
+      const Y = (v) => padT + ph - (min(yMax, v) / yMax) * ph;
+
+      // Grid
+      ctx.strokeStyle = C('--line'); ctx.lineWidth = 1;
+      for (const v of [0, 2, 5, 10]) {
+        const y = Y(v);
+        ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(w - padR, y); ctx.stroke();
+        ctx.fillStyle = C('--muted'); ctx.font = mono(10); ctx.textAlign = 'right';
+        ctx.fillText(v, padL - 5, y + 3.5);
+      }
+
+      // Unclipped curve (dashed muted)
+      dashed(ctx, () => {
+        ctx.strokeStyle = C('--muted'); ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        let started = false;
+        for (let i = 1; i <= 199; i++) {
+          const tau = i / 200, v = rawLambda(tau);
+          if (v > yMax * 1.1) { started = false; continue; }
+          if (!started) { ctx.moveTo(X(tau), Y(v)); started = true; }
+          else ctx.lineTo(X(tau), Y(v));
+        }
+        ctx.stroke();
+      }, [4, 3]);
+
+      // Cap horizontal line beta
+      dashed(ctx, () => {
+        ctx.strokeStyle = C('--c2'); ctx.lineWidth = 1.4;
+        ctx.beginPath(); ctx.moveTo(padL, Y(beta)); ctx.lineTo(w - padR, Y(beta)); ctx.stroke();
+      }, [5, 4]);
+      ctx.fillStyle = C('--c2'); ctx.font = mono(10); ctx.textAlign = 'right';
+      ctx.fillText('β=' + f(beta, 1), w - padR - 2, max(padT + 10, Y(beta) - 4));
+
+      // Clipped lambda_tau curve
+      ctx.strokeStyle = guidedOn ? C('--c1') : C('--line-2'); ctx.lineWidth = 2.6;
+      ctx.beginPath();
+      for (let i = 0; i <= 200; i++) {
+        const tau = i / 200;
+        const v = guidedOn ? min(beta, rawLambda(tau)) : 0;
+        i === 0 ? ctx.moveTo(X(tau), Y(v)) : ctx.lineTo(X(tau), Y(v));
+      }
+      ctx.stroke();
+
+      // Step dots
+      for (let j = 0; j < NSTEP; j++) {
+        const st = curHist[j];
+        ctx.fillStyle = j === k ? C('--c2') : (guidedOn ? C('--c1') : C('--muted'));
+        ctx.beginPath(); ctx.arc(X(st.tau), Y(st.lam), j === k ? 5.5 : 3, 0, 2 * PI); ctx.fill();
+      }
+
+      // X ticks
+      ctx.fillStyle = C('--muted'); ctx.font = mono(10); ctx.textAlign = 'center';
+      for (const tau of [0, 0.2, 0.5, 0.8, 1]) ctx.fillText('τ=' + f(tau, 1), X(tau), h - 8);
+
+      const cur = curHist[k], fin = curHist[NSTEP], refFin = refUnguided[NSTEP];
+      const seam = abs(fin.A1[d] - Aprev[d - 1]);
+      const refSeam = abs(refFin.A1[d] - Aprev[d - 1]);
+      const prefRmse = sqrt(Aprev.slice(0, d).reduce((acc, p, i) => acc + (p - fin.A1[i]) ** 2, 0) / d);
+      const cls = seam < 0.25 ? 'ok' : 'bad';
+      rd.innerHTML =
+        `<span>当前 τ = <b>${f(cur.tau, 2)}</b></span>` +
+        `<span>λ<sub>τ</sub> = <b>${f(cur.lam, 2)}</b></span>` +
+        `<span>冻结前缀 RMSE = <b class="${prefRmse < 0.15 ? 'ok' : 'bad'}">${f(prefRmse, 3)}</b></span>` +
+        `<span>接缝跳变 = <b class="${cls}">${f(seam, 3)}</b></span>` +
+        `<span>无引导对照 = <b>${f(refSeam, 3)}</b></span>`;
+    });
+
+    const redrawAll = () => { computeState(); drawTr(); drawLam(); };
+    V4U.seg($('sg-gd-on'), (v) => { guidedOn = v === 'on'; redrawAll(); });
+    [slB, slD, slK].forEach((el) => el.addEventListener('input', redrawAll));
+    $('bt-gd-seed').addEventListener('click', () => { seedIdx = (seedIdx + 1) % SEEDS.length; redrawAll(); });
+    btPlay.addEventListener('click', () => {
+      if (anim) { anim.stop(); anim = null; btPlay.textContent = '逐步播放'; return; }
+      btPlay.textContent = '暂停';
+      let acc = 0;
+      slK.value = 0; redrawAll();
+      anim = V4U.loop(btPlay, (t, dt) => {
+        acc += dt;
+        if (acc >= 0.35) {
+          acc = 0;
+          const next = (+slK.value + 1) % (NSTEP + 1);
+          slK.value = next; redrawAll();
+        }
+      });
+    });
+  }
+
+  /* ==================== 6. #training token row & postfix loss ==================== */
+  {
+    const slD = $('sl-tr-d'), slT = $('sl-tr-t');
+    const oD = $('o-tr-d'), oT = $('o-tr-t'), rd = $('rd-tr');
+    let H = 16, dist = 'unif', noiseSeed = 17;
+
+    function makeSignal(H, seed) {
+      const r = rngOf(seed), g = gaussOf(r);
+      const gt = Array.from({ length: H }, (_, i) => 0.72 * sin(2 * PI * i / (H * 1.15) + 0.3));
+      const eps = Array.from({ length: H }, () => g() * 0.75);
+      return { gt, eps };
+    }
+
+    const redraw = V4U.canvas($('cv-tr'), (w) => (w < 460 ? 295 : 275), (ctx, w, h) => {
+      slD.max = H - 1;
+      const d = min(H - 1, +slD.value); slD.value = d;
+      const tau = +slT.value;
+      oD.textContent = d; oT.textContent = f(tau, 2);
+
+      const { gt, eps } = makeSignal(H, noiseSeed);
+      const padL = 34, padR = 14, padT = 16, padB = 24;
+      const pw = w - padL - padR;
+      const cellW = pw / H;
+      const xC = (i) => padL + i * cellW;
+
+      // Top section: token boxes
+      const tokY = padT + 14, tokH = 56;
+      for (let i = 0; i < H; i++) {
+        const isPref = i < d;
+        const ti = isPref ? 1 : tau;
+        const x = xC(i), cw = max(2, cellW - (H > 18 ? 2 : 3.5));
+
+        ctx.fillStyle = isPref ? C('--c1s') : C('--c2s');
+        ctx.fillRect(x, tokY, cw, tokH);
+        ctx.strokeStyle = isPref ? C('--c1') : C('--c2');
+        ctx.lineWidth = 1.4;
+        ctx.strokeRect(x + 0.5, tokY + 0.5, max(0, cw - 1), tokH - 1);
+
+        // Inside mini signal bar showing tau_i clean fraction
+        const barH = 7, barY = tokY + tokH - barH - 4;
+        ctx.fillStyle = C('--surface');
+        ctx.fillRect(x + 3, barY, max(0, cw - 6), barH);
+        ctx.fillStyle = isPref ? C('--c1') : C('--c2');
+        ctx.fillRect(x + 3, barY, max(0, (cw - 6) * ti), barH);
+
+        if (cw >= 16) {
+          ctx.fillStyle = C('--ink'); ctx.font = mono(cw >= 28 ? 11 : 9.5); ctx.textAlign = 'center';
+          ctx.fillText(i, x + cw / 2, tokY + 15);
+        }
+        if (cw >= 28) {
+          ctx.fillStyle = isPref ? C('--c1') : C('--c2'); ctx.font = mono(9.5); ctx.textAlign = 'center';
+          ctx.fillText(isPref ? '1.0' : f(tau, 2), x + cw / 2, tokY + 31);
+        }
+      }
+
+      // Span headers above tokens
+      const putTop = (i0, i1, fullTxt, shortTxt, col) => {
+        if (i1 <= i0) return;
+        const spanW = (i1 - i0) * cellW;
+        if (spanW < 34) return;
+        ctx.font = body(10.5);
+        const txt = ctx.measureText(fullTxt).width + 8 <= spanW ? fullTxt : (ctx.measureText(shortTxt).width + 4 <= spanW ? shortTxt : '');
+        if (!txt) return;
+        ctx.fillStyle = col; ctx.textAlign = 'center';
+        ctx.fillText(txt, xC(i0) + spanW / 2, tokY - 6);
+      };
+      putTop(0, d, '干净前缀 τ=1（无 loss）', '前缀 τ=1', C('--c1'));
+      putTop(d, H, '加噪后缀 τ=' + f(tau, 2) + '（计入 MSE loss）', '后缀 τ=' + f(tau, 2) + '（算 loss）', C('--c2'));
+
+      // Divider at i = d
+      if (d > 0) {
+        const xd = xC(d) - 1;
+        dashed(ctx, () => {
+          ctx.strokeStyle = C('--ink-2'); ctx.lineWidth = 1.4;
+          ctx.beginPath(); ctx.moveTo(xd, tokY - 12); ctx.lineTo(xd, h - padB); ctx.stroke();
+        }, [4, 3]);
+      }
+
+      // Bottom section: trajectory A^1 (gt) vs input A^{tau_i}
+      const pTop = tokY + tokH + 26, pBot = h - padB, pH = pBot - pTop;
+      const yMin = -1.65, yMax = 1.65;
+      const Y = (v) => pBot - ((V4U.clamp(v, yMin, yMax) - yMin) / (yMax - yMin)) * pH;
+      const xMid = (i) => xC(i) + (cellW - (H > 18 ? 2 : 3.5)) / 2;
+
+      ctx.strokeStyle = C('--line'); ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(padL, Y(0)); ctx.lineTo(w - padR, Y(0)); ctx.stroke();
+
+      // Ground truth curve A^1
+      dashed(ctx, () => {
+        ctx.strokeStyle = C('--muted'); ctx.lineWidth = 1.8;
+        ctx.beginPath();
+        for (let i = 0; i < H; i++) i ? ctx.lineTo(xMid(i), Y(gt[i])) : ctx.moveTo(xMid(i), Y(gt[i]));
+        ctx.stroke();
+      }, [5, 4]);
+
+      // Input A^{tau_i} and loss markers on postfix
+      const inp = gt.map((gVal, i) => (i < d ? gVal : tau * gVal + (1 - tau) * eps[i]));
+      // Prefix line (clean)
+      if (d > 0) {
+        ctx.strokeStyle = C('--c1'); ctx.lineWidth = 2.6;
+        ctx.beginPath();
+        for (let i = 0; i < d; i++) i ? ctx.lineTo(xMid(i), Y(inp[i])) : ctx.moveTo(xMid(i), Y(inp[i]));
+        ctx.stroke();
+      }
+      // Postfix line (noisy)
+      ctx.strokeStyle = C('--c2'); ctx.lineWidth = 2.4;
+      ctx.beginPath();
+      for (let i = max(0, d - 1); i < H; i++) i === max(0, d - 1) ? ctx.moveTo(xMid(i), Y(inp[i])) : ctx.lineTo(xMid(i), Y(inp[i]));
+      ctx.stroke();
+
+      // Residual bars + dots
+      for (let i = 0; i < H; i++) {
+        const xm = xMid(i);
+        if (i >= d) {
+          ctx.strokeStyle = C('--c2'); ctx.globalAlpha = 0.45; ctx.lineWidth = 1.6;
+          ctx.beginPath(); ctx.moveTo(xm, Y(gt[i])); ctx.lineTo(xm, Y(inp[i])); ctx.stroke();
+          ctx.globalAlpha = 1;
+        }
+        ctx.fillStyle = i < d ? C('--c1') : C('--c2');
+        ctx.beginPath(); ctx.arc(xm, Y(inp[i]), 3.3, 0, 2 * PI); ctx.fill();
+      }
+
+      // Y label
+      ctx.fillStyle = C('--muted'); ctx.font = mono(10); ctx.textAlign = 'right';
+      ctx.fillText('A', padL - 6, pTop + 10);
+      ctx.fillText('0', padL - 6, Y(0) + 3.5);
+      // X label
+      ctx.textAlign = 'center';
+      for (let i = 0; i < H; i += (H > 16 ? 4 : 2)) ctx.fillText(i, xMid(i), h - 7);
+
+      const post = H - d;
+      rd.innerHTML =
+        `<span>干净前缀 d = <b>${d}</b>（τ<sub>i</sub> = 1.00）</span>` +
+        `<span>参与损失 token = <b>${post} / ${H}</b>（${f((post / H) * 100, 1)}%）</span>` +
+        `<span>后缀时间 τ = <b>${f(tau, 2)}</b></span>` +
+        `<span>后缀噪声比 1−τ = <b>${f(1 - tau, 2)}</b></span>`;
+    });
+
+    V4U.seg($('sg-tr-h'), (v) => { H = +v; redraw(); });
+    V4U.seg($('sg-tr-dist'), (v) => { dist = v; });
+    [slD, slT].forEach((el) => el.addEventListener('input', redraw));
+    $('bt-tr-samp').addEventListener('click', () => {
+      noiseSeed = (noiseSeed + 13) % 997;
+      const r = rngOf(noiseSeed + 5);
+      const dMax = floor(H / 2);
+      let sampled = 0;
+      if (dist === 'unif') {
+        sampled = floor(r() * (dMax + 1));
+      } else {
+        // Exponentially decreasing weights over 0..dMax
+        const weights = Array.from({ length: dMax + 1 }, (_, k) => exp(-0.45 * k));
+        const tot = weights.reduce((a, b) => a + b, 0);
+        let u = r() * tot;
+        for (let k = 0; k <= dMax; k++) { u -= weights[k]; if (u <= 0) { sampled = k; break; } }
+      }
+      slD.value = sampled;
+      redraw();
+    });
+  }
+});
+</script>
+</body>
+</html>

@@ -14,6 +14,9 @@ Visualize for Understanding：机器人学习研究要补的预备知识，每�
 - (i) [旋转与位姿表示](https://gongshukai.github.io/Vis4Und/pages/rotations/) — 旋转矩阵、欧拉角、轴角、四元数、6D 表示和齐次变换：定义、互相换算、插值，以及网络该输出哪一种。
 - (ii) [机器人的运动空间](https://gongshukai.github.io/Vis4Und/pages/action-space/) — 关节空间与末端空间、绝对动作与增量动作、正运动学、雅可比与逆运动学；VLA 的动作到底在哪个空间里。
 - (iii) [相机模型与标定](https://gongshukai.github.io/Vis4Und/pages/camera/) — 针孔模型、内参与畸变、外参、各家坐标系约定、张正友标定、手眼标定和深度反投影。
+- (iv) [π 系列 VLA](https://gongshukai.github.io/Vis4Und/pages/pi-series/) — flow matching 动作专家、FAST 动作 token、π0.5 的异构数据与分层推理、知识隔离，以及 π*0.6 用优势条件化做 RL。
+- (v) [实时分块执行（RTC）](https://gongshukai.github.io/Vis4Und/pages/rtc/) — 推理有延迟时动作块怎么衔接：同步执行、时间集成、异步队列，推理期 RTC 的冻结前缀与软掩码引导，训练期 RTC 的前缀条件化。
+- (vi) [仿真 RL 与行为克隆](https://gongshukai.github.io/Vis4Und/pages/sim-rl/) — 仿真 RL 具体怎么做（并行环境、奖励、域随机化、教师-学生蒸馏），为什么要做，和采数据训 VLA 的行为克隆差在哪里，以及两者怎么结合。
 
 ### (2) 3D 视觉与图形学
 

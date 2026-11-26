@@ -1,0 +1,1662 @@
+<!doctype html>
+<html lang="zh-CN" data-sec="robotics">
+<head>
+<!-- v4u:head -->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="icon" href="data:,">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700&family=Inter+Tight:wght@700&family=JetBrains+Mono:wght@400;700&family=Noto+Sans+SC:wght@400;700&display=swap">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<link rel="stylesheet" href="../../assets/v4u.css?v=691854ab">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
+<script src="../../assets/v4u.js?v=d6640e00"></script>
+<!-- /v4u:head -->
+<title>仿真 RL 与行为克隆 · Vis4Und</title>
+<meta name="description" content="仿真 RL 具体怎么做（并行环境、奖励、域随机化、教师–学生蒸馏），为什么要做，和采数据训 VLA 的行为克隆差在哪里，以及两者怎么结合。">
+<style>
+.pane-t{font:700 13px/1.4 var(--f-body);color:var(--ink-2);margin:0 0 6px}
+.viz-stage+.viz-stage.full{border-top:1px solid var(--line)}
+.ts-cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,250px),1fr));gap:10px;padding:12px 16px 4px}
+.ts-box{background:var(--surface-2);border:1px solid var(--line);border-radius:8px;padding:10px 12px;font-size:13.5px;line-height:1.6}
+.ts-box h5{font:700 12.5px/1.3 var(--f-mono);margin:0 0 6px;letter-spacing:.03em;color:var(--ink)}
+.ts-box.priv{border-color:var(--c4);background:var(--c4s)}
+.ts-box.stu{border-color:var(--c1);background:var(--c1s)}
+.ts-box ul{margin:0;padding-left:1.15em;max-width:none}
+.ts-box li{margin:2px 0;color:var(--ink-2)}
+@media (max-width:760px){
+  .tbl table.wide{min-width:660px}
+  .tbl table.xwide{min-width:780px}
+}
+</style>
+</head>
+<body>
+<!-- v4u:nav -->
+<nav class="v4u-nav" aria-label="站点导航"><div class="v4u-nav-in"><span class="v4u-crumb"><a href="../../"><b>Vis4Und</b></a><span class="v4u-sep">/</span><a href="../../#robotics">(1) 机器人学</a></span><span class="v4u-links"><a href="../rotations/">(i) 旋转与位姿</a><a href="../action-space/">(ii) 运动空间</a><a href="../camera/">(iii) 相机</a><a href="../pi-series/">(iv) π 系列</a><a href="../rtc/">(v) RTC</a><a href="../sim-rl/" aria-current="page">(vi) 仿真 RL</a><button type="button" class="v4u-theme" aria-label="切换深浅色">深色</button></span></div></nav>
+<!-- /v4u:nav -->
+
+<header class="hero"><div class="wrap">
+  <p class="kicker">(1) 机器人学 · (vi)</p>
+  <h1>仿真 RL 与行为克隆</h1>
+  <p class="lede">同事说的「仿真 RL」通常是两类事：在 GPU 并行仿真里从零训底层控制器（足式行走、人形全身控制、灵巧手），或者先用示教 SFT 一个 VLA，再在仿真基准里用任务成功作奖励做 RL 微调。这一页讲清楚仿真 RL 怎么做、为什么要在仿真里做，以及它和采数据做行为克隆（BC）差在哪里、各自在哪赢、怎么结合。</p>
+  <p class="asks-h">读完能回答</p>
+  <ul class="asks">
+    <li>行为克隆为什么会有 $O(\varepsilon T^2)$ 复合误差，DAgger 和 RL 各自怎么打破它？</li>
+    <li>连续控制里的 PPO、高斯策略、PD 目标与 decimation 怎么串起来？</li>
+    <li>为什么单卡 GPU 并行仿真几分钟能训出走路策略，真机遥操作换不来同样体量的试错？</li>
+    <li>奖励设计、域随机化、教师–学生蒸馏各自解决什么问题，代价是什么？</li>
+    <li>什么任务选 BC / VLA、什么任务选仿真 RL，两类方法有哪些结合方式？</li>
+  </ul>
+</div></header>
+
+<div class="wrap layout">
+<nav class="toc" id="toc" aria-label="本页目录"></nav>
+<main>
+
+<!-- ============================================================ -->
+<section id="what">
+  <h2 data-toc="两种范式">两种范式：行为克隆 vs 仿真 RL</h2>
+  <p class="def"><b>行为克隆（BC，Behavior Cloning）</b>把专家示教数据集 $\mathcal D=\{(o_i,a_i)\}$ 当作监督学习样本，最大化策略在示教动作上的对数似然（或最小化回归 / flow matching 损失）：$\max_\theta\ \mathbb E_{(o,a)\sim\mathcal D}[\log\pi_\theta(a\mid o)]$。</p>
+  <p class="def"><b>仿真强化学习（Sim RL）</b>让策略自己在仿真环境里试错采样轨迹 $\tau=(s_0,a_0,r_0,\dots,s_T)$，根据每步奖励 $r_t$ 最大化期望折扣回报：$\max_\theta\ J(\theta)=\mathbb E_{\tau\sim\pi_\theta}\!\big[\sum_{t=0}^{T-1}\gamma^t r_t\big]$。</p>
+
+  <p>工程里说的「仿真 RL」实际分成两条技术路线，两者的前提、算力分布和难点都不同：</p>
+  <ul>
+    <li><b>路线 A · 从零训底层控制器</b>：面向足式行走、人形全身控制与动作跟踪、灵巧手在手操作。用 GPU 并行仿真跑几千个环境 + PPO + 域随机化 + 教师–学生蒸馏，再零样本或微调 sim-to-real，几乎不用人类遥操作示教。</li>
+    <li><b>路线 B · 仿真里用 RL 微调 VLA</b>：面向桌面视觉–语言操作。先用示教数据 SFT 出一个能动的 VLA，再在 LIBERO、ManiSkill、RoboTwin 等仿真基准里以任务成功作奖励做在线 RL（SimpleVLA-RL、RL4VLA、VLA-RL、$\pi_{\text{RL}}$）。</li>
+  </ul>
+
+  <div class="tbl"><table class="xwide">
+    <thead><tr><th>维度</th><th>行为克隆（BC / SFT VLA）</th><th>仿真 RL（路线 A：从零）</th><th>仿真 RL（路线 B：VLA 微调）</th></tr></thead>
+    <tbody>
+      <tr><td>数据从哪来</td><td>人遥操作、手持夹爪、动捕重定向</td><td>策略自己在并行仿真里试错产生</td><td>先用示教 SFT 冷启动，再由策略在仿真里在线采样</td></tr>
+      <tr><td>优化目标</td><td>$\max_\theta\ \mathbb E_{(o,a)\sim\mathcal D}[\log\pi_\theta(a\mid o)]$</td><td>$\max_\theta\ \mathbb E_{\tau\sim\pi_\theta}[\sum_t\gamma^t r_t]$</td><td>同左；通常只用终局 0/1 成功奖励（可配 KL / 过程奖励）</td></tr>
+      <tr><td>需要准备什么</td><td>遥操作设备、真机硬件、采集人力</td><td>机器人 URDF/MJCF、物理资产、稠密奖励、重置与域随机化</td><td>可运行且可判定成败的任务仿真环境 + 已有 SFT 检查点</td></tr>
+      <tr><td>能否超过示教</td><td>通常不能；上限被示教者的速度和成功率锁住</td><td>能；不依赖人类操作极限，可发现超人步态与恢复动作</td><td>能；可超越 SFT 示教的成功率并发现示教里没有的捷径</td></tr>
+      <tr><td>典型失败</td><td>分布外状态漂移（复合误差）、不会从失误中恢复</td><td>奖励投机（reward hacking）、sim-to-real 差距导致真机崩</td><td>稀疏奖励探索难、视觉 sim-to-real 差距、flow 策略似然难算</td></tr>
+      <tr><td>典型场景</td><td>开放世界桌面 / 家居长程操作、多任务 VLA</td><td>四足越野、人形行走与动作跟踪、灵巧手在手旋转</td><td>仿真操作基准提分、少示教冷启动、提升执行与语义 OOD 泛化</td></tr>
+    </tbody>
+  </table></div>
+
+  <table class="notation">
+    <caption>全页记号（单符号单义；MDP、PPO、GAE 基础推导见 <a href="../llm-rl-basics/#mdp">RL 基础</a>）</caption>
+    <thead><tr><th>符号</th><th>含义</th><th>形状 / 单位</th></tr></thead>
+    <tbody>
+      <tr><td>$o_t,\ s_t$</td><td>第 $t$ 步策略可见观测（本体/图像）、仿真完整状态（含特权量）</td><td>向量 / 图像</td></tr>
+      <tr><td>$a_t,\ u_t$</td><td>策略输出的连续动作、执行器施加的关节力矩</td><td>$\mathbb R^{d_a}$，N·m</td></tr>
+      <tr><td>$q_t,\ \dot q_t,\ q^*_t$</td><td>当前关节角、关节速度、PD 目标关节角；$q_{\text{def}}$ 为默认站立角</td><td>$\mathbb R^n$；rad，rad/s</td></tr>
+      <tr><td>$\alpha_a$</td><td>动作缩放系数（<code>action_scale</code>），$q^*_t=q_{\text{def}}+\alpha_a a_t$</td><td>标量</td></tr>
+      <tr><td>$\tau,\ T$</td><td>一条轨迹 $(s_0,a_0,r_0,\dots,s_T)$；单集最大步数（horizon）</td><td>序列；整数</td></tr>
+      <tr><td>$\pi_\theta,\ \pi^*$</td><td>待训参数化策略、专家策略；$\mathcal D$ 为专家示教集</td><td>分布</td></tr>
+      <tr><td>$r_t,\ \gamma,\ J(\theta)$</td><td>第 $t$ 步即时奖励、折扣因子、期望折扣回报</td><td>标量</td></tr>
+      <tr><td>$c(s,a),\ C(\pi)$</td><td>模仿误差分析中的单步代价 $\in[0,1]$ 与 $T$ 步期望总代价</td><td>标量</td></tr>
+      <tr><td>$\varepsilon,\ d_\pi$</td><td>专家分布上的单步错误率、策略 $\pi$ 诱导的平均状态分布</td><td>标量；分布</td></tr>
+      <tr><td>$\mu_\theta(o),\ \sigma$</td><td>连续高斯策略的均值与每维标准差</td><td>$\mathbb R^{d_a}$</td></tr>
+      <tr><td>$V_\phi(s),\ \hat A_t$</td><td>价值网络（critic）、GAE 优势估计</td><td>标量</td></tr>
+      <tr><td>$N_{\text{env}},\ K_{\text{step}}$</td><td>GPU 并行环境数量、每轮 PPO 更新前各环境收集的步数</td><td>整数</td></tr>
+      <tr><td>$\Delta t_{\text{sim}},\ \Delta t_{\text{ctrl}},\ D_{\text{dec}}$</td><td>物理步长、策略控制周期、decimation（$\Delta t_{\text{ctrl}}=D_{\text{dec}}\Delta t_{\text{sim}}$）</td><td>s；s；整数</td></tr>
+      <tr><td>$w_i$</td><td>第 $i$ 个奖励项的权重</td><td>标量</td></tr>
+      <tr><td>$\xi,\ p(\xi),\ \xi_{\text{real}}$</td><td>仿真物理参数（如摩擦、质量）、域随机化分布、真机物理参数</td><td>向量 / 标量</td></tr>
+      <tr><td>$z_t,\ \hat z_t,\ k$</td><td>特权环境隐变量、学生由最近 $k$ 步历史估计出的隐变量、历史窗口长</td><td>$\mathbb R^{d_z}$；整数</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ============================================================ -->
+<section id="bc-limits">
+  <h2 data-toc="BC 的四个局限">行为克隆为什么不够</h2>
+  <p>监督学习假设训练和测试同分布（i.i.d.）。机器人控制是序贯决策：当前步动作决定下一步看到什么状态，微小预测误差会改变后续状态分布。</p>
+  <ul>
+    <li><b>协变量偏移与复合误差</b>：训练只在专家状态分布 $d_{\pi^*}$ 上监督；部署时策略 $\pi$ 偶发小错，把自己带到没见过的状态，误差越来越大，总代价按步数的平方增长。</li>
+    <li><b>示教里没有「出错怎么拉回来」</b>：熟练操作员采出的轨迹几乎都是成功的，物体滑落、夹偏、机身失衡这类边缘状态在 $\mathcal D$ 里几乎为空，策略遇到扰动不知道如何恢复。</li>
+    <li><b>性能被示教上限锁死</b>：遥操作受延迟与人类反应速度限制，BC 策略通常比真机物理极限慢得多，也很难超过示教者的成功率。</li>
+    <li><b>许多任务无法遥操作</b>：四足越野的 12 关节高频协调、人形抗推平衡、多指灵巧手在手翻转物体涉及毫秒级接触切换，人类根本没法用手柄或手套给出示范。</li>
+  </ul>
+
+  <h3>复合误差的直观推导（Ross, Gordon, Bagnell, AISTATS 2011）</h3>
+  <p>设单步代价 $c(s,a)\in[0,1]$，专家完美执行 $C(\pi^*)=0$。假设学到的策略 $\pi$ 在专家访问的状态分布 $d_{\pi^*}$ 上单步犯错概率不超过 $\varepsilon$（即 $\mathbb E_{s\sim d_{\pi^*}}[\mathbb P(\pi(s)\ne\pi^*(s))]\le\varepsilon$）。记 $C(\pi)=\mathbb E_{\tau\sim\pi}[\sum_{t=0}^{T-1}c(s_t,a_t)]$：</p>
+  <ol class="derive">
+    <li><p>在前 $t$ 步都没犯错的条件下，第 $t$ 步的状态仍在专家分布 $d_{\pi^*}$ 上，因此「首次犯错恰好发生在第 $t$ 步」的概率至多为 $\varepsilon$（记 $p_t\le\varepsilon$）。</p></li>
+    <li><p>一旦在第 $t$ 步偏离专家轨迹，剩余的 $T-t$ 步都落在训练未覆盖的分布外状态；最坏情况下每步代价都是上界 $1$，贡献总代价至多 $T-t$：</p>$$C(\pi\mid\text{首次犯错在 }t)\le T-t$$</li>
+    <li><p>对首次犯错的时刻 $t=0,\dots,T-1$ 求和，得到关于步数 $T$ 的二次上界（Ross et al., 2011 定理 2.1）：</p>$$C(\pi)\le\sum_{t=0}^{T-1}\varepsilon\,(T-t)=\frac{T(T+1)}{2}\,\varepsilon\le T^2\varepsilon$$<p>更一般地，若专家总代价非零且单次出错的恢复代价上界为 $u$，则 $C(\pi)\le C(\pi^*)+O(uT^2\varepsilon)$。长程任务里 $T$ 翻倍，最坏误差翻 4 倍。</p></li>
+    <li><p><b>DAgger（Dataset Aggregation）</b>把上界降回线性：每轮让当前策略 $\pi_i$ 自己跑轨迹，在它实际访问到的状态 $s\sim d_{\pi_i}$ 上向专家查询正确动作并并入 $\mathcal D$。用无悔在线学习迭代 $N$ 轮、得到在自身分布 $d_{\hat\pi}$ 上的平均单步误差 $\varepsilon_N$ 后，每次犯错不再永久漂走，只付单步恢复代价 $u$（定理 4.1）：</p>$$C(\hat\pi)\le C(\pi^*)+u\,T\,\varepsilon_N+O(1)$$</li>
+  </ol>
+
+  <figure class="viz" id="viz-bc">
+    <div class="viz-h"><b>二维轨迹跟踪：执行噪声下 BC 漂移 vs DAgger 纠正 vs RL</b><span>20 条同扰动测试轨迹，T = 80 步</span></div>
+    <div class="viz-grid">
+      <div class="viz-stage"><p class="pane-t">二维平面轨迹（左起点 → 右目标圆）</p><canvas id="cv-bc-map" aria-label="二维平面中示教轨迹与 BC、DAgger、RL 在噪声下的执行轨迹"></canvas></div>
+      <div class="viz-stage"><p class="pane-t">平均横向偏离 vs 步数 t</p><canvas id="cv-bc-err" aria-label="三种策略的平均横向偏离随步数变化曲线"></canvas></div>
+    </div>
+    <div class="viz-ctrl">
+      <div class="seg" id="sg-bc" role="group" aria-label="显示策略">
+        <button type="button" data-v="all" aria-pressed="true">三者叠加</button>
+        <button type="button" data-v="bc">仅 BC</button>
+        <button type="button" data-v="dagger">BC + DAgger</button>
+        <button type="button" data-v="rl">RL 策略</button>
+      </div>
+      <label for="sl-bc-n">噪声 σ <input type="range" id="sl-bc-n" min="0" max="0.35" step="0.01" value="0.16"><output id="o-bc-n">0.16</output></label>
+      <label for="sl-bc-m">示教条数 M <input type="range" id="sl-bc-m" min="1" max="15" step="1" value="4"><output id="o-bc-m">4</output></label>
+      <button type="button" class="btn ghost" id="bt-bc-play">逐步播放</button>
+      <button type="button" class="btn ghost" id="bt-bc-resamp">换扰动</button>
+    </div>
+    <div class="viz-read" id="rd-bc"></div>
+    <ul class="chips">
+      <li><i style="background:var(--muted)"></i>专家示教管（M 条）</li>
+      <li><i style="background:var(--c2)"></i>BC（仅拟合示教，无偏离恢复）</li>
+      <li><i style="background:var(--c1)"></i>DAgger（加入偏离态纠正标签）</li>
+      <li><i style="background:var(--c3)"></i>RL（优化到达目标 + 纠偏回报）</li>
+    </ul>
+    <figcaption>BC 用核回归只拟合示教管内的 (状态, 切向速度) 样本：一旦执行噪声把质点推离示教管，最近邻示教点的动作仍然只沿参考曲线切线指，不会把质点拉回轨道，偏离随步数超线性放大。加入 DAgger 纠正样本或改用 RL 策略后，同样一串噪声下质点能主动纠偏回到目标圆内。把噪声降到 0 时三者都能到达目标。</figcaption>
+  </figure>
+</section>
+
+<!-- ============================================================ -->
+<section id="rl-loop">
+  <h2 data-toc="连续控制 RL 循环">RL 在连续控制里长什么样</h2>
+  <p>MDP、策略梯度、PPO 的 clip 代理目标与 GAE 已在 <a href="../llm-rl-basics/#ppo">LLM RL 基础 · PPO</a> 与 <a href="../llm-rl-basics/#gae">GAE</a> 推导过。机器人连续控制和 LLM 的主要区别有三处：动作是连续向量、策略输出要经过底层控制器、单步奖励通常是稠密的且 $\gamma&lt;1$。</p>
+
+  <ul>
+    <li><b>对角高斯策略</b>：动作 $a_t\in\mathbb R^{d_a}$ 从各维独立高斯采样，$a_t\sim\mathcal N(\mu_\theta(o_t),\operatorname{diag}(\sigma^2))$。网络输出均值 $\mu_\theta(o_t)$，标准差 $\sigma$ 常取与状态无关的可学习向量（训练时提供探索噪声，部署时取均值 $\mu_\theta(o_t)$）。对数概率闭式可算，可直接代入 PPO 的重要性比值 $\rho_t=\exp(\log\pi_\theta-\log\pi_{\theta_{\text{old}}})$：</li>
+  </ul>
+  <div class="eq">$$\log\pi_\theta(a\mid o)=-\frac{1}{2}\sum_{j=1}^{d_a}\left(\frac{(a_j-\mu_{\theta,j}(o))^2}{\sigma_j^2}+2\log\sigma_j+\log 2\pi\right)$$</div>
+
+  <ul>
+    <li><b>PD 目标与 <code>action_scale</code></b>：底层控制很少直接输出裸力矩 $u_t$，而是输出相对默认站立姿态 $q_{\text{def}}$ 的偏移，经缩放系数 $\alpha_a$（<code>legged_gym</code> 默认 0.5）转成目标关节角，再交给底层 PD 控制器算力矩（详见 <a href="../action-space/#exec">运动空间 · 动作怎么执行</a>）：</li>
+  </ul>
+  <div class="eq">$$q^*_t=q_{\text{def}}+\alpha_a\,a_t,\qquad u_t=K_p\,(q^*_t-q_t)-K_d\,\dot q_t$$</div>
+
+  <ul>
+    <li><b>控制频率与 decimation</b>：刚体接触需要高频积分防止穿模（典型 $\Delta t_{\text{sim}}=0.005\text{ s}$，200 Hz），但策略网络不必每步都跑。设 <code>decimation</code> $D_{\text{dec}}=4$，策略每 4 个物理步推理一次（$\Delta t_{\text{ctrl}}=0.02\text{ s}$，50 Hz），期间目标 $q^*_t$ 保持，PD 在每个 200 Hz 物理子步里按最新 $q_t,\dot q_t$ 重算力矩 $u_t$。</li>
+    <li><b>价值网络与 GAE</b>：连续控制常取 $\gamma=0.99,\ \lambda=0.95$。每轮由 $N_{\text{env}}$ 个并行环境各走 $K_{\text{step}}$ 步（例如 <code>legged_gym</code> 的 $4096\times 24=98{,}304$ 步），用 $V_\phi(s_t)$ 和 GAE 算出 $\hat A_t$ 与目标回报 $\hat R_t=\hat A_t+V_\phi(s_t)$，再拆成多个 mini-batch 做若干 epoch 的 PPO 更新。</li>
+  </ul>
+
+  <pre><code># 连续控制 PPO 单轮训练循环（PyTorch / Isaac 风格伪代码）
+for iteration in range(num_iterations):
+    # 1) 在 GPU 上同步推进 N_env 个环境，收集 K_step 步 rollout
+    for t in range(K_step):
+        mu, std = actor(obs)                         # obs: [N_env, d_o]
+        dist = Normal(mu, std)
+        act = dist.sample()                          # act: [N_env, d_a]
+        logp_old[t] = dist.log_prob(act).sum(-1)
+        val_old[t]  = critic(priv_state)             # 非对称 critic 可读特权状态
+        # 环境内部做 D_dec 次物理子步：q* = q_def + alpha_a * act -> PD -> 积分
+        obs, priv_state, rew[t], done[t], timeout[t] = vec_env.step(act)
+
+    # 2) 用 GAE 算优势（注意：超时截断需 bootstrap，真摔倒终止不 bootstrap）
+    adv, ret = compute_gae(rew, val_old, done, timeout, critic(priv_state), gamma=0.99, lam=0.95)
+    adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+
+    # 3) 对这批 N_env * K_step 条转移做若干 epoch 小批量 PPO 更新
+    for epoch in range(num_epochs):
+        for mb in minibatches(obs, priv_state, act, logp_old, adv, ret):
+            ratio = (Normal(*actor(mb.obs)).log_prob(mb.act).sum(-1) - mb.logp_old).exp()
+            loss_pi = -torch.min(ratio * mb.adv, ratio.clamp(1 - eps, 1 + eps) * mb.adv).mean()
+            loss_v  = ((critic(mb.priv_state) - mb.ret) ** 2).mean()
+            loss    = loss_pi + c_v * loss_v - c_ent * entropy.mean()
+            optimizer.zero_grad(); loss.backward(); optimizer.step()</code></pre>
+  <div class="note pit"><b>易错：终止 vs 超时截断</b><p>一集走到最大步数 $T$ 被强行截断（<code>timeout</code>）并不是机器人摔倒了。如果在超时步把下一状态价值 $V(s_T)$ 置零，critic 会以为「活到第 $T$ 步之后价值暴跌」，进而学出怪异的末端行为。正确做法是只在真失败终止时置零，超时步照常加 $\gamma V(s_T)$。</p></div>
+</section>
+
+<!-- ============================================================ -->
+<section id="parallel">
+  <h2 data-toc="GPU 并行仿真">为什么要在仿真里：样本量与并行吞吐</h2>
+  <p>无模型 on-policy RL（PPO）通常要吃掉 $10^7$ 到 $10^9$ 步环境交互才能从零收敛。真机跑不了这个量级，仿真提供四件真机给不了的东西：</p>
+  <ul>
+    <li><b>单卡数千环境并行</b>：物理状态与神经网络权重都在同一张 GPU 显存里，省掉 CPU–GPU 拷贝，一步矩阵推进几千台机器人。</li>
+    <li><b>免费且瞬间重置</b>：一台机器人摔倒，写回初始关节角即可在微秒内重新开始，无需人工扶起或整理桌面。</li>
+    <li><b>特权状态直接可读</b>：地形高程图、脚底接触力、精确摩擦系数、物体 6D 位姿都是仿真内存里的张量。</li>
+    <li><b>不怕摔坏硬件</b>：随机策略早期会剧烈抽搐和翻滚，在真机上几秒就会断连杆或烧电机。</li>
+  </ul>
+  <p>算一笔吞吐账：1 台 50 Hz 真机全速连续遥操作 1 小时（不计复位换场），最多采 $50\times 3600=1.8\times 10^5$ 步；而在 GPU 上同时跑 4,096 个环境，即便每个环境仅按 $1\times$ 实时步速推进，1 小时墙钟时间就能采 $4096\times 1.8\times 10^5\approx 7.37\times 10^8$ 步（相当于 4,096 小时、约 170 天真机经验）。<b>Rudin et al.（CoRL 2021，<code>legged_gym</code>，arXiv:2109.11978）</b>在单张 RTX 3090 上用 4,096 个并行环境，不到 <b>4 分钟</b>教会 ANYmal 平地行走，约 <b>20 分钟</b>学会翻越崎岖地形。</p>
+
+  <figure class="viz" id="viz-par">
+    <div class="viz-h"><b>GPU 并行环境网格与样本吞吐账</b><span>倒立摆 50 Hz 控制；摔倒自动微秒重置</span></div>
+    <div class="viz-grid">
+      <div class="viz-stage"><p class="pane-t" id="par-grid-t">并行环境实时视图（显示前 64 / 4,096 个）</p><canvas id="cv-par-grid" aria-label="多个并行倒立摆环境同时运行和自动重置的网格"></canvas></div>
+      <div class="viz-stage"><p class="pane-t">攒满 10⁸ 步（典型 PPO 训练量）所需墙钟时间（对数轴）</p><canvas id="cv-par-bar" aria-label="真机、CPU 多进程与 GPU 并行仿真收集一亿步所需时间对比"></canvas></div>
+    </div>
+    <div class="viz-ctrl">
+      <label for="sl-par-n">并行数 N<sub>env</sub> <input type="range" id="sl-par-n" min="0" max="6" step="1" value="6"><output id="o-par-n">4096</output></label>
+      <label for="sl-par-sp">单环境倍率 <input type="range" id="sl-par-sp" min="0.2" max="5" step="0.2" value="1.0"><output id="o-par-sp">1.0×</output></label>
+      <button type="button" class="btn" id="bt-par-play">运行并行仿真</button>
+      <button type="button" class="btn ghost" id="bt-par-rst">清零步数</button>
+    </div>
+    <div class="viz-read" id="rd-par"></div>
+    <ul class="chips">
+      <li><i style="background:var(--c1)"></i>正常运行中的摆</li>
+      <li><i style="background:var(--bad)"></i>刚倾倒并瞬间重置（红框闪烁）</li>
+      <li><i style="background:var(--c3)"></i>当前 GPU 并行配置</li>
+      <li><i style="background:var(--muted)"></i>真机 1 台 / CPU 16 核参照</li>
+    </ul>
+    <figcaption>拖动 N<sub>env</sub> 从 1 到 4,096：左侧网格直观展开（超过 64 个时展示前 64 个代表单元），每个单元以独立初始倾角与扰动演化，倾倒超过 35° 立即重置计数。右侧对比收集 10⁸ 步所需墙钟时间：1 台 50 Hz 真机需要约 23 天不间断运行，4,096 个 1× 并行环境只需约 8 分钟。</figcaption>
+  </figure>
+
+  <h3>主流 GPU 并行仿真平台（截至 2026-11）</h3>
+  <div class="tbl"><table class="wide">
+    <thead><tr><th>平台</th><th>年份 / 论文</th><th>物理与渲染</th><th>典型定位</th></tr></thead>
+    <tbody>
+      <tr><td>Isaac Gym</td><td class="num">2021 · arXiv:2108.10470</td><td>PhysX GPU 端到端张量接口</td><td>开创单卡数千环境 RL（<code>legged_gym</code> 基座）；已停止更新，由 Isaac Lab 接替</td></tr>
+      <tr><td>Isaac Lab</td><td class="num">2025 · arXiv:2511.04831</td><td>源于 Orbit（2301.04195）；OpenUSD + PhysX / Newton 后端</td><td>NVIDIA 统一多模态机器人学习框架，覆盖足式、人形、灵巧手与视觉操作</td></tr>
+      <tr><td>MuJoCo Playground</td><td class="num">2025 · arXiv:2502.08844</td><td>MuJoCo MJX（JAX）与 MuJoCo Warp</td><td>轻量开源、接触物理口碑好；支持单卡分钟级训练并零样本迁移真机</td></tr>
+      <tr><td>ManiSkill3</td><td class="num">2024 · arXiv:2410.00425</td><td>SAPIEN GPU 并行物理 + 异构场景渲染（30,000+ FPS）</td><td>专攻通用视觉操作基准，常用于 VLA + RL 微调评测</td></tr>
+      <tr><td>Genesis</td><td class="num">2024 · GitHub</td><td>纯 Python 统一刚体、MPM、SPH、FEM、PBD 求解器</td><td>兼顾刚体与柔体/流体多物理仿真，并内置可微物理接口</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<!-- ============================================================ -->
+<section id="recipe">
+  <h2 data-toc="任务配方与奖励">一个仿真 RL 任务要写什么</h2>
+  <p>把一个真实控制需求翻译成可训练的仿真 RL 任务，需要写清五块配置，其中<b>奖励函数的设计和调权往往占掉一半以上的研发时间</b>：</p>
+  <ol>
+    <li><b>观测（Observation）</b>：策略输入只放真机拿得到的量（角速度、重力投影、关节角与速度、上一步动作、目标速度指令）；critic 或教师可额外读取地形高程、真实摩擦和接触力。</li>
+    <li><b>动作（Action）</b>：PD 目标偏移 $q^*_t=q_{\text{def}}+\alpha_a a_t$，并限制范围防止目标突变。</li>
+    <li><b>奖励（Reward）</b>：主任务项（如跟踪期望速度）叠加一排正则项（姿态稳定、能耗、加速度、动作变化率、防磕碰、步态抬脚）。</li>
+    <li><b>终止与重置（Termination / Reset）</b>：机身或大腿触地即刻判负终止；重置时随机化初始关节角、朝向和速度指令，防止过拟合单一初始状态。</li>
+    <li><b>课程（Curriculum）</b>：困难地形（楼梯、高坡、乱石）直接开训会全员摔倒拿不到正回报。<code>legged_gym</code> 按机器人能否走出当前地形格一半距离动态升降级，让每个策略始终待在「跳一跳够得着」的难度区。</li>
+  </ol>
+
+  <h3>例：<code>legged_gym</code> 四足速度跟踪奖励项（<code>legged_robot_config.py</code>）</h3>
+  <div class="tbl"><table class="wide">
+    <thead><tr><th>奖励项</th><th>表达式示意</th><th>典型权重 $w_i$</th><th>作用</th></tr></thead>
+    <tbody>
+      <tr><td><code>tracking_lin_vel</code></td><td>$\exp(-\|v_{xy}-v^*_{xy}\|^2/\sigma_v)$</td><td class="num">+1.0</td><td>主任务：跟踪平面期望线速度</td></tr>
+      <tr><td><code>tracking_ang_vel</code></td><td>$\exp(-(\omega_z-\omega^*_z)^2/\sigma_\omega)$</td><td class="num">+0.5</td><td>主任务：跟踪期望偏航角速度</td></tr>
+      <tr><td><code>lin_vel_z</code></td><td>$v_z^2$</td><td class="num">−2.0</td><td>抑制机身上下弹跳</td></tr>
+      <tr><td><code>ang_vel_xy</code></td><td>$\|\omega_{xy}\|^2$</td><td class="num">−0.05</td><td>抑制横滚与俯仰晃动</td></tr>
+      <tr><td><code>orientation</code></td><td>$\|g_{\text{proj},xy}\|^2$</td><td class="num">0（崎岖）/ 负值（平地）</td><td>平地保持机身水平；崎岖坡面常关掉以免阻碍爬坡</td></tr>
+      <tr><td><code>torques</code></td><td>$\|u_t\|^2$</td><td class="num">−1×10⁻⁵</td><td>压低力矩，省电并保护电机</td></tr>
+      <tr><td><code>dof_acc</code></td><td>$\|\ddot q_t\|^2$</td><td class="num">−2.5×10⁻⁷</td><td>压低关节加速度尖峰</td></tr>
+      <tr><td><code>action_rate</code></td><td>$\|a_t-a_{t-1}\|^2$</td><td class="num">−0.01</td><td>相邻步动作平滑，防止高频抽搐</td></tr>
+      <tr><td><code>collision</code></td><td>非足端连杆触地计数</td><td class="num">−1.0</td><td>禁止膝盖、大腿、躯干蹭地</td></tr>
+      <tr><td><code>feet_air_time</code></td><td>$\sum_f (t_{\text{air},f}-0.5)\,\mathbb 1[\text{刚落地}]$</td><td class="num">+1.0</td><td>鼓励抬脚跨步，防止四脚蹭地小碎步</td></tr>
+    </tbody>
+  </table></div>
+  <div class="note pit"><b>易错：奖励投机（Reward Hacking）</b><p>优化器只会最大化你写下的公式，而不是你心里的意图。如果正则惩罚太大、跟踪权重太小，策略会学会「原地趴着不动」来拿零能耗；如果只给速度奖励而不加 <code>action_rate</code> 与 <code>dof_acc</code>，仿真里能跑很快，但动作每帧剧烈震荡，一上真机立刻过流报错。</p></div>
+
+  <figure class="viz" id="viz-rew">
+    <div class="viz-h"><b>奖励权重如何塑形最优行为</b><span>1 维二阶系统，精确离散 LQR 最优策略，Δt = 0.05 s</span></div>
+    <div class="viz-grid">
+      <div class="viz-stage"><p class="pane-t">位置响应 x(t) 与目标阶跃 x*(t)</p><canvas id="cv-rew-x" aria-label="系统位置随时间跟踪目标阶跃的响应曲线"></canvas></div>
+      <div class="viz-stage"><p class="pane-t">控制动作 a(t) 与三项代价构成</p><canvas id="cv-rew-u" aria-label="控制动作变化曲线及跟踪、能耗、平滑三项代价占比"></canvas></div>
+    </div>
+    <div class="viz-ctrl">
+      <div class="seg" id="sg-rew" role="group" aria-label="权重预设">
+        <button type="button" data-v="bal" aria-pressed="true">均衡</button>
+        <button type="button" data-v="fast">激进跟踪</button>
+        <button type="button" data-v="smooth">强平滑惩罚</button>
+        <button type="button" data-v="lazy">省力摸鱼</button>
+      </div>
+      <label for="sl-rw-t">跟踪 w<sub>track</sub> <input type="range" id="sl-rw-t" min="0.1" max="10" step="0.1" value="2.0"><output id="o-rw-t">2.0</output></label>
+      <label for="sl-rw-e">力矩 w<sub>effort</sub> <input type="range" id="sl-rw-e" min="0.005" max="0.8" step="0.005" value="0.03"><output id="o-rw-e">0.030</output></label>
+      <label for="sl-rw-s">平滑 w<sub>smooth</sub> <input type="range" id="sl-rw-s" min="0.005" max="4.0" step="0.05" value="0.25"><output id="o-rw-s">0.25</output></label>
+    </div>
+    <div class="viz-read" id="rd-rew"></div>
+    <ul class="chips">
+      <li><i style="background:var(--muted)"></i>目标轨迹 x*(t)</li>
+      <li><i style="background:var(--c1)"></i>实际位置 x(t) / 跟踪代价</li>
+      <li><i style="background:var(--c2)"></i>动作输出 a(t) / 力矩代价</li>
+      <li><i style="background:var(--c3)"></i>动作变化率代价 (a<sub>t</sub>−a<sub>t−1</sub>)²</li>
+    </ul>
+    <figcaption>每步奖励 $r_t=-w_{\text{track}}(x_t-x^*_t)^2-w_{\text{effort}}a_t^2-w_{\text{smooth}}(a_t-a_{t-1})^2$，对增广状态 $(x-x^*,v,a_{t-1})$ 实时解精确 Riccati 方程得到全局最优策略。调大 w<sub>smooth</sub>，动作曲线尖峰迅速消失但响应变慢；调小 w<sub>track</sub> 并调大 w<sub>effort</sub>（点「省力摸鱼」），策略干脆半途停下不追目标。</figcaption>
+  </figure>
+</section>
+
+<!-- ============================================================ -->
+<section id="toy">
+  <h2 data-toc="动手：浏览器 PPO">动手：在浏览器里真的训练一个连续策略</h2>
+  <p>下面跑的是完整的浏览器内连续控制 PPO（无外部库，纯 JS）：策略是一个 2 层 <code>6→16→2</code> tanh 高斯 MLP（配独立 <code>6→16→1</code> critic，共 277 个参数），任务是让二维点质量在执行噪声下绕过中间障碍到达右侧目标圆。每轮在 $N_{\text{env}}$ 个并行环境里采样完整轨迹，算 GAE 优势，做 4 个 epoch 的 PPO-clip + Adam 更新。</p>
+
+  <figure class="viz" id="viz-toy">
+    <div class="viz-h"><b>实时连续控制 PPO 训练，并与同扰动下的 BC 策略对照</b><span>左：12 条测试轨迹；右：回报与成功率曲线</span></div>
+    <div class="viz-grid">
+      <div class="viz-stage"><p class="pane-t">绕障碍到目标（实时策略 rollout）</p><canvas id="cv-toy-env" aria-label="二维避障环境中当前 PPO 策略与 BC 策略的轨迹对比"></canvas></div>
+      <div class="viz-stage"><p class="pane-t">训练曲线：平均回报与成功率 vs 迭代轮数</p><canvas id="cv-toy-cur" aria-label="不同并行环境数下 PPO 训练的回报和成功率曲线"></canvas></div>
+    </div>
+    <div class="viz-ctrl">
+      <button type="button" class="btn" id="bt-toy-go">从零重新训练</button>
+      <button type="button" class="btn ghost" id="bt-toy-cont">继续训 30 轮</button>
+      <div class="seg" id="sg-toy-n" role="group" aria-label="并行环境数">
+        <button type="button" data-v="4">N = 4</button>
+        <button type="button" data-v="16">N = 16</button>
+        <button type="button" data-v="64" aria-pressed="true">N = 64</button>
+      </div>
+      <label for="sl-toy-ns">扰动 σ <input type="range" id="sl-toy-ns" min="0" max="0.30" step="0.02" value="0.16"><output id="o-toy-ns">0.16</output></label>
+      <label><input type="checkbox" id="ck-toy-bc" checked> 显示 BC 对照</label>
+    </div>
+    <div class="viz-read" id="rd-toy"></div>
+    <ul class="chips">
+      <li><i style="background:var(--c3)"></i>当前 PPO 策略（成功）</li>
+      <li><i style="background:var(--bad)"></i>当前 PPO 策略（撞障/超时）</li>
+      <li><i style="background:var(--c2)"></i>BC 策略（仅拟合贴边示教）</li>
+      <li><i style="background:var(--c1)"></i>当前训练回报 / 浅灰线为 N=4 参照</li>
+    </ul>
+    <figcaption>默认状态已经跑完 50 轮（对比 N = 64 实线与 N = 4 虚线）：N = 4 单轮梯度方差大、曲线剧烈震荡；N = 64 只需约 20 轮就稳定绕过障碍并锁住 95% 以上成功率。把扰动 σ 调大：只学了贴近障碍弧线的 BC 策略频繁被吹撞到圆障，而带噪训练出的 PPO 学会主动拉宽绕行余量并纠偏回目标。</figcaption>
+  </figure>
+</section>
+
+<!-- ============================================================ -->
+<section id="sim2real">
+  <h2 data-toc="Sim-to-Real 与域随机化">Sim-to-Real 的差距与办法</h2>
+  <p>仿真里跑通不代表真机能跑通。Sim-to-real 差距主要来自三层：</p>
+  <ul>
+    <li><b>物理动力学差距</b>：真实地面摩擦、连杆质量与质心偏差、柔性橡胶鞋底与物体弹性接触，刚体物理引擎只能近似建模。</li>
+    <li><b>执行器与延迟差距</b>：理想仿真给多少力矩立刻生效；真机有电机电流饱和、减速器摩擦与背隙、传感器滤波与通信延迟。<b>Hwangbo et al.（Science Robotics 2019，arXiv:1901.08652）</b>直接用真机电机采集指令–力矩序列，训一个神经网络 <b>actuator network</b> 放进仿真替代理想关节模型，大幅缩小足式迁移差距。</li>
+    <li><b>感知 / 视觉差距</b>：仿真渲染的光照、反光、纹理、运动模糊和镜头畸变与真实 RGB 相机仍有明显鸿沟——这正是纯视觉桌面操作很难靠纯仿真 RL 直接上真机的核心原因。</li>
+  </ul>
+
+  <h3>缩小差距的三类办法</h3>
+  <ul>
+    <li><b>系统辨识（SysID）</b>：实测质量、惯量、延迟与接触刚度，把仿真调准；或像 <b>ASAP（He et al., 2025，arXiv:2502.01143）</b>那样用真机 rollout 数据训一个残差动作模型塞回仿真对齐动力学。</li>
+    <li><b>域随机化（DR，Domain Randomization）</b>：把不确定的参数变成训练分布 $\xi\sim p(\xi)$——视觉 DR 随机化纹理光照（<b>Tobin et al., IROS 2017，arXiv:1703.06907</b>），动力学 DR 随机化质量、摩擦、阻尼与延迟（<b>Peng et al., ICRA 2018，arXiv:1710.06537</b>）。只要真机参数 $\xi_{\text{real}}$ 落在训练区间内，鲁棒策略就能扛过去。</li>
+    <li><b>自动域随机化（ADR）</b>：手调随机化区间很难两全——太窄包不住真机，太宽策略为了兜住极端情况会变得极度保守甚至学不动。<b>OpenAI 魔方（Akkaya et al., 2019，arXiv:1910.07113）</b>提出 ADR：从很窄的初始区间起步，只在策略在当前区间边界的成功率高于阈值时自动向外扩宽范围。</li>
+  </ul>
+
+  <figure class="viz" id="viz-s2r">
+    <div class="viz-h"><b>域随机化区间宽度 Δ 的权衡：覆盖范围 vs 策略保守度</b><span>参数：地面摩擦系数 ξ；可拖动图中真实值竖线</span></div>
+    <div class="viz-stage"><canvas id="cv-s2r" aria-label="不同域随机化范围下，策略在各真实摩擦系数上的成功率与速度保守度曲线"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="sl-s2r-d">随机化半宽 Δ <input type="range" id="sl-s2r-d" min="0.03" max="0.58" step="0.01" value="0.24"><output id="o-s2r-d">0.24</output></label>
+      <label for="sl-s2r-r">真机摩擦 ξ<sub>real</sub> <input type="range" id="sl-s2r-r" min="0.15" max="1.45" step="0.01" value="0.50"><output id="o-s2r-r">0.50</output></label>
+      <button type="button" class="btn ghost" id="bt-s2r-adr">演示 ADR 扩宽</button>
+    </div>
+    <div class="viz-read" id="rd-s2r"></div>
+    <ul class="chips">
+      <li><i style="background:var(--c1s)"></i>训练分布区间 [ξ₀−Δ, ξ₀+Δ]（ξ₀ = 0.70）</li>
+      <li><i style="background:var(--c1)"></i>当前策略成功率（随 ξ<sub>real</sub> 变化）</li>
+      <li><i style="background:var(--c3)"></i>当前策略相对速度 / 敏捷度（保守度）</li>
+      <li><i style="background:var(--line-2)"></i>虚线：窄随机化（Δ = 0.06）对照</li>
+      <li><i style="background:var(--c2)"></i>真机参数 ξ<sub>real</sub>（可拖动）</li>
+    </ul>
+    <figcaption>策略按训练区间内的最坏情况（低摩擦防打滑、高摩擦防卡顿）保守标定步幅。把 Δ 拉到 0.06：在名义值 ξ₀ = 0.70 附近跑得最快，但真机落在 ξ<sub>real</sub> = 0.46 时因打滑直接崩到接近 0%。把 Δ 拉到 0.55：覆盖范围极广，但为了兼容接近冰面的 ξ = 0.15，策略被迫处处小心翼翼，敏捷度掉到约六成。</figcaption>
+  </figure>
+</section>
+
+<!-- ============================================================ -->
+<section id="teacher-student">
+  <h2 data-toc="教师–学生蒸馏">特权教师、学生蒸馏与非对称 Critic</h2>
+  <p>纯靠域随机化逼出一个「对所有摩擦和地形一视同仁」的策略过于保守。更强的做法是利用仿真里的<b>特权信息</b>（地形高程、真实摩擦、外部推力、物体 6D 位姿），先训出好策略或好价值函数，再过渡到真机可部署的观测（本体历史、深度或 RGB 图像）。三条主流路线：</p>
+  <div class="tbl"><table class="wide">
+    <thead><tr><th>架构</th><th>阶段数</th><th>部署策略（Actor）输入</th><th>训练期特权信息给谁</th><th>代表工作</th></tr></thead>
+    <tbody>
+      <tr><td>特权教师 → 学生蒸馏</td><td class="num">2</td><td>本体历史 / 深度 / RGB</td><td>阶段一教师策略 $\pi_{\text{teach}}(a\mid s_t)$；阶段二学生在线 DAgger 模仿教师动作</td><td>Lee et al. 2020（<code>2010.11251</code>）、DextrAH-G（<code>2407.02274</code>）、DextrAH-RGB（<code>2412.01791</code>）</td></tr>
+      <tr><td>RMA 在线隐变量适配</td><td class="num">2</td><td>当前本体 + 估计的隐变量 $\hat z_t$</td><td>阶段一环境编码器 $z_t=E_\psi(\xi_t)$；阶段二 1D-CNN 适配模块用 $k$ 步历史回归 $z_t$</td><td>Kumar et al., RSS 2021（<code>2107.04034</code>）</td></tr>
+      <tr><td>非对称 Actor-Critic（AAC）</td><td class="num">1</td><td>本体历史或图像 $o_t$</td><td>只给 Critic $V_\phi(s_t)$，提供低方差优势估计，省去二阶段蒸馏</td><td>Pinto et al., RSS 2018（<code>1710.06542</code>）</td></tr>
+    </tbody>
+  </table></div>
+  <p>学生之所以能从纯本体历史里反推出「现在地面有多滑」或「手里物体有多重」，本质是隐式的在线系统辨识：同样的关节力矩 $u_t$ 下，如果脚底打滑（加速度和接触力异常），最近 $k$ 步的 $(o_{t-k+1:t}, a_{t-k:t-1})$ 序列里就藏着环境参数 $\xi_t$ 的指纹。</p>
+
+  <figure class="viz" id="viz-ts">
+    <div class="viz-h"><b>教师特权观测 vs 学生用最近 k 步历史估计隐参数</b><span>滑窗最小二乘在线辨识地面摩擦 ξ(t)</span></div>
+    <div class="ts-cols">
+      <div class="ts-box priv">
+        <h5>教师观测（仅仿真可见）</h5>
+        <ul>
+          <li>精确地形高程网格、足底接触力</li>
+          <li>真实摩擦系数 $\xi_{\text{true}}(t)$、质量与质心</li>
+          <li>无延迟完整状态 $s_t$</li>
+        </ul>
+      </div>
+      <div class="ts-box stu">
+        <h5>学生观测（真机可部署）</h5>
+        <ul>
+          <li>最近 $k$ 步带噪本体感知与动作历史 $(o_{t-k+1:t},a_{t-k:t-1})$</li>
+          <li>深度 / 立体 RGB 图像（若视觉任务）</li>
+          <li>通过历史窗口在线估计 $\hat\xi_t$（或隐变量 $\hat z_t$）</li>
+        </ul>
+      </div>
+    </div>
+    <div class="viz-grid">
+      <div class="viz-stage"><p class="pane-t">真实摩擦 ξ(t) 与学生在线估计 ξ̂(t)</p><canvas id="cv-ts-est" aria-label="摩擦系数突变时学生不同窗口长度 k 下的在线估计曲线"></canvas></div>
+      <div class="viz-stage"><p class="pane-t">估计 RMSE vs 历史窗口 k（偏差–方差权衡）</p><canvas id="cv-ts-u" aria-label="估计均方根误差随历史步数 k 变化的 U 形曲线"></canvas></div>
+    </div>
+    <div class="viz-ctrl">
+      <label for="sl-ts-k">历史步数 k <input type="range" id="sl-ts-k" min="1" max="36" step="1" value="10"><output id="o-ts-k">10</output></label>
+      <label for="sl-ts-ns">传感噪声 σ<sub>obs</sub> <input type="range" id="sl-ts-ns" min="0.04" max="0.40" step="0.02" value="0.22"><output id="o-ts-ns">0.22</output></label>
+      <div class="seg" id="sg-ts" role="group" aria-label="地形变化">
+        <button type="button" data-v="step" aria-pressed="true">水泥 → 冰面 → 碎石</button>
+        <button type="button" data-v="const">恒定地面</button>
+      </div>
+      <button type="button" class="btn ghost" id="bt-ts-rs">换噪声</button>
+    </div>
+    <div class="viz-read" id="rd-ts"></div>
+    <ul class="chips">
+      <li><i style="background:var(--c4)"></i>教师直读：真实摩擦 ξ<sub>true</sub>(t)</li>
+      <li><i style="background:var(--c1)"></i>学生估计：k 步滑窗 ξ̂(t)</li>
+      <li><i style="background:var(--c2)"></i>k = 2 对照（噪声大）</li>
+      <li><i style="background:var(--c3)"></i>当前 k 位置（右图 U 形误差曲线）</li>
+    </ul>
+    <figcaption>动力学模型 $m\dot v_t=u_t-\xi_{\text{true}}(t)mg\operatorname{sign}(v_t)+\eta_t$，学生用最近 $k$ 步带噪观测做最小二乘估计 $\hat\xi_t$。$k$ 太小（如 2 步），踩上冰面瞬间跟得上但平时噪声极大；$k$ 太大（如 30 步），平地很稳但从水泥踩上冰面后滞后十几步才反应过来，已经打滑摔倒。恒定地面下没有突变滞后，RMSE 随 $k$ 单调下降。</figcaption>
+  </figure>
+</section>
+
+<!-- ============================================================ -->
+<section id="where">
+  <h2 data-toc="各自在哪赢">行为克隆与仿真 RL 各自在哪赢（截至 2026-11）</h2>
+  <p>选 BC 还是选仿真 RL，不取决于个人偏好，而取决于四个硬约束：<b>传感是否依赖 RGB 视觉</b>、<b>任务能否人工遥操作</b>、<b>奖励和资产好不好建</b>、<b>探索步长有多长</b>。</p>
+  <div class="tbl"><table class="xwide">
+    <thead><tr><th>任务领域</th><th>主导范式</th><th>核心原因</th><th>代表工作（截至 2026-11）</th></tr></thead>
+    <tbody>
+      <tr><td>足式越野行走</td><td>仿真 RL（绝对主导）</td><td>本体感知为主（几乎无视觉 gap）；力矩级平衡无法遥操作；速度跟踪与步态奖励写得清</td><td>ANYmal（Hwangbo 2019、Lee 2020）、<code>legged_gym</code>（Rudin 2021）、RMA（Kumar 2021）、Unitree 系列控制器</td></tr>
+      <tr><td>人形全身控制与动作跟踪</td><td>仿真 RL + 动捕参考轨迹</td><td>动捕重定向提供现成参考姿态（奖励直接是跟踪误差），无需遥操作；结合残差对齐或引导扩散处理物理差异</td><td>ASAP（He et al., <code>2502.01143</code>）、BeyondMimic（Liao et al., <code>2508.08241</code>）</td></tr>
+      <tr><td>灵巧手在手操作 / 通用抓取</td><td>仿真 RL + 教师学生蒸馏</td><td>16–24 自由度高频指尖接触切换极难遥操作；仿真里用特权物体位姿训教师，再蒸馏到深度或双目 RGB 学生</td><td>OpenAI 魔方（<code>1910.07113</code>）、DeXtreme（<code>2210.13702</code>）、DextrAH-G / DextrAH-RGB（<code>2407.02274</code> / <code>2412.01791</code>）</td></tr>
+      <tr><td>带视觉与语言的桌面 / 家居长程操作</td><td>BC / VLA 预训练主导（RL 辅助后训练）</td><td>四重瓶颈挡住从零仿真 RL：开放世界资产难建、RGB 视觉 gap 大、叠衣/收纳等语义奖励难写、长程稀疏奖励几乎探索不到成功</td><td>π0 / π0.5（<a href="../pi-series/#pi0">π 系列</a>）、OpenVLA、ACT / UMI；RL 后训练见下节</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<!-- ============================================================ -->
+<section id="vla-rl">
+  <h2 data-toc="用 RL 微调 VLA">用 RL 微调 VLA：仿真基准与真机路线</h2>
+  <p>桌面视觉操作从零做仿真 RL 几乎撞不到成功，但如果先用示教 SFT 出一个已经有 20%–80% 成功率的 VLA，再放进仿真里用任务成败作奖励做在线 RL（路线 B），就能同时解决探索冷启动和 BC 复合误差两件事。</p>
+
+  <h3>仿真里的 VLA + RL 代表工作（截至 2026-11）</h3>
+  <ul>
+    <li><b>SimpleVLA-RL</b>（Li, Zuo et al., 2025，<a href="https://arxiv.org/abs/2509.09674">arXiv:2509.09674</a>）：基于 <code>veRL</code>，只用终局二值成功作奖励微调 OpenVLA-OFT。LIBERO 四套基准平均成功率从 SFT 的 <b>91.0%</b> 升到 <b>99.1%</b>（LIBERO-Long <b>86.5% → 98.5%</b>）；极少数据设定下（每任务仅 1 条示教 SFT），LIBERO-Long 从 <b>17.3%</b> 拉升到 <b>91.7%</b>（四套平均 96.9%），并出现示教里没有的「推切（pushcut）」快捷动作。</li>
+    <li><b>RL4VLA</b>（Liu et al., 2025，<a href="https://arxiv.org/abs/2505.19789">arXiv:2505.19789</a>）：在 ManiSkill 上系统比较 PPO、GRPO、DPO 与 SFT 在视觉、语义、执行三个 OOD 维度上的泛化，结论是在线 PPO 对执行鲁棒性与语义泛化提升最大，同时保持视觉鲁棒性。</li>
+    <li><b>VLA-RL</b>（Lu et al., 2025，<a href="https://arxiv.org/abs/2505.18719">arXiv:2505.18719</a>）：将机械臂轨迹建模为多模态多轮对话，引入微调 VLM 作为过程奖励模型缓解稀疏奖励，在 LIBERO 的 40 个任务上让 OpenVLA-7B 比最强的微调基线高 <b>4.5%</b>。</li>
+    <li><b>$\pi_{\text{RL}}$ 与 RLinf</b>（Chen et al., 2025，<a href="https://arxiv.org/abs/2510.25889">arXiv:2510.25889</a>；分布式框架 <b>RLinf</b>，Yu et al., <a href="https://arxiv.org/abs/2509.15965">arXiv:2509.15965</a> / <b>RLinf-VLA</b> <a href="https://arxiv.org/abs/2510.06710">arXiv:2510.06710</a>）：专门攻克 flow-based VLA（$\pi_0$、$\pi_{0.5}$）的在线 RL。LIBERO 上从少样本 SFT 起步，$\pi_0$ <b>57.6% → 97.6%</b>、$\pi_{0.5}$ <b>77.1% → 98.3%</b>；ManiSkill 上用 320 个并行环境、在 4352 个抓放任务上，$\pi_0$ <b>41.6% → 85.7%</b>、$\pi_{0.5}$ <b>40.0% → 84.8%</b>。</li>
+    <li><b>推理 VLM 的纯成功信号仿真 RL</b>：完全不做示教 SFT、直接让多模态推理模型以文本写动作并在仿真里只用 0/1 成功信号做多轮 RL（PEAR），详见 <a href="../robot-use-agent/#rurl">Robot-Use Agent · PEAR</a>。</li>
+  </ul>
+
+  <h3>Flow / Diffusion VLA 的难点：算不出动作似然</h3>
+  <p>自回归 VLA（如 OpenVLA、FAST token）把动作离散成 token，每步都有显式 softmax 概率，PPO / GRPO 可以直接拿 $\log\pi_\theta(a\mid o)$ 算重要性比值。但 $\pi_0$、$\pi_{0.5}$ 这类 flow matching 策略（原理见 <a href="../pi-series/#flow">π 系列 · Flow Matching</a>）用确定性 ODE 把高斯噪声积分成连续动作块：不仅没有采样随机性，而且求动作边缘密度 $\log p_\theta(a\mid o)$ 要沿整条积分路径求雅可比散度，反传代价极高。目前有两条解法：</p>
+  <ol>
+    <li><b>把去噪步改写成可算似然的随机链（$\pi_{\text{RL}}$）</b>：<b>Flow-Noise</b> 在去噪网络外挂一个可学习噪声头，把每步去噪建为离散时间 MDP 从而算出精确对数似然；<b>Flow-SDE</b> 把确定性 ODE 改写成边缘分布等价的随机微分方程（SDE），每一步去噪转移都是闭式高斯分布，既引入探索噪声，又能直接逐去噪步计算 $\log\pi_\theta$ 代入 PPO / GRPO。</li>
+    <li><b>干脆不用策略梯度，改成优势条件化监督学习（$\pi^*_{0.6}$ 的 RECAP）</b>：Physical Intelligence（<a href="https://arxiv.org/abs/2511.14759">arXiv:2511.14759</a>，详链 <a href="../pi-series/#pi06">π 系列 · $\pi^*_{0.6}$ 与 RECAP</a>）单独训价值网络评估轨迹优势，把 <code>Advantage: positive / negative</code> 作为条件 token 拼进输入，用纯监督 flow matching 吃下全部好坏轨迹与人工纠正，推理时把条件钉在 positive 上采样，完全绕开动作似然。</li>
+  </ol>
+
+  <figure class="viz" id="viz-vlarl">
+    <div class="viz-h"><b>Flow ODE vs Flow-SDE 去噪路径，以及仿真 VLA-RL 提升实测</b><span>左：从噪声到动作的 10 步去噪；右：论文报告成功率 %</span></div>
+    <div class="viz-grid">
+      <div class="viz-stage"><p class="pane-t">为什么 ODE 不能直接 PPO：切换 SDE 噪声 η</p><canvas id="cv-vla-sde" aria-label="确定性 ODE 去噪路径与随机 Flow-SDE 多条高斯转移路径的对比"></canvas></div>
+      <div class="viz-stage"><p class="pane-t">SFT 基线 → 在线 RL 微调（各论文报告值）</p><canvas id="cv-vla-bar" aria-label="SimpleVLA-RL 和 pi_RL 在 LIBERO 与 ManiSkill 上的 SFT 与 RL 成功率对比"></canvas></div>
+    </div>
+    <div class="viz-ctrl">
+      <label for="sl-sde-eta">SDE 噪声强度 η <input type="range" id="sl-sde-eta" min="0" max="0.6" step="0.05" value="0.25"><output id="o-sde-eta">0.25</output></label>
+      <button type="button" class="btn ghost" id="bt-sde-rs">重新采样路径</button>
+    </div>
+    <div class="viz-read" id="rd-vlarl"></div>
+    <ul class="chips">
+      <li><i style="background:var(--muted)"></i>确定性 ODE（η = 0，单条路径，无似然）</li>
+      <li><i style="background:var(--c1)"></i>Flow-SDE 采样轨迹（每步高斯转移，可算 log π）</li>
+      <li><i style="background:var(--c4)"></i>SFT 基线成功率</li>
+      <li><i style="background:var(--c3)"></i>仿真 RL 微调后成功率</li>
+    </ul>
+    <figcaption>左：$\eta=0$ 退化为确定性 ODE，给定初始噪声 $x_0$ 只落到唯一动作点，既无探索随机性又难算似然；$\eta&gt;0$ 时每步去噪转移 $p_\theta(x_{k+1}\mid x_k,o)$ 是闭式高斯（圆圈标示条件标准差），可把整条去噪链当作双层 MDP 用 PPO / GRPO 更新。右：四组公开论文实测——SimpleVLA-RL（arXiv:2509.09674，OpenVLA-OFT）与 $\pi_{\text{RL}}$（arXiv:2510.25889，$\pi_0$/$\pi_{0.5}$）。</figcaption>
+  </figure>
+
+  <h3>跳过仿真器：真机 RL</h3>
+  <p>对于插拔电路板、绕柔性线缆、叠衣这类仿真难以精确建模接触与外观的任务，另一条路是用高样本效率的 off-policy 算法直接在真机上做 RL：<b>SERL</b>（Luo et al., ICRA 2024，<a href="https://arxiv.org/abs/2401.16013">arXiv:2401.16013</a>）与 <b>HIL-SERL</b>（Luo et al., Science Robotics / <a href="https://arxiv.org/abs/2410.21845">arXiv:2410.21845</a>）结合少量示教、RLPD（离线数据 + 在线回放池混合更新）与人工在线接管纠正，在 <b>1–2.5 小时</b>真机训练内达到近 100% 精密装配成功率。批式真机迭代的 <b>RECAP</b> 则把自主 rollout 与人类介入统一成优势条件化重训，详见 <a href="../pi-series/#pi06">π 系列 · $\pi^*_{0.6}$</a>。</p>
+</section>
+
+<!-- ============================================================ -->
+<section id="combine">
+  <h2 data-toc="两者如何结合">行为克隆与 RL 怎么结合</h2>
+  <p>实际系统很少非此即彼，而是用 BC 解决探索和语义先验、用 RL 解决恢复和物理上限。常见组合有四种：</p>
+  <div class="tbl"><table class="xwide">
+    <thead><tr><th>结合方式</th><th>核心做法</th><th>需要什么</th><th>代表工作</th></tr></thead>
+    <tbody>
+      <tr><td>BC 预训练 + RL 微调</td><td>先在示教集上 SFT 得到可行基策略，再用稀疏或过程奖励在线 RL 拉高成功率与 OOD 鲁棒性</td><td>少量示教 + 可判成败的仿真器（或真机奖励分类器）</td><td>SimpleVLA-RL（<code>2509.09674</code>）、RL4VLA（<code>2505.19789</code>）、VLA-RL（<code>2505.18719</code>）、$\pi_{\text{RL}}$（<code>2510.25889</code>）</td></tr>
+      <tr><td>仿真 RL 专家 → 视觉蒸馏</td><td>在仿真里用特权状态 RL 训出高分教师，再让只看本体 / 深度 / RGB 的学生在线 DAgger 模仿教师</td><td>高保真物理仿真 + 可写奖励 + 域随机化</td><td>Lee et al. 2020（<code>2010.11251</code>）、RMA（<code>2107.04034</code>）、DextrAH-G / RGB（<code>2407.02274</code> / <code>2412.01791</code>）</td></tr>
+      <tr><td>残差 RL（Residual RL）</td><td>冻结 BC 或解析基策略 $a_{\text{base}}(o)$，RL 只学有界的小修正 $\Delta a_\theta(o)$，执行 $a=a_{\text{base}}+\Delta a_\theta$，大幅压缩探索空间</td><td>已能大致完成任务的基策略 + 在线交互与奖励</td><td>Johannink et al., ICRA 2019（<code>1812.03201</code>）、ResiP（Ankile et al., <code>2407.16677</code>）</td></tr>
+      <tr><td>人工在线纠正（交互式模仿 / 离线强化）</td><td>部署策略自主运行，偏离或快失败时由人接管纠正，把恢复片段并入训练集或以正优势条件重训</td><td>可安全介入的真机遥操作接口 + 人工值守</td><td>DAgger（<code>1011.0686</code>）、HG-DAgger（Kelly et al., <code>1810.02890</code>）、HIL-SERL（<code>2410.21845</code>）、RECAP（<code>2511.14759</code>）</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<!-- ============================================================ -->
+<section id="quiz">
+  <h2>自测</h2>
+  <details class="q"><summary>任务一：要让双足人形机器人在碎石斜坡上行走并抵抗侧推，选采数据 BC 还是仿真 RL？为什么？</summary><div><p>选仿真 RL（路线 A）。双足动态平衡需要 50–200 Hz 的全身力矩级协调，人类无法遥操作示教；该任务以本体感知为主，视觉 sim-to-real 差距小，速度与动作跟踪奖励清楚，在 GPU 并行仿真里配合域随机化与教师–学生蒸馏是最成熟路径。</p></div></details>
+  <details class="q"><summary>任务二：要让双臂机械臂在开放厨房里按自然语言指令收拾各种碗筷和抹布，为什么目前以 BC / VLA 为主而不是纯仿真 RL 从零训？</summary><div><p>四重障碍挡住从零仿真 RL：真实厨具与布料资产难以穷举建模，RGB 外观与光照的 sim-to-real 差距大，语义任务难以写出无漏洞的稠密奖励，且长程稀疏奖励下随机探索几乎碰不到成功。现实路线是用遥操作 / 手持夹爪示教配合 VLM 预训练做 BC，再用仿真或真机 RL 做后训练微调。</p></div></details>
+  <details class="q"><summary>为什么行为克隆的误差上界是 $O(\varepsilon T^2)$，而 DAgger 能降到 $O(\varepsilon T)$？</summary><div><p>BC 只在专家状态分布 $d_{\pi^*}$ 上保证单步出错率 $\le\varepsilon$；一旦在第 $t$ 步偏离，剩下 $T-t$ 步全在分布外，每步都可能出错，求和 $\sum_{t=0}^{T-1}\varepsilon(T-t)\approx\frac12\varepsilon T^2$。DAgger 把专家查询放到策略自己访问的状态分布 $d_{\hat\pi}$ 上，学会出错后立刻拉回，每次犯错只付常数恢复代价 $u$，总代价降为 $O(uT\varepsilon_N)$。</p></div></details>
+  <details class="q"><summary>连续控制仿真 RL 里，<code>decimation = 4</code> 和 <code>action_scale = 0.5</code> 分别控制什么？</summary><div><p><code>decimation = 4</code> 表示策略每 4 个物理仿真步才推理一次新动作（如物理 200 Hz、策略 50 Hz），期间目标关节角保持不变、PD 环在每个物理步重算力矩。<code>action_scale = 0.5</code> 将网络输出 $a_t$ 缩放到默认站立姿态附近 $q^*_t=q_{\text{def}}+0.5\,a_t$，约束搜索空间并防止初期剧烈甩臂。</p></div></details>
+  <details class="q"><summary>域随机化范围是不是越宽越好？ADR 怎么解决这个问题？</summary><div><p>不是。范围太窄覆盖不到真机参数会直接崩溃；范围太宽时策略为了同时兼容极端摩擦、质量或延迟，只能学出极度保守甚至学不动的动作。ADR（自动域随机化）从窄区间起步，等策略在区间边界达到足够成功率再自动扩宽，在可学性与鲁棒性之间动态平衡。</p></div></details>
+  <details class="q"><summary>特权教师–学生蒸馏和非对称 Actor-Critic（AAC）都用了仿真特权信息，两者有什么区别？</summary><div><p>教师–学生是两阶段：先让教师策略用特权状态 RL 训到高分，再让只看可部署观测的学生在线 DAgger 模仿教师动作（或像 RMA 那样只回归环境隐变量）。非对称 Actor-Critic 是单阶段：Actor 从一开始就只看可部署观测，只有 Critic 读取特权状态，用来给出更准、低方差的价值与优势估计，无需第二阶段蒸馏。</p></div></details>
+  <details class="q"><summary>为什么不能把标准 PPO 直接套在 $\pi_0$ 这类 flow matching VLA 上？$\pi_{\text{RL}}$ 和 RECAP 各怎么解决？</summary><div><p>标准 PPO 需要计算采样动作的对数概率 $\log\pi_\theta(a\mid o)$ 来求重要性比值 $\rho_t$，而 flow matching 通过确定性 ODE 生成连续动作块，没有廉价可微的边缘对数似然。$\pi_{\text{RL}}$ 用 Flow-Noise（可学习噪声头）或 Flow-SDE（把 ODE 改写成高斯转移 SDE）把去噪链变成可算步级似然的 MDP；RECAP 则彻底绕开策略梯度，用价值网络标出正负优势后做优势条件化监督学习。</p></div></details>
+</section>
+
+<!-- ============================================================ -->
+<section id="refs">
+  <h2>延伸阅读</h2>
+  <ol class="refs">
+    <li><b>Ross, Gordon, Bagnell. A Reduction of Imitation Learning and Structured Prediction to No-Regret Online Learning</b>（DAgger）, AISTATS 2011. <a href="https://arxiv.org/abs/1011.0686">arXiv:1011.0686</a></li>
+    <li><b>Schulman et al. High-Dimensional Continuous Control Using Generalized Advantage Estimation</b>（GAE）, ICLR 2016. <a href="https://arxiv.org/abs/1506.02438">arXiv:1506.02438</a></li>
+    <li><b>Schulman et al. Proximal Policy Optimization Algorithms</b>（PPO）, 2017. <a href="https://arxiv.org/abs/1707.06347">arXiv:1707.06347</a></li>
+    <li><b>Makoviychuk et al. Isaac Gym: High Performance GPU-Based Physics Simulation For Robot Learning</b>, NeurIPS 2021 Datasets and Benchmarks. <a href="https://arxiv.org/abs/2108.10470">arXiv:2108.10470</a></li>
+    <li><b>Rudin, Hoeller, Reist, Hutter. Learning to Walk in Minutes Using Massively Parallel Deep Reinforcement Learning</b>（legged_gym）, CoRL 2021. <a href="https://arxiv.org/abs/2109.11978">arXiv:2109.11978</a>；<a href="https://github.com/leggedrobotics/legged_gym">GitHub</a></li>
+    <li><b>Mittal, Roth et al. Isaac Lab: A GPU-Accelerated Simulation Framework for Multi-Modal Robot Learning</b>, 2025. <a href="https://arxiv.org/abs/2511.04831">arXiv:2511.04831</a>；前身 Orbit <a href="https://arxiv.org/abs/2301.04195">arXiv:2301.04195</a>；<a href="https://github.com/isaac-sim/IsaacLab">GitHub</a></li>
+    <li><b>Tao et al. ManiSkill3: GPU Parallelized Robotics Simulation and Rendering for Generalizable Embodied AI</b>, 2024. <a href="https://arxiv.org/abs/2410.00425">arXiv:2410.00425</a></li>
+    <li><b>Zakka et al. MuJoCo Playground</b>, 2025. <a href="https://arxiv.org/abs/2502.08844">arXiv:2502.08844</a></li>
+    <li><b>Genesis Authors. Genesis: A Generative and Universal Physics Engine for Robotics and Beyond</b>, 2024. <a href="https://github.com/Genesis-Embodied-AI/Genesis">GitHub</a></li>
+    <li><b>Tobin et al. Domain Randomization for Transferring Deep Neural Networks from Simulation to the Real World</b>, IROS 2017. <a href="https://arxiv.org/abs/1703.06907">arXiv:1703.06907</a></li>
+    <li><b>Peng et al. Sim-to-Real Transfer of Robotic Control with Dynamics Randomization</b>, ICRA 2018. <a href="https://arxiv.org/abs/1710.06537">arXiv:1710.06537</a></li>
+    <li><b>Hwangbo et al. Learning Agile and Dynamic Motor Skills for Legged Robots</b>（Actuator Network）, Science Robotics 2019. <a href="https://arxiv.org/abs/1901.08652">arXiv:1901.08652</a></li>
+    <li><b>Akkaya et al. (OpenAI). Solving Rubik's Cube with a Robot Hand</b>（ADR）, 2019. <a href="https://arxiv.org/abs/1910.07113">arXiv:1910.07113</a></li>
+    <li><b>Handa et al. DeXtreme: Transfer of Agile In-hand Manipulation from Simulation to Reality</b>, ICRA 2023. <a href="https://arxiv.org/abs/2210.13702">arXiv:2210.13702</a></li>
+    <li><b>Pinto et al. Asymmetric Actor Critic for Image-Based Robot Learning</b>, RSS 2018. <a href="https://arxiv.org/abs/1710.06542">arXiv:1710.06542</a></li>
+    <li><b>Lee et al. Learning Quadrupedal Locomotion over Challenging Terrain</b>（特权教师–学生蒸馏）, Science Robotics 2020. <a href="https://arxiv.org/abs/2010.11251">arXiv:2010.11251</a></li>
+    <li><b>Kumar, Fu, Pathak, Malik. RMA: Rapid Motor Adaptation for Legged Robots</b>, RSS 2021. <a href="https://arxiv.org/abs/2107.04034">arXiv:2107.04034</a></li>
+    <li><b>Lum et al. DextrAH-G</b>（<a href="https://arxiv.org/abs/2407.02274">arXiv:2407.02274</a>）与 <b>DextrAH-RGB</b>（<a href="https://arxiv.org/abs/2412.01791">arXiv:2412.01791</a>）, 2024.</li>
+    <li><b>He et al. ASAP: Aligning Simulation and Real-World Physics for Learning Agile Humanoid Whole-Body Skills</b>, 2025. <a href="https://arxiv.org/abs/2502.01143">arXiv:2502.01143</a></li>
+    <li><b>Liao et al. BeyondMimic: From Motion Tracking to Versatile Humanoid Control via Guided Diffusion</b>, 2025. <a href="https://arxiv.org/abs/2508.08241">arXiv:2508.08241</a></li>
+    <li><b>Li, Zuo et al. SimpleVLA-RL: Scaling VLA Training via Reinforcement Learning</b>, 2025. <a href="https://arxiv.org/abs/2509.09674">arXiv:2509.09674</a>；<a href="https://github.com/PRIME-RL/SimpleVLA-RL">GitHub</a></li>
+    <li><b>Liu et al. What Can RL Bring to VLA Generalization? An Empirical Study</b>（RL4VLA）, 2025. <a href="https://arxiv.org/abs/2505.19789">arXiv:2505.19789</a></li>
+    <li><b>Lu et al. VLA-RL: Towards Masterful and General Robotic Manipulation with Scalable Reinforcement Learning</b>, 2025. <a href="https://arxiv.org/abs/2505.18719">arXiv:2505.18719</a></li>
+    <li><b>Chen et al. π<sub>RL</sub>: Online RL Fine-tuning for Flow-based Vision-Language-Action Models</b>, 2025. <a href="https://arxiv.org/abs/2510.25889">arXiv:2510.25889</a></li>
+    <li><b>Yu et al. RLinf</b>（<a href="https://arxiv.org/abs/2509.15965">arXiv:2509.15965</a>）与 <b>RLinf-VLA</b>（<a href="https://arxiv.org/abs/2510.06710">arXiv:2510.06710</a>）, 2025；<a href="https://github.com/RLinf/RLinf">GitHub</a></li>
+    <li><b>Luo et al. SERL: A Software Suite for Sample-Efficient Robotic Reinforcement Learning</b>, ICRA 2024. <a href="https://arxiv.org/abs/2401.16013">arXiv:2401.16013</a></li>
+    <li><b>Luo, Xu, Wu, Levine. Precise and Dexterous Robotic Manipulation via Human-in-the-Loop Reinforcement Learning</b>（HIL-SERL）, 2024. <a href="https://arxiv.org/abs/2410.21845">arXiv:2410.21845</a></li>
+    <li><b>Physical Intelligence. π*0.6: a VLA That Learns From Experience</b>（RECAP）, 2025. <a href="https://arxiv.org/abs/2511.14759">arXiv:2511.14759</a></li>
+    <li><b>Johannink et al. Residual Reinforcement Learning for Robot Control</b>, ICRA 2019（<a href="https://arxiv.org/abs/1812.03201">arXiv:1812.03201</a>）；<b>Ankile et al. ResiP</b>, 2024（<a href="https://arxiv.org/abs/2407.16677">arXiv:2407.16677</a>）；<b>Kelly et al. HG-DAgger</b>, ICRA 2019（<a href="https://arxiv.org/abs/1810.02890">arXiv:1810.02890</a>）.</li>
+  </ol>
+</section>
+
+</main>
+</div>
+
+<!-- v4u:foot -->
+<footer class="v4u-foot"><div class="v4u-foot-in"><a class="pv" href="../rtc/"><span>上一篇</span>实时分块执行（RTC）</a><a class="nx" href="../3d-representations/"><span>下一篇</span>3D 表征</a></div></footer>
+<!-- /v4u:foot -->
+
+<script>
+V4U.ready(() => {
+  const $ = (id) => document.getElementById(id);
+  const C = (n) => V4U.css(n);
+  const { PI, cos, sin, exp, log, sqrt, abs, min, max, hypot, tanh } = Math;
+  const f = (x, d = 2) => V4U.fmt(x, d);
+  const mono = (px = 11) => px + 'px ' + C('--f-mono');
+  const bodyF = (px = 12, bold = false) => (bold ? '700 ' : '400 ') + px + 'px ' + C('--f-body');
+  const rngOf = (seed) => {
+    let s = seed | 0;
+    return () => {
+      s = (s + 0x6D2B79F5) | 0;
+      let t = Math.imul(s ^ (s >>> 15), 1 | s);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  };
+  const gaussOf = (r) => () => sqrt(-2 * log(r() || 1e-9)) * cos(2 * PI * r());
+  const dashed = (ctx, fn, pat = [5, 4]) => { ctx.save(); ctx.setLineDash(pat); fn(); ctx.restore(); };
+  const polyline = (ctx, pts, col, w = 2) => {
+    ctx.strokeStyle = col; ctx.lineWidth = w; ctx.beginPath();
+    let pen = false;
+    for (let i = 0; i < pts.length; i++) {
+      const p = pts[i];
+      if (!p) { pen = false; continue; }
+      if (pen) ctx.lineTo(p[0], p[1]); else { ctx.moveTo(p[0], p[1]); pen = true; }
+    }
+    ctx.stroke();
+  };
+  const dot = (ctx, x, y, r, col) => { ctx.fillStyle = col; ctx.beginPath(); ctx.arc(x, y, r, 0, 2 * PI); ctx.fill(); };
+  const plotAxes = (ctx, x0, y0, w, h, xr, yr, xt, yt, fx = (v) => v, fy = (v) => v) => {
+    const X = (v) => x0 + ((v - xr[0]) / (xr[1] - xr[0])) * w;
+    const Y = (v) => y0 + h - ((v - yr[0]) / (yr[1] - yr[0])) * h;
+    ctx.strokeStyle = C('--line'); ctx.lineWidth = 1; ctx.font = mono(10.5); ctx.fillStyle = C('--muted');
+    yt.forEach((v) => {
+      const py = Y(v);
+      ctx.beginPath(); ctx.moveTo(x0, py); ctx.lineTo(x0 + w, py); ctx.stroke();
+      ctx.textAlign = 'right'; ctx.textBaseline = 'middle'; ctx.fillText(fy(v), x0 - 6, py);
+    });
+    xt.forEach((v) => {
+      ctx.textAlign = 'center'; ctx.textBaseline = 'top'; ctx.fillText(fx(v), X(v), y0 + h + 5);
+    });
+    ctx.strokeStyle = C('--line-2');
+    ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x0, y0 + h); ctx.lineTo(x0 + w, y0 + h); ctx.stroke();
+    ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+    return { X, Y };
+  };
+
+  // =========================================================================
+  // 1. #bc-limits: 2D BC covariate shift vs DAgger vs RL
+  // =========================================================================
+  {
+    const slN = $('sl-bc-n'), slM = $('sl-bc-m'), rd = $('rd-bc');
+    const T = 80, DT = 0.155, N_EVAL = 20;
+    const yRef = (x) => 1.35 * sin(0.2 * PI * x);
+    const dyRef = (x) => 1.35 * 0.2 * PI * cos(0.2 * PI * x);
+    let mode = 'all', seed = 17, playStep = T, anim = null;
+
+    function buildData(M, curSeed) {
+      const r = rngOf(curSeed * 97 + M * 13);
+      const g = gaussOf(r);
+      const demos = [];
+      const demoPts = [];
+      // Generate M expert demonstrations narrowly inside the expert tube
+      for (let m = 0; m < M; m++) {
+        const yOff = (M === 1 ? 0 : ((m / (M - 1)) - 0.5) * 0.22) + g() * 0.025;
+        const pts = [];
+        let x = 0, y = yRef(0) + yOff;
+        for (let t = 0; t <= T; t++) {
+          const xc = V4U.clamp(x, 0, 10);
+          const slp = dyRef(xc);
+          const norm = hypot(1, slp);
+          const vx = 1.0 / norm, vy = slp / norm;
+          const err = y - yRef(xc);
+          const ax = vx, ay = vy - 0.14 * err + g() * 0.02;
+          pts.push([x, y]);
+          if (t % 2 === 0 && x <= 10.2) demoPts.push({ x, y, ax, ay });
+          x += ax * DT; y += ay * DT;
+          if (x >= 10.05) { pts.push([10, 0]); break; }
+        }
+        demos.push(pts);
+      }
+      // DAgger corrective dataset: adds expert recovery labels on off-track visited states
+      const dagPts = demoPts.slice();
+      for (let i = 0; i < 65; i++) {
+        const x = (i / 64) * 10;
+        for (const sgn of [-1, 1]) {
+          for (const d of [0.45, 1.15, 2.0]) {
+            const y = yRef(x) + sgn * d;
+            const slp = dyRef(x), norm = hypot(1, slp);
+            const vx = 1.0 / norm, vy = slp / norm;
+            const corr = V4U.clamp(-1.55 * (y - yRef(x)), -1.8, 1.8);
+            dagPts.push({ x, y, ax: vx, ay: vy + corr });
+          }
+        }
+      }
+      return { demos, demoPts, dagPts };
+    }
+
+    function kernelPolicy(pts, x, y, bw, oodDrift) {
+      let sw = 0, sax = 0, say = 0, minD2 = 1e9;
+      for (let i = 0; i < pts.length; i++) {
+        const p = pts[i], dx = x - p.x, dy = y - p.y, d2 = dx * dx + dy * dy;
+        if (d2 < minD2) minD2 = d2;
+        const w = exp(-d2 / (2 * bw * bw));
+        sw += w; sax += w * p.ax; say += w * p.ay;
+      }
+      if (sw < 1e-12) {
+        let best = pts[0], bd = 1e9;
+        for (let i = 0; i < pts.length; i++) {
+          const d = (x - pts[i].x) ** 2 + (y - pts[i].y) ** 2;
+          if (d < bd) { bd = d; best = pts[i]; }
+        }
+        sax = best.ax; say = best.ay; sw = 1;
+      }
+      let ax = sax / sw, ay = say / sw;
+      // Out-of-distribution compounding drift when pushed outside the expert demo tube
+      const dist = sqrt(minD2);
+      if (oodDrift > 0 && dist > 0.14) {
+        const excess = dist - 0.14;
+        const sgn = y >= yRef(V4U.clamp(x, 0, 10)) ? 1 : -1;
+        ay += sgn * oodDrift * (0.45 * excess + 0.55 * excess * excess);
+      }
+      return [ax, ay];
+    }
+
+    function rlPolicy(x, y) {
+      const xc = V4U.clamp(x, 0, 10);
+      const dx = 10.0 - x, dy = yRef(xc) - y;
+      const distGoal = hypot(dx, 0 - y);
+      if (distGoal < 1.8) {
+        const gn = max(0.35, distGoal);
+        return [dx / gn, (0 - y) / gn];
+      }
+      const slp = dyRef(xc), norm = hypot(1, slp);
+      return [1.0 / norm, slp / norm + V4U.clamp(1.75 * dy, -1.8, 1.8)];
+    }
+
+    function simAll() {
+      const noise = +slN.value, M = +slM.value;
+      const { demos, demoPts, dagPts } = buildData(M, seed);
+      const rNoise = rngOf(seed * 313 + 7);
+      const gNoise = gaussOf(rNoise);
+      // Shared noise bank so BC, DAgger, and RL face identical perturbations
+      const bank = [];
+      for (let k = 0; k < N_EVAL; k++) {
+        const seq = [];
+        for (let t = 0; t < T; t++) seq.push([gNoise() * noise, gNoise() * noise]);
+        bank.push(seq);
+      }
+      const oodGain = 1.35 / sqrt(M) + 0.35;
+      const runOne = (kind) => {
+        const trajs = [], errByT = new Float64Array(T + 1);
+        let ok = 0, sumErr = 0;
+        for (let k = 0; k < N_EVAL; k++) {
+          let x = 0, y = 0, reached = false;
+          const pts = [[x, y]];
+          for (let t = 0; t < T; t++) {
+            if (!reached) {
+              const [ax, ay] =
+                kind === 'bc' ? kernelPolicy(demoPts, x, y, 0.42, oodGain) :
+                kind === 'dagger' ? kernelPolicy(dagPts, x, y, 0.48, 0) :
+                rlPolicy(x, y);
+              const nx = bank[k][t][0], ny = bank[k][t][1];
+              x += (ax + nx) * DT;
+              y = V4U.clamp(y + (ay + ny) * DT, -3.2, 3.2);
+              if (hypot(x - 10, y) < 0.72) reached = true;
+            }
+            pts.push([x, y]);
+            const e = reached ? 0 : abs(y - yRef(V4U.clamp(x, 0, 10)));
+            errByT[t + 1] += e / N_EVAL;
+            sumErr += e;
+          }
+          if (reached) ok++;
+          trajs.push(pts);
+        }
+        return { trajs, errByT, okRate: ok / N_EVAL, meanErr: sumErr / (N_EVAL * T) };
+      };
+      return { demos, bc: runOne('bc'), dagger: runOne('dagger'), rl: runOne('rl') };
+    }
+
+    let cache = simAll();
+    const H = (w) => (w < 420 ? 235 : 265);
+
+    const drawMap = V4U.canvas($('cv-bc-map'), H, (ctx, w, h) => {
+      $('o-bc-n').textContent = f(+slN.value);
+      $('o-bc-m').textContent = slM.value;
+      const pad = 16;
+      const X = (x) => pad + ((x + 0.3) / 11.4) * (w - 2 * pad);
+      const Y = (y) => h / 2 - (y / 3.4) * (h / 2 - pad);
+      // Reference corridor
+      ctx.strokeStyle = C('--surface-2'); ctx.lineWidth = (0.45 / 3.4) * (h - 2 * pad); ctx.lineCap = 'round';
+      ctx.beginPath();
+      for (let i = 0; i <= 100; i++) {
+        const x = (i / 100) * 10;
+        if (i === 0) ctx.moveTo(X(x), Y(yRef(x))); else ctx.lineTo(X(x), Y(yRef(x)));
+      }
+      ctx.stroke(); ctx.lineCap = 'butt';
+      // Demo trajectories
+      ctx.globalAlpha = 0.55;
+      cache.demos.forEach((tr) => polyline(ctx, tr.map(([x, y]) => [X(x), Y(y)]), C('--muted'), 1.1));
+      ctx.globalAlpha = 1;
+      // Goal circle
+      const gx = X(10), gy = Y(0), gr = (0.72 / 11.4) * (w - 2 * pad);
+      ctx.fillStyle = C('--ok-soft'); ctx.strokeStyle = C('--ok'); ctx.lineWidth = 1.6;
+      ctx.beginPath(); ctx.arc(gx, gy, gr, 0, 2 * PI); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = C('--ok'); ctx.font = mono(10.5); ctx.textAlign = 'center';
+      ctx.fillText('目标', gx, gy - gr - 5); ctx.textAlign = 'left';
+      dot(ctx, X(0), Y(0), 4.5, C('--ink'));
+
+      const drawGroup = (grp, col, alpha) => {
+        const showN = mode === 'all' ? 9 : 16;
+        ctx.globalAlpha = alpha;
+        for (let k = 0; k < showN; k++) {
+          const slice = grp.trajs[k].slice(0, playStep + 1);
+          polyline(ctx, slice.map(([x, y]) => [X(x), Y(y)]), col, 1.5);
+          const last = slice[slice.length - 1];
+          dot(ctx, X(last[0]), Y(last[1]), 2.6, col);
+        }
+        ctx.globalAlpha = 1;
+      };
+      if (mode === 'all' || mode === 'bc') drawGroup(cache.bc, C('--c2'), mode === 'all' ? 0.65 : 0.78);
+      if (mode === 'all' || mode === 'dagger') drawGroup(cache.dagger, C('--c1'), mode === 'all' ? 0.6 : 0.78);
+      if (mode === 'all' || mode === 'rl') drawGroup(cache.rl, C('--c3'), mode === 'all' ? 0.65 : 0.78);
+
+      rd.innerHTML =
+        `<span>BC：偏离 <b>${f(cache.bc.meanErr)}</b>，成功率 <b>${Math.round(cache.bc.okRate * 100)}%</b></span>` +
+        `<span>DAgger：偏离 <b>${f(cache.dagger.meanErr)}</b>，成功率 <b>${Math.round(cache.dagger.okRate * 100)}%</b></span>` +
+        `<span>RL：偏离 <b>${f(cache.rl.meanErr)}</b>，成功率 <b>${Math.round(cache.rl.okRate * 100)}%</b></span>`;
+    });
+
+    const drawErr = V4U.canvas($('cv-bc-err'), H, (ctx, w, h) => {
+      const ymax = max(1.0, ceilNice(max(...cache.bc.errByT) * 1.12));
+      const P = plotAxes(ctx, 42, 14, w - 54, h - 38, [0, T], [0, ymax], [0, 20, 40, 60, 80], [0, ymax / 2, ymax], (v) => v, (v) => f(v, 1));
+      const drawCurve = (arr, col, lw) => {
+        const pts = [];
+        for (let t = 0; t <= playStep; t++) pts.push([P.X(t), P.Y(arr[t])]);
+        polyline(ctx, pts, col, lw);
+      };
+      if (mode === 'all' || mode === 'bc') drawCurve(cache.bc.errByT, C('--c2'), 2.5);
+      if (mode === 'all' || mode === 'dagger') drawCurve(cache.dagger.errByT, C('--c1'), 2.3);
+      if (mode === 'all' || mode === 'rl') drawCurve(cache.rl.errByT, C('--c3'), 2.3);
+    });
+
+    function ceilNice(v) { return v <= 1 ? 1 : v <= 2 ? 2 : v <= 3 ? 3 : Math.ceil(v); }
+    const redrawAll = () => { drawMap(); drawErr(); };
+    const recompute = () => { cache = simAll(); playStep = T; redrawAll(); };
+    V4U.seg($('sg-bc'), (v) => { mode = v; redrawAll(); });
+    slN.addEventListener('input', recompute);
+    slM.addEventListener('input', recompute);
+    $('bt-bc-resamp').addEventListener('click', () => { seed++; recompute(); });
+    $('bt-bc-play').addEventListener('click', (e) => {
+      if (anim) { anim.stop(); anim = null; e.target.textContent = '逐步播放'; return; }
+      playStep = 0; e.target.textContent = '暂停';
+      let acc = 0;
+      anim = V4U.loop(slN, (t, dt) => {
+        acc += dt * 32;
+        if (acc >= 1) {
+          playStep = min(T, playStep + Math.floor(acc));
+          acc %= 1;
+          redrawAll();
+          if (playStep >= T) { anim.stop(); anim = null; e.target.textContent = '逐步播放'; }
+        }
+      });
+    });
+  }
+
+  // =========================================================================
+  // 2. #parallel: Massively parallel cart-pole grid & throughput bar chart
+  // =========================================================================
+  {
+    const nChoices = [1, 4, 16, 64, 256, 1024, 4096];
+    const slN = $('sl-par-n'), slSp = $('sl-par-sp'), rd = $('rd-par');
+    const r0 = rngOf(91);
+    const MAX_VIS = 64;
+    const envs = Array.from({ length: MAX_VIS }, () => ({
+      x: (r0() - 0.5) * 0.4, v: (r0() - 0.5) * 0.4,
+      th: (r0() - 0.5) * 0.36, w: (r0() - 0.5) * 0.8, flash: 0
+    }));
+    let totalSteps = 0, totalResets = 0, anim = null;
+
+    function stepCartPoles(dtSim, nEnv) {
+      const visN = min(MAX_VIS, nEnv);
+      const subSteps = max(1, Math.round(dtSim / 0.02));
+      const scaleN = nEnv / visN;
+      let resetsThis = 0;
+      for (let i = 0; i < visN; i++) {
+        const e = envs[i];
+        e.flash = max(0, e.flash - 0.35);
+        for (let s = 0; s < subSteps; s++) {
+          // Imperfect noisy exploratory PD controller so pendulums actively swing and occasionally fall
+          const u = V4U.clamp(16 * e.th + 3.0 * e.w + 1.0 * e.x + (r0() - 0.5) * 18, -12, 12);
+          const ddth = (9.8 * sin(e.th) - 0.08 * u * cos(e.th)) / 0.5 - 0.14 * e.w;
+          const ddx = 0.13 * u;
+          e.w += ddth * 0.02; e.th += e.w * 0.02;
+          e.v += ddx * 0.02; e.x = V4U.clamp(e.x + e.v * 0.02, -0.85, 0.85);
+          if (abs(e.th) > 0.62) {
+            e.x = (r0() - 0.5) * 0.3; e.v = 0;
+            e.th = (r0() - 0.5) * 0.36; e.w = (r0() - 0.5) * 0.85;
+            e.flash = 1.0;
+            resetsThis++;
+          }
+        }
+      }
+      totalSteps += Math.round(subSteps * nEnv);
+      totalResets += Math.round(resetsThis * scaleN);
+    }
+
+    // Advance initially so tiles show varied tilt angles and ~15% active resets
+    for (let k = 0; k < 24; k++) stepCartPoles(0.06, 4096);
+
+    const H = (w) => (w < 420 ? 250 : 280);
+    const drawGrid = V4U.canvas($('cv-par-grid'), H, (ctx, w, h) => {
+      const nEnv = nChoices[+slN.value];
+      const sp = +slSp.value;
+      $('o-par-n').textContent = nEnv.toLocaleString();
+      $('o-par-sp').textContent = f(sp, 1) + '×';
+      const visN = min(MAX_VIS, nEnv);
+      const cols = Math.round(sqrt(visN)), rows = cols;
+      $('par-grid-t').textContent = nEnv > MAX_VIS
+        ? `并行环境实时视图（展示前 64 / ${nEnv.toLocaleString()} 个）`
+        : `并行环境实时视图（${nEnv} 个）`;
+      const pad = 8, gap = cols >= 8 ? 3 : 6;
+      const cw = (w - 2 * pad - (cols - 1) * gap) / cols;
+      const ch = (h - 2 * pad - (rows - 1) * gap) / rows;
+      for (let i = 0; i < visN; i++) {
+        const e = envs[i], r = Math.floor(i / cols), c = i % cols;
+        const bx = pad + c * (cw + gap), by = pad + r * (ch + gap);
+        ctx.fillStyle = e.flash > 0.15 ? C('--bad-soft') : C('--surface-2');
+        ctx.strokeStyle = e.flash > 0.15 ? C('--bad') : C('--line');
+        ctx.lineWidth = e.flash > 0.15 ? 1.5 : 1;
+        ctx.fillRect(bx, by, cw, ch); ctx.strokeRect(bx, by, cw, ch);
+        // Track & cart & pole
+        const cy = by + ch * 0.76, cx = bx + cw * (0.5 + e.x * 0.34);
+        const L = min(cw, ch) * 0.46;
+        ctx.strokeStyle = C('--line-2'); ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(bx + 4, cy); ctx.lineTo(bx + cw - 4, cy); ctx.stroke();
+        const px = cx + L * sin(e.th), py = cy - L * cos(e.th);
+        ctx.strokeStyle = e.flash > 0.15 ? C('--bad') : C('--c1');
+        ctx.lineWidth = cols >= 8 ? 2 : 3;
+        ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(px, py); ctx.stroke();
+        dot(ctx, px, py, cols >= 8 ? 2.2 : 3.5, e.flash > 0.15 ? C('--bad') : C('--c2'));
+      }
+      const sps = nEnv * 50 * sp;
+      const eqHrsPerHr = nEnv * sp;
+      const hrsFor1e8 = 1e8 / (sps * 3600);
+      const tStr = hrsFor1e8 >= 24 ? `${f(hrsFor1e8 / 24, 1)} 天` : hrsFor1e8 >= 1 ? `${f(hrsFor1e8, 2)} 小时` : `${f(hrsFor1e8 * 60, 1)} 分钟`;
+      const eqStr = eqHrsPerHr >= 24 ? `${f(eqHrsPerHr, 0)} 小时（${f(eqHrsPerHr / 24, 1)} 天）` : `${f(eqHrsPerHr, 1)} 小时`;
+      rd.innerHTML =
+        `<span>吞吐 <b>${Math.round(sps).toLocaleString()}</b> 步/秒</span>` +
+        `<span>1 小时墙钟 ≈ <b>${eqStr}</b> 真机经验</span>` +
+        `<span>攒 10⁸ 步需 <b>${tStr}</b></span>` +
+        `<span>本次演示累计 <b>${totalSteps.toLocaleString()}</b> 步 · 重置 <b>${totalResets.toLocaleString()}</b> 次</span>`;
+    });
+
+    const drawBar = V4U.canvas($('cv-par-bar'), H, (ctx, w, h) => {
+      const nEnv = nChoices[+slN.value], sp = +slSp.value;
+      const items = [
+        { label: '真机 1 台 (50 Hz)', sps: 50, col: C('--muted') },
+        { label: 'CPU 16 核 (1×)', sps: 16 * 50, col: C('--c5') },
+        { label: `当前 GPU (${nEnv} × ${f(sp, 1)}×)`, sps: nEnv * 50 * sp, col: C('--c3') }
+      ];
+      // Log scale of seconds to collect 1e8 steps: from 10^1 s (10s) to 10^7 s (~115 days)
+      const lo = 1.5, hi = 6.6;
+      const x0 = 14, bw = w - 28;
+      const rowH = (h - 46) / 3;
+      items.forEach((it, idx) => {
+        const secs = 1e8 / it.sps;
+        const lv = V4U.clamp(Math.log10(secs), lo, hi);
+        const frac = (lv - lo) / (hi - lo);
+        const y = 14 + idx * rowH;
+        ctx.fillStyle = C('--ink'); ctx.font = bodyF(12, idx === 2);
+        ctx.fillText(it.label, x0, y + 14);
+        const tStr = secs >= 86400 ? `${f(secs / 86400, 1)} 天` : secs >= 3600 ? `${f(secs / 3600, 1)} 小时` : secs >= 60 ? `${f(secs / 60, 1)} 分钟` : `${f(secs, 0)} 秒`;
+        ctx.fillStyle = C('--muted'); ctx.font = mono(11.5); ctx.textAlign = 'right';
+        ctx.fillText(tStr, x0 + bw, y + 14); ctx.textAlign = 'left';
+        ctx.fillStyle = C('--surface-2'); ctx.fillRect(x0, y + 22, bw, 20);
+        ctx.fillStyle = it.col; ctx.fillRect(x0, y + 22, max(6, bw * frac), 20);
+      });
+      // Log ticks at bottom
+      const tickS = [[60, '1分'], [600, '10分'], [3600, '1时'], [86400, '1天'], [86400 * 23, '23天']];
+      ctx.strokeStyle = C('--line-2'); ctx.beginPath(); ctx.moveTo(x0, h - 24); ctx.lineTo(x0 + bw, h - 24); ctx.stroke();
+      ctx.fillStyle = C('--muted'); ctx.font = mono(10.5); ctx.textAlign = 'center';
+      tickS.forEach(([s, txt]) => {
+        const tx = x0 + ((Math.log10(s) - lo) / (hi - lo)) * bw;
+        if (tx >= x0 && tx <= x0 + bw) {
+          ctx.beginPath(); ctx.moveTo(tx, h - 24); ctx.lineTo(tx, h - 19); ctx.stroke();
+          ctx.fillText(txt, tx, h - 6);
+        }
+      });
+      ctx.textAlign = 'left';
+    });
+
+    const redraw = () => { drawGrid(); drawBar(); };
+    slN.addEventListener('input', redraw);
+    slSp.addEventListener('input', redraw);
+    $('bt-par-rst').addEventListener('click', () => { totalSteps = 0; totalResets = 0; redraw(); });
+    $('bt-par-play').addEventListener('click', (e) => {
+      if (anim) { anim.stop(); anim = null; e.target.textContent = '运行并行仿真'; return; }
+      e.target.textContent = '暂停';
+      anim = V4U.loop(slN, (t, dt) => {
+        const nEnv = nChoices[+slN.value], sp = +slSp.value;
+        stepCartPoles(dt * sp, nEnv);
+        redraw();
+      });
+    });
+  }
+
+  // =========================================================================
+  // 3. #recipe: Exact 3x3 Discrete LQR reward-weight trade-off
+  // =========================================================================
+  {
+    const slT = $('sl-rw-t'), slE = $('sl-rw-e'), slS = $('sl-rw-s'), rd = $('rd-rew');
+    const DT = 0.05, STEPS = 110;
+
+    function solveLQR(wT, wE, wS) {
+      const A = [[1, DT, 0], [0, 0.94, 0], [0, 0, 0]];
+      const B = [0.5 * DT * DT, DT, 1];
+      const Q = [[wT, 0, 0], [0, 0.02 * wT, 0], [0, 0, wS]];
+      const Nv = [0, 0, -wS];
+      const R = max(1e-4, wE + wS);
+      let P = Q.map((r) => r.slice());
+      const K = [0, 0, 0];
+      for (let it = 0; it < 220; it++) {
+        const Pb = [0, 0, 0];
+        for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) Pb[i] += P[i][j] * B[j];
+        const Pa = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+        for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) for (let k = 0; k < 3; k++) Pa[i][j] += P[i][k] * A[k][j];
+        let denom = R;
+        for (let i = 0; i < 3; i++) denom += B[i] * Pb[i];
+        const num = [0, 0, 0];
+        for (let j = 0; j < 3; j++) {
+          num[j] = Nv[j];
+          for (let i = 0; i < 3; i++) num[j] += B[i] * Pa[i][j];
+          K[j] = num[j] / denom;
+        }
+        const Pn = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+        for (let i = 0; i < 3; i++) {
+          for (let j = 0; j < 3; j++) {
+            let s = Q[i][j] - num[i] * K[j];
+            for (let k = 0; k < 3; k++) s += A[k][i] * Pa[k][j];
+            Pn[i][j] = s;
+          }
+        }
+        P = Pn;
+      }
+      let x = 0, v = 0, ap = 0;
+      const xs = [], refs = [], us = [];
+      let cT = 0, cE = 0, cS = 0, peakU = 0, jitter = 0, settleIdx = 60;
+      for (let t = 0; t < STEPS; t++) {
+        const ref = t < 60 ? 1.0 : 0.35;
+        const u = V4U.clamp(-(K[0] * (x - ref) + K[1] * v + K[2] * ap), -12, 12);
+        xs.push(x); refs.push(ref); us.push(u);
+        cT += wT * (x - ref) ** 2;
+        cE += wE * u * u;
+        cS += wS * (u - ap) ** 2;
+        jitter += (u - ap) ** 2;
+        peakU = max(peakU, abs(u));
+        if (t < 60 && abs(x - 1.0) > 0.05) settleIdx = t;
+        x = x + DT * v + 0.5 * DT * DT * u;
+        v = 0.94 * v + DT * u;
+        ap = u;
+      }
+      return { xs, refs, us, cT, cE, cS, peakU, jitter, settleT: (settleIdx + 1) * DT };
+    }
+
+    let sol = solveLQR(2.0, 0.03, 0.25);
+    const H = (w) => (w < 420 ? 225 : 250);
+
+    const drawX = V4U.canvas($('cv-rew-x'), H, (ctx, w, h) => {
+      $('o-rw-t').textContent = f(+slT.value, 1);
+      $('o-rw-e').textContent = f(+slE.value, 3);
+      $('o-rw-s').textContent = f(+slS.value, 2);
+      const P = plotAxes(ctx, 40, 14, w - 52, h - 38, [0, STEPS * DT], [-0.1, 1.35], [0, 1, 2, 3, 4, 5], [0, 0.5, 1.0], (v) => v + 's', (v) => f(v, 1));
+      dashed(ctx, () => polyline(ctx, sol.refs.map((r, i) => [P.X(i * DT), P.Y(r)]), C('--muted'), 1.8));
+      polyline(ctx, sol.xs.map((x, i) => [P.X(i * DT), P.Y(x)]), C('--c1'), 2.6);
+      const tot = sol.cT + sol.cE + sol.cS;
+      rd.innerHTML =
+        `<span>首次稳定时间 <b>${f(sol.settleT, 2)} s</b></span>` +
+        `<span>峰值动作 <b>${f(sol.peakU, 2)}</b></span>` +
+        `<span>动作抖动 ∑Δa² <b>${f(sol.jitter, 1)}</b></span>` +
+        `<span>总惩罚 −<b>${f(tot, 1)}</b>（跟踪 ${Math.round((sol.cT / tot) * 100)}% · 力矩 ${Math.round((sol.cE / tot) * 100)}% · 平滑 ${Math.round((sol.cS / tot) * 100)}%）</span>`;
+    });
+
+    const drawU = V4U.canvas($('cv-rew-u'), H, (ctx, w, h) => {
+      const plotH = h - 72;
+      const P = plotAxes(ctx, 40, 12, w - 52, plotH, [0, STEPS * DT], [-12, 12], [0, 1, 2, 3, 4, 5], [-10, 0, 10], (v) => v + 's', (v) => v);
+      polyline(ctx, sol.us.map((u, i) => [P.X(i * DT), P.Y(u)]), C('--c2'), 2.2);
+      // Stacked bar of the 3 weighted reward terms at bottom
+      const tot = max(1e-6, sol.cT + sol.cE + sol.cS);
+      const bx = 40, by = h - 22, bw = w - 52, bh = 14;
+      const w1 = bw * (sol.cT / tot), w2 = bw * (sol.cE / tot), w3 = bw - w1 - w2;
+      ctx.fillStyle = C('--c1'); ctx.fillRect(bx, by, w1, bh);
+      ctx.fillStyle = C('--c2'); ctx.fillRect(bx + w1, by, w2, bh);
+      ctx.fillStyle = C('--c3'); ctx.fillRect(bx + w1 + w2, by, w3, bh);
+    });
+
+    const update = () => { sol = solveLQR(+slT.value, +slE.value, +slS.value); drawX(); drawU(); };
+    slT.addEventListener('input', update);
+    slE.addEventListener('input', update);
+    slS.addEventListener('input', update);
+    const presets = { bal: [2.0, 0.03, 0.25], fast: [8.5, 0.005, 0.005], smooth: [2.0, 0.03, 3.6], lazy: [0.15, 0.65, 0.5] };
+    V4U.seg($('sg-rew'), (v) => {
+      const p = presets[v];
+      slT.value = p[0]; slE.value = p[1]; slS.value = p[2];
+      update();
+    });
+  }
+
+  // =========================================================================
+  // 4. #toy: Live in-browser continuous PPO on 2D obstacle avoidance + BC baseline
+  // =========================================================================
+  {
+    const OBS_X = 0, OBS_Y = 0, OBS_R = 0.62;
+    const GOAL_X = 2.0, GOAL_Y = 0.0, GOAL_R = 0.35;
+    const MAX_T = 45, DT = 0.16;
+
+    const resetEnv = (r) => ({ x: -2.0 + (r() - 0.5) * 0.22, y: (r() - 0.5) * 0.55, vx: 0, vy: 0, t: 0, done: false, hit: false, ok: false });
+    const getObs = (e) => {
+      const dx = (GOAL_X - e.x) / 2.5, dy = (GOAL_Y - e.y) / 2.5;
+      const ox = e.x - OBS_X, oy = e.y - OBS_Y, od = hypot(ox, oy) || 1e-4;
+      const invD = 1 / (max(0.15, od - OBS_R) + 0.35);
+      return [dx, dy, e.vx, e.vy, (ox / od) * invD, (oy / od) * invD];
+    };
+    const stepEnv = (e, ax, ay, ns, g) => {
+      const ux = V4U.clamp(ax, -1, 1) + g() * ns, uy = V4U.clamp(ay, -1, 1) + g() * ns;
+      const d0 = hypot(GOAL_X - e.x, GOAL_Y - e.y);
+      e.vx = 0.45 * e.vx + 0.65 * ux; e.vy = 0.45 * e.vy + 0.65 * uy;
+      e.x += e.vx * DT; e.y += e.vy * DT; e.t++;
+      const d1 = hypot(GOAL_X - e.x, GOAL_Y - e.y), od = hypot(e.x - OBS_X, e.y - OBS_Y);
+      let rew = (d0 - d1) * 1.8 - 0.015 * (ax * ax + ay * ay) - 0.02;
+      if (od < OBS_R + 0.28) rew -= 0.45 * (OBS_R + 0.28 - od);
+      if (od < OBS_R) { rew -= 2.5; e.hit = true; e.done = true; }
+      else if (d1 < GOAL_R) { rew += 3.0; e.ok = true; e.done = true; }
+      else if (abs(e.x) > 2.8 || abs(e.y) > 2.2) { rew -= 1.5; e.done = true; }
+      else if (e.t >= MAX_T) { e.done = true; }
+      return rew;
+    };
+
+    // BC baseline trained on noise-free tight arc demos (passes closely over obstacle top)
+    const bcDemos = [];
+    for (let i = 0; i <= 40; i++) {
+      const s = i / 40;
+      const x = -2.0 + 4.0 * s;
+      const y = 0.80 * sin(PI * s);
+      const dx = 4.0, dy = 0.80 * PI * cos(PI * s);
+      const n = hypot(dx, dy);
+      bcDemos.push({ x, y, ax: dx / n, ay: dy / n });
+    }
+    function bcAct(e) {
+      let sw = 0, sax = 0, say = 0;
+      for (let i = 0; i < bcDemos.length; i++) {
+        const p = bcDemos[i], d2 = (e.x - p.x) ** 2 + (e.y - p.y) ** 2;
+        const w = exp(-d2 / 0.16);
+        sw += w; sax += w * p.ax; say += w * p.ay;
+      }
+      if (sw < 1e-12) return [0.7, 0];
+      return [sax / sw, say / sw];
+    }
+
+    function createMLP(nIn, nH, nOut, scale, r) {
+      const W1 = new Float64Array(nH * nIn), b1 = new Float64Array(nH);
+      const W2 = new Float64Array(nOut * nH), b2 = new Float64Array(nOut);
+      const s1 = sqrt(2 / (nIn + nH)), s2 = scale / sqrt(nH);
+      for (let i = 0; i < W1.length; i++) W1[i] = (r() * 2 - 1) * s1;
+      for (let i = 0; i < W2.length; i++) W2[i] = (r() * 2 - 1) * s2;
+      return { nIn, nH, nOut, W1, b1, W2, b2 };
+    }
+    function fwdMLP(m, x, hOut) {
+      const { nIn, nH, nOut, W1, b1, W2, b2 } = m;
+      for (let j = 0; j < nH; j++) {
+        let s = b1[j], off = j * nIn;
+        for (let i = 0; i < nIn; i++) s += W1[off + i] * x[i];
+        hOut[j] = tanh(s);
+      }
+      const y = new Float64Array(nOut);
+      for (let k = 0; k < nOut; k++) {
+        let s = b2[k], off = k * nH;
+        for (let j = 0; j < nH; j++) s += W2[off + j] * hOut[j];
+        y[k] = s;
+      }
+      return y;
+    }
+
+    function makeAgent(seed) {
+      const r = rngOf(seed), g = gaussOf(r);
+      const actor = createMLP(6, 16, 2, 0.25, r), critic = createMLP(6, 16, 1, 0.25, r);
+      const logStd = new Float64Array([-0.55, -0.55]);
+      const params = [actor.W1, actor.b1, actor.W2, actor.b2, logStd, critic.W1, critic.b1, critic.W2, critic.b2];
+      const grads = params.map((p) => new Float64Array(p.length));
+      const m = params.map((p) => new Float64Array(p.length));
+      const v = params.map((p) => new Float64Array(p.length));
+      let adamStep = 0;
+      const hTmp = new Float64Array(16);
+
+      const act = (obs, det = false) => {
+        const raw = fwdMLP(actor, obs, hTmp);
+        const mu0 = tanh(raw[0]), mu1 = tanh(raw[1]);
+        if (det) return { a0: mu0, a1: mu1, lp: 0 };
+        const s0 = exp(logStd[0]), s1 = exp(logStd[1]);
+        const a0 = mu0 + s0 * g(), a1 = mu1 + s1 * g();
+        const lp = -0.5 * (((a0 - mu0) / s0) ** 2 + ((a1 - mu1) / s1) ** 2 + 2 * (logStd[0] + logStd[1]) + 2 * log(2 * PI));
+        return { a0, a1, lp };
+      };
+      const val = (obs) => fwdMLP(critic, obs, hTmp)[0];
+
+      const trainOne = (nEnv, ns) => {
+        const trajs = [];
+        let totRet = 0, totOk = 0, totSteps = 0;
+        for (let ei = 0; ei < nEnv; ei++) {
+          const e = resetEnv(r);
+          const os = [], as = [], lps = [], rs = [], vs = [];
+          let epR = 0;
+          while (!e.done) {
+            const o = getObs(e), { a0, a1, lp } = act(o, false), vv = val(o);
+            const rw = stepEnv(e, a0, a1, ns, g);
+            os.push(o); as.push([a0, a1]); lps.push(lp); rs.push(rw); vs.push(vv);
+            epR += rw; totSteps++;
+          }
+          totRet += epR; if (e.ok) totOk++;
+          const L = rs.length, adv = new Float64Array(L), ret = new Float64Array(L);
+          let gae = 0;
+          const lastV = (e.ok || e.hit) ? 0 : val(getObs(e));
+          for (let t = L - 1; t >= 0; t--) {
+            const nv = t === L - 1 ? lastV : vs[t + 1];
+            const d = rs[t] + 0.97 * nv - vs[t];
+            gae = d + 0.97 * 0.92 * gae;
+            adv[t] = gae; ret[t] = gae + vs[t];
+          }
+          for (let t = 0; t < L; t++) trajs.push({ o: os[t], a: as[t], lp: lps[t], adv: adv[t], ret: ret[t] });
+        }
+        let mA = 0, vA = 0;
+        for (let i = 0; i < trajs.length; i++) mA += trajs[i].adv;
+        mA /= trajs.length;
+        for (let i = 0; i < trajs.length; i++) vA += (trajs[i].adv - mA) ** 2;
+        const sdA = sqrt(vA / trajs.length + 1e-8);
+        for (let i = 0; i < trajs.length; i++) trajs[i].adv = (trajs[i].adv - mA) / sdA;
+
+        const hA = new Float64Array(16), hC = new Float64Array(16), invN = 1 / trajs.length;
+        for (let ep = 0; ep < 4; ep++) {
+          for (let p = 0; p < grads.length; p++) grads[p].fill(0);
+          const [gAW1, gAb1, gAW2, gAb2, gLS, gCW1, gCb1, gCW2, gCb2] = grads;
+          const s0 = exp(logStd[0]), s1 = exp(logStd[1]);
+          for (let idx = 0; idx < trajs.length; idx++) {
+            const tr = trajs[idx], o = tr.o, a0 = tr.a[0], a1 = tr.a[1];
+            const raw = fwdMLP(actor, o, hA);
+            const mu0 = tanh(raw[0]), mu1 = tanh(raw[1]);
+            const d0 = (a0 - mu0) / s0, d1 = (a1 - mu1) / s1;
+            const lp = -0.5 * (d0 * d0 + d1 * d1 + 2 * (logStd[0] + logStd[1]) + 2 * log(2 * PI));
+            const ratio = exp(V4U.clamp(lp - tr.lp, -10, 10));
+            const clipped = (tr.adv > 0 && ratio > 1.2) || (tr.adv < 0 && ratio < 0.8);
+            const coeff = clipped ? 0 : -ratio * tr.adv * invN;
+            if (coeff !== 0) {
+              const dR0 = coeff * ((a0 - mu0) / (s0 * s0)) * (1 - mu0 * mu0);
+              const dR1 = coeff * ((a1 - mu1) / (s1 * s1)) * (1 - mu1 * mu1);
+              gAb2[0] += dR0; gAb2[1] += dR1;
+              for (let j = 0; j < 16; j++) {
+                gAW2[j] += dR0 * hA[j]; gAW2[16 + j] += dR1 * hA[j];
+                const dh = (dR0 * actor.W2[j] + dR1 * actor.W2[16 + j]) * (1 - hA[j] * hA[j]);
+                gAb1[j] += dh;
+                const off = j * 6;
+                for (let i = 0; i < 6; i++) gAW1[off + i] += dh * o[i];
+              }
+              gLS[0] += coeff * (d0 * d0 - 1); gLS[1] += coeff * (d1 * d1 - 1);
+            }
+            gLS[0] -= 0.008 * invN; gLS[1] -= 0.008 * invN;
+            const vp = fwdMLP(critic, o, hC)[0], dv = 2 * (vp - tr.ret) * invN;
+            gCb2[0] += dv;
+            for (let j = 0; j < 16; j++) {
+              gCW2[j] += dv * hC[j];
+              const dh = dv * critic.W2[j] * (1 - hC[j] * hC[j]);
+              gCb1[j] += dh;
+              const off = j * 6;
+              for (let i = 0; i < 6; i++) gCW1[off + i] += dh * o[i];
+            }
+          }
+          adamStep++;
+          const bc1 = 1 - 0.9 ** adamStep, bc2 = 1 - 0.999 ** adamStep;
+          for (let p = 0; p < params.length; p++) {
+            const P = params[p], G = grads[p], M = m[p], V = v[p], lr = p < 5 ? 0.012 : 0.02;
+            for (let i = 0; i < P.length; i++) {
+              const gg = V4U.clamp(G[i], -5, 5);
+              M[i] = 0.9 * M[i] + 0.1 * gg; V[i] = 0.999 * V[i] + 0.001 * gg * gg;
+              P[i] -= lr * (M[i] / bc1) / (sqrt(V[i] / bc2) + 1e-8);
+            }
+          }
+          logStd[0] = V4U.clamp(logStd[0], -2.0, -0.15);
+          logStd[1] = V4U.clamp(logStd[1], -2.0, -0.15);
+        }
+        return { avgRet: totRet / nEnv, okRate: totOk / nEnv, steps: totSteps };
+      };
+
+      const evalRollouts = (ns) => {
+        const re = rngOf(505), ge = gaussOf(re);
+        const rlTrajs = [], bcTrajs = [];
+        let rlOk = 0, bcOk = 0;
+        for (let k = 0; k < 12; k++) {
+          const e1 = resetEnv(re);
+          const e2 = { ...e1 };
+          const p1 = [[e1.x, e1.y]], p2 = [[e2.x, e2.y]];
+          // Use shared step noise for fair comparison
+          const seq = Array.from({ length: MAX_T }, () => [ge(), ge()]);
+          let i1 = 0;
+          while (!e1.done) {
+            const { a0, a1 } = act(getObs(e1), true);
+            let q = 0;
+            const g1 = () => seq[i1][q++];
+            stepEnv(e1, a0, a1, ns, g1);
+            p1.push([e1.x, e1.y]); i1++;
+          }
+          let i2 = 0;
+          while (!e2.done) {
+            const [a0, a1] = bcAct(e2);
+            let q = 0;
+            const g2 = () => seq[i2][q++];
+            stepEnv(e2, a0, a1, ns, g2);
+            p2.push([e2.x, e2.y]); i2++;
+          }
+          if (e1.ok) rlOk++; if (e2.ok) bcOk++;
+          rlTrajs.push({ pts: p1, ok: e1.ok });
+          bcTrajs.push({ pts: p2, ok: e2.ok });
+        }
+        return { rlTrajs, bcTrajs, rlOk: rlOk / 12, bcOk: bcOk / 12 };
+      };
+
+      return { trainOne, evalRollouts, logStd };
+    }
+
+    const slNs = $('sl-toy-ns'), ckBc = $('ck-toy-bc'), rd = $('rd-toy');
+    let nEnv = 64, anim = null, targetIters = 55;
+    let agent = makeAgent(123), hist = [], refHist = [], totalSteps = 0, runSeed = 123;
+
+    // Pre-compute N=4 reference curve (45 iters, ~90ms) and default N=64 curve (45 iters, ~240ms)
+    {
+      const refAg = makeAgent(123);
+      for (let i = 0; i < 50; i++) refHist.push(refAg.trainOne(4, 0.16));
+      for (let i = 0; i < 50; i++) {
+        const res = agent.trainOne(64, 0.16);
+        hist.push(res); totalSteps += res.steps;
+      }
+    }
+
+    const H = (w) => (w < 420 ? 235 : 265);
+    const drawEnv = V4U.canvas($('cv-toy-env'), H, (ctx, w, h) => {
+      const ns = +slNs.value;
+      $('o-toy-ns').textContent = f(ns, 2);
+      const pad = 16;
+      const s = min((w - 2 * pad) / 5.4, (h - 2 * pad) / 3.8);
+      const X = (x) => w / 2 + x * s, Y = (y) => h / 2 - y * s;
+      // Obstacle
+      ctx.fillStyle = C('--surface-2'); ctx.strokeStyle = C('--line-2'); ctx.lineWidth = 1.6;
+      ctx.beginPath(); ctx.arc(X(OBS_X), Y(OBS_Y), OBS_R * s, 0, 2 * PI); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = C('--muted'); ctx.font = mono(10.5); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText('障碍', X(OBS_X), Y(OBS_Y));
+      // Goal
+      ctx.fillStyle = C('--ok-soft'); ctx.strokeStyle = C('--ok');
+      ctx.beginPath(); ctx.arc(X(GOAL_X), Y(GOAL_Y), GOAL_R * s, 0, 2 * PI); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = C('--ok'); ctx.fillText('目标', X(GOAL_X), Y(GOAL_Y));
+      ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+
+      const ev = agent.evalRollouts(ns);
+      if (ckBc.checked) {
+        ctx.globalAlpha = 0.45;
+        ev.bcTrajs.forEach((tr) => dashed(ctx, () => polyline(ctx, tr.pts.map(([x, y]) => [X(x), Y(y)]), C('--c2'), 1.3), [4, 3]));
+        ctx.globalAlpha = 1;
+      }
+      ev.rlTrajs.forEach((tr) => {
+        const col = tr.ok ? C('--c3') : C('--bad');
+        ctx.globalAlpha = 0.78;
+        polyline(ctx, tr.pts.map(([x, y]) => [X(x), Y(y)]), col, 1.8);
+        const last = tr.pts[tr.pts.length - 1];
+        dot(ctx, X(last[0]), Y(last[1]), 3, col);
+        ctx.globalAlpha = 1;
+      });
+      const cur = hist[hist.length - 1] || { avgRet: 0, okRate: 0 };
+      const sig = exp(0.5 * (agent.logStd[0] + agent.logStd[1]));
+      rd.innerHTML =
+        `<span>迭代 <b>${hist.length}</b>（N = <b>${nEnv}</b>，累计 <b>${totalSteps.toLocaleString()}</b> 步）</span>` +
+        `<span>PPO 测试成功率 <b>${Math.round(ev.rlOk * 100)}%</b>（BC 对照 <b>${Math.round(ev.bcOk * 100)}%</b>）</span>` +
+        `<span>均值回报 <b>${f(cur.avgRet, 2)}</b> · 策略 σ <b>${f(sig, 2)}</b></span>`;
+    });
+
+    const drawCur = V4U.canvas($('cv-toy-cur'), H, (ctx, w, h) => {
+      const maxX = max(50, hist.length);
+      const P = plotAxes(ctx, 42, 14, w - 54, h - 38, [0, maxX], [-2, 10], [0, Math.round(maxX / 2), maxX], [-2, 2, 6, 10], (v) => v, (v) => v);
+      // Reference N=4 curve
+      dashed(ctx, () => polyline(ctx, refHist.map((d, i) => [P.X(i + 1), P.Y(V4U.clamp(d.avgRet, -2, 10))]), C('--muted'), 1.4));
+      // Active return curve
+      polyline(ctx, hist.map((d, i) => [P.X(i + 1), P.Y(V4U.clamp(d.avgRet, -2, 10))]), C('--c1'), 2.5);
+      // Active success rate mapped onto [-2, 10] as secondary subtle curve (0% -> -2, 100% -> 10)
+      polyline(ctx, hist.map((d, i) => [P.X(i + 1), P.Y(-2 + d.okRate * 12)]), C('--c3'), 1.8);
+      ctx.fillStyle = C('--c3'); ctx.font = mono(10); ctx.textAlign = 'right';
+      ctx.fillText('绿线: 成功率 0–100%', w - 14, 24);
+      ctx.textAlign = 'left';
+    });
+
+    const redraw = () => { drawEnv(); drawCur(); };
+    const stopAnim = () => { if (anim) { anim.stop(); anim = null; $('bt-toy-go').textContent = '从零重新训练'; } };
+    const startLoop = (maxIt) => {
+      targetIters = maxIt;
+      $('bt-toy-go').textContent = '暂停训练';
+      anim = V4U.loop(slNs, () => {
+        if (hist.length >= targetIters) { stopAnim(); return; }
+        const res = agent.trainOne(nEnv, +slNs.value);
+        hist.push(res); totalSteps += res.steps;
+        redraw();
+      });
+    };
+
+    V4U.seg($('sg-toy-n'), (v) => { nEnv = +v; });
+    slNs.addEventListener('input', redraw);
+    ckBc.addEventListener('change', redraw);
+    $('bt-toy-go').addEventListener('click', () => {
+      if (anim) { stopAnim(); return; }
+      runSeed += 17;
+      agent = makeAgent(runSeed); hist = []; totalSteps = 0;
+      startLoop(55);
+    });
+    $('bt-toy-cont').addEventListener('click', () => {
+      if (anim) { stopAnim(); return; }
+      startLoop(hist.length + 30);
+    });
+  }
+
+  // =========================================================================
+  // 5. #sim2real: Domain randomization width vs real friction robustness
+  // =========================================================================
+  {
+    const slD = $('sl-s2r-d'), slR = $('sl-s2r-r'), rd = $('rd-s2r'), cv = $('cv-s2r');
+    const XI0 = 0.70;
+    let anim = null;
+
+    // Grounded robustness & conservatism model:
+    // Policy trained on [XI0 - D, XI0 + D] chooses conservative speed factor s(D) to survive worst-case xi_min = max(0.08, XI0 - D).
+    function evalPolicy(D, xiReal) {
+      const lo = max(0.08, XI0 - D), hi = min(1.55, XI0 + D);
+      // Inside [lo, hi], policy stays stable (~96% minus small spread penalty); outside, fails rapidly as slip/stall grows
+      const margin = 0.045;
+      let distOut = 0;
+      if (xiReal < lo) distOut = (lo - xiReal) / 0.11;
+      else if (xiReal > hi) distOut = (xiReal - hi) / 0.16;
+      const baseOk = 0.97 - 0.11 * D;
+      const succ = V4U.clamp(baseOk * exp(-(distOut * distOut) / (1 + margin)), 0, 1);
+      // Agility / speed drops as D grows because worst-case low friction forces shorter, slower steps
+      const agility = V4U.clamp(1.0 - 0.68 * D * (1 + 0.35 * max(0, 0.35 - lo)), 0.25, 1.0);
+      return { lo, hi, succ, agility };
+    }
+
+    let plotGeom = null;
+    const redraw = V4U.canvas(cv, (w) => (w < 420 ? 250 : 285), (ctx, w, h) => {
+      const D = +slD.value, xiR = +slR.value;
+      $('o-s2r-d').textContent = f(D, 2);
+      $('o-s2r-r').textContent = f(xiR, 2);
+      const x0 = 46, y0 = 18, pw = w - 62, ph = h - 46;
+      const P = plotAxes(ctx, x0, y0, pw, ph, [0.1, 1.5], [0, 1], [0.2, 0.5, 0.7, 1.0, 1.3], [0, 0.5, 1], (v) => f(v, 1), (v) => Math.round(v * 100) + '%');
+      plotGeom = { P, x0, pw };
+
+      const cur = evalPolicy(D, xiR);
+      // Shaded training range
+      const sx1 = P.X(max(0.1, cur.lo)), sx2 = P.X(min(1.5, cur.hi));
+      ctx.fillStyle = C('--c1s'); ctx.fillRect(sx1, y0, sx2 - sx1, ph);
+      // Narrow reference curve (D = 0.06)
+      const refPts = [], okPts = [], agPts = [];
+      for (let i = 0; i <= 140; i++) {
+        const xi = 0.1 + (1.4 * i) / 140;
+        const r = evalPolicy(0.06, xi), c = evalPolicy(D, xi);
+        refPts.push([P.X(xi), P.Y(r.succ)]);
+        okPts.push([P.X(xi), P.Y(c.succ)]);
+        agPts.push([P.X(xi), P.Y(c.agility)]);
+      }
+      dashed(ctx, () => polyline(ctx, refPts, C('--line-2'), 1.8));
+      polyline(ctx, agPts, C('--c3'), 2.0);
+      polyline(ctx, okPts, C('--c1'), 2.8);
+
+      // Vertical line for xi_real
+      const rx = P.X(xiR);
+      ctx.strokeStyle = C('--c2'); ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(rx, y0); ctx.lineTo(rx, y0 + ph); ctx.stroke();
+      dot(ctx, rx, P.Y(cur.succ), 5.5, C('--c2'));
+      ctx.fillStyle = C('--c2'); ctx.font = mono(11); ctx.textAlign = rx > w - 90 ? 'right' : 'left';
+      ctx.fillText(`ξ_real = ${f(xiR, 2)}`, rx + (rx > w - 90 ? -6 : 6), y0 + 13);
+      ctx.textAlign = 'left';
+
+      const inside = xiR >= cur.lo && xiR <= cur.hi;
+      const narrow = evalPolicy(0.06, xiR);
+      rd.innerHTML =
+        `<span>训练区间 <b>[${f(cur.lo, 2)}, ${f(cur.hi, 2)}]</b>（真机${inside ? '在区间内' : '<b>超出区间</b>'}）</span>` +
+        `<span>真机成功率 <b>${Math.round(cur.succ * 100)}%</b>（窄 DR 参照 ${Math.round(narrow.succ * 100)}%）</span>` +
+        `<span>相对速度/敏捷度 <b>${Math.round(cur.agility * 100)}%</b></span>`;
+    });
+
+    slD.addEventListener('input', redraw);
+    slR.addEventListener('input', redraw);
+    V4U.drag(cv, (x) => {
+      if (!plotGeom) return;
+      const xi = 0.1 + ((x - plotGeom.x0) / plotGeom.pw) * 1.4;
+      slR.value = V4U.clamp(xi, 0.15, 1.45);
+      redraw();
+    });
+    $('bt-s2r-adr').addEventListener('click', (e) => {
+      if (anim) { anim.stop(); anim = null; e.target.textContent = '演示 ADR 扩宽'; return; }
+      slD.value = 0.04; e.target.textContent = '暂停 ADR';
+      anim = V4U.loop(slD, (t, dt) => {
+        let v = +slD.value + dt * 0.11;
+        if (v >= 0.42) { v = 0.42; anim.stop(); anim = null; e.target.textContent = '演示 ADR 扩宽'; }
+        slD.value = v; redraw();
+      });
+    });
+  }
+
+  // =========================================================================
+  // 6. #teacher-student: Privileged friction vs Student k-step online estimation
+  // =========================================================================
+  {
+    const slK = $('sl-ts-k'), slNs = $('sl-ts-ns'), rd = $('rd-ts');
+    const L = 120;
+    let mode = 'step', seed = 42;
+
+    function genSignal(curMode, curSeed) {
+      const r = rngOf(curSeed * 53 + (curMode === 'step' ? 1 : 9));
+      const g = gaussOf(r);
+      const truth = new Float64Array(L), noise = new Float64Array(L);
+      for (let t = 0; t < L; t++) {
+        truth[t] = curMode === 'const' ? 0.68 : (t < 40 ? 0.85 : t < 82 ? 0.25 : 0.65);
+        noise[t] = g();
+      }
+      return { truth, noise };
+    }
+
+    function estimate(sig, k, ns) {
+      const est = new Float64Array(L);
+      let se = 0, steadySe = 0, steadyN = 0;
+      for (let t = 0; t < L; t++) {
+        const a = max(0, t - k + 1), cnt = t - a + 1;
+        let s = 0;
+        for (let j = a; j <= t; j++) s += sig.truth[j] + sig.noise[j] * ns;
+        est[t] = s / cnt;
+        const err = est[t] - sig.truth[t];
+        se += err * err;
+        if (t >= 15 && t < 38) { steadySe += err * err; steadyN++; }
+      }
+      // Steps after t=40 ice drop until |est - 0.25| < 0.08
+      let lag = 0;
+      if (mode === 'step') {
+        for (let t = 40; t < 80; t++) { if (abs(est[t] - 0.25) < 0.08) break; lag++; }
+      }
+      return { est, rmse: sqrt(se / L), steadyRmse: sqrt(steadySe / max(1, steadyN)), lag };
+    }
+
+    let sig = genSignal(mode, seed);
+    const H = (w) => (w < 420 ? 225 : 250);
+
+    const drawEst = V4U.canvas($('cv-ts-est'), H, (ctx, w, h) => {
+      const k = +slK.value, ns = +slNs.value;
+      $('o-ts-k').textContent = k;
+      $('o-ts-ns').textContent = f(ns, 2);
+      const cur = estimate(sig, k, ns), small = estimate(sig, 2, ns);
+      const P = plotAxes(ctx, 40, 14, w - 52, h - 38, [0, L - 1], [0, 1.2], [0, 40, 80, 120], [0, 0.4, 0.8, 1.2], (v) => v, (v) => f(v, 1));
+      // Highlight sliding window at t=52 (just after stepping onto ice)
+      const tRef = 52;
+      ctx.fillStyle = C('--c1s');
+      ctx.fillRect(P.X(max(0, tRef - k + 1)), 14, P.X(tRef) - P.X(max(0, tRef - k + 1)), h - 38);
+      ctx.globalAlpha = 0.45;
+      polyline(ctx, Array.from(small.est, (v, t) => [P.X(t), P.Y(V4U.clamp(v, 0, 1.2))]), C('--c2'), 1.3);
+      ctx.globalAlpha = 1;
+      polyline(ctx, Array.from(sig.truth, (v, t) => [P.X(t), P.Y(v)]), C('--c4'), 2.4);
+      polyline(ctx, Array.from(cur.est, (v, t) => [P.X(t), P.Y(V4U.clamp(v, 0, 1.2))]), C('--c1'), 2.4);
+
+      // Find best k
+      let bestK = 1, bestE = 1e9;
+      for (let kk = 1; kk <= 36; kk++) {
+        const e = estimate(sig, kk, ns).rmse;
+        if (e < bestE) { bestE = e; bestK = kk; }
+      }
+      rd.innerHTML =
+        `<span>整体 RMSE <b>${f(cur.rmse, 3)}</b>（最优 k* = <b>${bestK}</b>，RMSE ${f(bestE, 3)}）</span>` +
+        `<span>稳态 RMSE <b>${f(cur.steadyRmse, 3)}</b></span>` +
+        (mode === 'step' ? `<span>踩冰后恢复滞后 <b>${cur.lag}</b> 步</span>` : `<span>恒定地面无突变滞后</span>`);
+    });
+
+    const drawU = V4U.canvas($('cv-ts-u'), H, (ctx, w, h) => {
+      const k = +slK.value, ns = +slNs.value;
+      const ks = [];
+      let ymax = 0.1;
+      for (let kk = 1; kk <= 36; kk++) {
+        const e = estimate(sig, kk, ns).rmse;
+        ks.push([kk, e]); ymax = max(ymax, e);
+      }
+      ymax = max(0.18, Math.ceil(ymax * 10) / 10);
+      const P = plotAxes(ctx, 44, 14, w - 56, h - 38, [1, 36], [0, ymax], [1, 10, 20, 30, 36], [0, ymax / 2, ymax], (v) => v, (v) => f(v, 2));
+      polyline(ctx, ks.map(([kk, e]) => [P.X(kk), P.Y(e)]), C('--c1'), 2.4);
+      const curE = ks[k - 1][1];
+      dot(ctx, P.X(k), P.Y(curE), 5.5, C('--c3'));
+    });
+
+    const redraw = () => { drawEst(); drawU(); };
+    slK.addEventListener('input', redraw);
+    slNs.addEventListener('input', redraw);
+    V4U.seg($('sg-ts'), (v) => { mode = v; sig = genSignal(mode, seed); redraw(); });
+    $('bt-ts-rs').addEventListener('click', () => { seed++; sig = genSignal(mode, seed); redraw(); });
+  }
+
+  // =========================================================================
+  // 7. #vla-rl: Flow ODE vs Flow-SDE denoising trajectories + SFT->RL bar chart
+  // =========================================================================
+  {
+    const slEta = $('sl-sde-eta'), rd = $('rd-vlarl');
+    let seed = 11;
+    const K = 10;
+
+    const H = (w) => (w < 420 ? 230 : 260);
+    const drawSde = V4U.canvas($('cv-vla-sde'), H, (ctx, w, h) => {
+      const eta = +slEta.value;
+      $('o-sde-eta').textContent = f(eta, 2);
+      const r = rngOf(seed * 71), g = gaussOf(r);
+      const P = plotAxes(ctx, 40, 14, w - 52, h - 38, [0, 1], [-1.3, 1.3], [0, 0.2, 0.5, 0.8, 1.0], [-1, 0, 1], (v) => 'τ=' + f(v, 1), (v) => f(v, 1));
+      // ODE path from x0 = -0.75 to target a* = +0.65
+      const odePts = [];
+      for (let k = 0; k <= K; k++) {
+        const tau = k / K;
+        const x = -0.75 + 1.40 * (tau + 0.14 * sin(PI * tau));
+        odePts.push([P.X(tau), P.Y(x)]);
+      }
+      // 8 SDE stochastic paths
+      const endVals = [];
+      const dt = 1 / K;
+      for (let m = 0; m < 8; m++) {
+        let x = -0.75;
+        const pts = [[P.X(0), P.Y(x)]];
+        for (let k = 0; k < K; k++) {
+          const tau = k / K;
+          const xNextOde = -0.75 + 1.40 * ((k + 1) / K + 0.14 * sin(PI * (k + 1) / K));
+          const xCurOde = -0.75 + 1.40 * (tau + 0.14 * sin(PI * tau));
+          // Mean-reverting velocity field + SDE Brownian diffusion
+          const drift = (xNextOde - xCurOde) - 0.35 * (x - xCurOde) * dt;
+          x = x + drift + eta * sqrt(dt) * g();
+          pts.push([P.X((k + 1) / K), P.Y(V4U.clamp(x, -1.28, 1.28))]);
+        }
+        endVals.push(x);
+        ctx.globalAlpha = 0.65;
+        polyline(ctx, pts, C('--c1'), 1.6);
+        dot(ctx, pts[K][0], pts[K][1], 2.8, C('--c1'));
+        ctx.globalAlpha = 1;
+      }
+      // Gaussian transition circles along ODE backbone to show tractable step transitions
+      if (eta > 0) {
+        const radY = (eta * sqrt(dt) / 2.6) * (h - 38);
+        ctx.strokeStyle = C('--c1'); ctx.fillStyle = C('--c1s'); ctx.globalAlpha = 0.5;
+        for (let k = 2; k <= K; k += 2) {
+          ctx.beginPath(); ctx.ellipse(odePts[k][0], odePts[k][1], 4, max(3, radY), 0, 0, 2 * PI); ctx.fill(); ctx.stroke();
+        }
+        ctx.globalAlpha = 1;
+      }
+      dashed(ctx, () => polyline(ctx, odePts, C('--muted'), 2.2));
+      const meanE = endVals.reduce((a, b) => a + b, 0) / endVals.length;
+      const sdE = sqrt(endVals.reduce((a, b) => a + (b - meanE) ** 2, 0) / endVals.length);
+      rd.innerHTML =
+        `<span>模式 <b>${eta === 0 ? '确定性 ODE（似然难算、无探索）' : 'Flow-SDE（每步高斯转移可算 log π）'}</b></span>` +
+        `<span>单步转移标准差 <b>${f(eta * sqrt(dt), 3)}</b></span>` +
+        `<span>终态动作采样分散度 σ <b>${f(sdE, 3)}</b></span>`;
+    });
+
+    const drawBar = V4U.canvas($('cv-vla-bar'), H, (ctx, w, h) => {
+      const compact = w < 420;
+      const data = [
+        { name: compact ? 'SVLA\nLIBERO' : 'SimpleVLA\nLIBERO 4套', sft: 91.0, rl: 99.1 },
+        { name: compact ? 'SVLA\n1-demo' : 'SimpleVLA\n1-demo', sft: 17.3, rl: 91.7 },
+        { name: compact ? 'πRL(π0)\nLIBERO' : 'πRL (π0)\nLIBERO', sft: 57.6, rl: 97.6 },
+        { name: compact ? 'πRL(0.5)\nLIBERO' : 'πRL (π0.5)\nLIBERO', sft: 77.1, rl: 98.3 },
+        { name: compact ? 'πRL(0.5)\nManiSkill' : 'πRL (π0.5)\nManiSkill', sft: 40.0, rl: 84.8 }
+      ];
+      const x0 = 36, y0 = 16, pw = w - 46, ph = h - 54;
+      const P = plotAxes(ctx, x0, y0, pw, ph, [0, data.length], [0, 100], [], [0, 50, 100], (v) => v, (v) => v + '%');
+      const grpW = pw / data.length;
+      const bw = min(22, grpW * 0.34);
+      data.forEach((d, i) => {
+        const cx = x0 + (i + 0.5) * grpW;
+        const yS = P.Y(d.sft), yR = P.Y(d.rl);
+        ctx.fillStyle = C('--c4'); ctx.fillRect(cx - bw - 2, yS, bw, y0 + ph - yS);
+        ctx.fillStyle = C('--c3'); ctx.fillRect(cx + 2, yR, bw, y0 + ph - yR);
+        ctx.font = mono(compact ? 9 : 9.5); ctx.textAlign = 'center';
+        ctx.fillStyle = C('--ink-2'); ctx.fillText(f(d.sft, 0), cx - bw / 2 - 2, yS - 4);
+        ctx.fillStyle = C('--ink'); ctx.fillText(f(d.rl, 0), cx + bw / 2 + 2, yR - 4);
+        const lines = d.name.split('\n');
+        ctx.fillStyle = C('--muted'); ctx.font = bodyF(compact ? 9.5 : 10.5);
+        ctx.fillText(lines[0], cx, y0 + ph + 13);
+        ctx.fillText(lines[1], cx, y0 + ph + 26);
+      });
+      ctx.textAlign = 'left';
+    });
+
+    slEta.addEventListener('input', drawSde);
+    $('bt-sde-rs').addEventListener('click', () => { seed++; drawSde(); });
+  }
+});
+</script>
+</body>
+</html>

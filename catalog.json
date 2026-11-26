@@ -6,7 +6,7 @@
       "no": "1",
       "title": "机器人学",
       "en": "Robotics",
-      "summary": "动作用什么坐标表示，关节空间和末端空间怎么换算，相机怎样把三维世界投到像素上。"
+      "summary": "动作用什么坐标表示，关节空间和末端空间怎么换算，相机怎样把三维世界投到像素上；π 系列 VLA 怎么建模和训练动作，动作块怎样实时衔接执行，以及仿真里的 RL 和采数据做行为克隆有什么不同。"
     },
     {
       "id": "vision3d",
@@ -57,6 +57,33 @@
       "short": "相机",
       "en": "Camera Models & Calibration",
       "summary": "针孔模型、内参与畸变、外参、各家坐标系约定、张正友标定、手眼标定和深度反投影。"
+    },
+    {
+      "slug": "pi-series",
+      "section": "robotics",
+      "no": "iv",
+      "title": "π 系列 VLA",
+      "short": "π 系列",
+      "en": "The π Series: π0 → π*0.6",
+      "summary": "flow matching 动作专家、FAST 动作 token、π0.5 的异构数据与分层推理、知识隔离，以及 π*0.6 用优势条件化做 RL。"
+    },
+    {
+      "slug": "rtc",
+      "section": "robotics",
+      "no": "v",
+      "title": "实时分块执行（RTC）",
+      "short": "RTC",
+      "en": "Real-Time Chunking",
+      "summary": "推理有延迟时动作块怎么衔接：同步执行、时间集成、异步队列，推理期 RTC 的冻结前缀与软掩码引导，训练期 RTC 的前缀条件化。"
+    },
+    {
+      "slug": "sim-rl",
+      "section": "robotics",
+      "no": "vi",
+      "title": "仿真 RL 与行为克隆",
+      "short": "仿真 RL",
+      "en": "RL in Simulation vs. Behavior Cloning",
+      "summary": "仿真 RL 具体怎么做（并行环境、奖励、域随机化、教师-学生蒸馏），为什么要做，和采数据训 VLA 的行为克隆差在哪里，以及两者怎么结合。"
     },
     {
       "slug": "3d-representations",
