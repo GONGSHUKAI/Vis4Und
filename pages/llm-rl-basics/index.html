@@ -1,0 +1,870 @@
+<!doctype html>
+<html lang="zh-CN" data-sec="agentic-rl">
+<head>
+<!-- v4u:head -->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="icon" href="data:,">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700&family=Inter+Tight:wght@700&family=JetBrains+Mono:wght@400;700&family=Noto+Sans+SC:wght@400;700&display=swap">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<link rel="stylesheet" href="../../assets/v4u.css?v=4288b6c4">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
+<script src="../../assets/v4u.js?v=d6640e00"></script>
+<!-- /v4u:head -->
+<title>LLM 强化学习基础 · Vis4Und</title>
+<meta name="description" content="把一次生成看成一条轨迹：策略梯度、基线与优势、PPO 的 clip、GAE、KL、GRPO 及 DAPO / RLOO / REINFORCE++ / GSPO / CISPO，以及异步训练、训推不一致、熵塌缩。">
+<style>
+.traj{display:flex;flex-wrap:wrap;gap:6px;align-items:stretch;margin:0 0 12px}
+.tok{display:inline-flex;flex-direction:column;align-items:center;justify-content:center;border:1px solid var(--line-2);border-radius:6px;padding:4px 9px;font:400 13px/1.35 var(--f-mono);background:var(--surface-2);color:var(--ink)}
+.tok small{font-size:11px;color:var(--muted)}
+.tok.prompt{background:var(--c1s);border-color:var(--c1)}
+.tok.win{background:var(--ok-soft);border-color:var(--ok)}
+.tok.lose{background:var(--bad-soft);border-color:var(--bad)}
+.cands{display:grid;gap:6px}
+.cand{display:grid;grid-template-columns:7em minmax(0,1fr) auto;align-items:center;gap:10px;text-align:left;font:400 13px/1.3 var(--f-mono);color:var(--ink);background:transparent;border:1px solid var(--line);border-radius:6px;padding:7px 9px;cursor:pointer}
+.cand:hover{border-color:var(--accent)}
+.cand .bar{height:10px;background:var(--surface-2);border-radius:3px;overflow:hidden}
+.cand .bar i{display:block;height:100%;background:var(--accent)}
+.cand .qa{color:var(--ink-2);font-size:12px;white-space:nowrap;text-align:right}
+.cands-h{font:400 12px/1.4 var(--f-mono);color:var(--muted);margin:0 0 6px}
+@media (max-width:520px){.cand{grid-template-columns:6em minmax(0,1fr)}.cand .qa{grid-column:1/-1;text-align:left}}
+.viz-stage+.viz-stage.full{border-top:1px solid var(--line)}
+.nscroll{overflow-x:auto;max-width:100%}
+/* wide comparison tables scroll sideways on phones instead of squeezing columns */
+@media (max-width:760px){.tbl table.wide{min-width:620px}.tbl table.xwide{min-width:1100px}}
+/* keep KaTeX's absolutely positioned MathML inside the scroll box (otherwise wide display math widens the page on phones) */
+.katex-display,.eq,.tbl,.nscroll{position:relative}
+</style>
+</head>
+<body>
+<!-- v4u:nav -->
+<nav class="v4u-nav" aria-label="站点导航"><div class="v4u-nav-in"><span class="v4u-crumb"><a href="../../"><b>Vis4Und</b></a><span class="v4u-sep">/</span><a href="../../#agentic-rl">(3) Agentic RL</a></span><span class="v4u-links"><a href="../llm-rl-basics/" aria-current="page">补充 RL 基础</a><a href="../coding-agent/">(i) Coding Agent</a><a href="../robot-use-agent/">(ii) Robot-Use Agent</a><button type="button" class="v4u-theme" aria-label="切换深浅色">深色</button></span></div></nav>
+<!-- /v4u:nav -->
+
+<header class="hero"><div class="wrap">
+  <p class="kicker">(3) Agentic RL · 补充</p>
+  <h1>LLM 强化学习基础</h1>
+  <p class="lede">把一次生成看成一条轨迹，奖励只在最后给一次。这一页从策略梯度推到 PPO 和 GRPO，再看 DAPO、RLOO、REINFORCE++、GSPO、CISPO 各改了哪一项，以及大规模训练时真正会出的问题。后面两篇（<a href="../coding-agent/">coding agent</a>、<a href="../robot-use-agent/">robot-use agent</a>）都建立在这里的记号上。</p>
+  <p class="asks-h">读完能回答</p>
+  <ul class="asks">
+    <li>一条回答的奖励怎样变成每个 token 的梯度？基线为什么能减方差而不引入偏差？</li>
+    <li>PPO 的 clip 在哪几种情况下让梯度变成 0？</li>
+    <li>GRPO 为什么不需要 value model？一组回答全对时会发生什么？</li>
+    <li>为什么「先对 token 求平均、再对序列求平均」会让错误回答越写越长？</li>
+    <li>异步 rollout 和训推引擎不一致，为什么都要靠重要性采样修正？</li>
+  </ul>
+</div></header>
+
+<div class="wrap layout">
+<nav class="toc" id="toc" aria-label="本页目录"></nav>
+<main>
+
+<section id="mdp">
+  <h2 data-toc="生成即 MDP">把生成看成一个 MDP</h2>
+  <p class="def"><b>Token 级 MDP</b>：状态 $s_t=(x,y_{&lt;t})$ 是提示加上已生成的 token，动作 $a_t=y_t$ 是下一个 token，转移是确定的拼接 $s_{t+1}=(x,y_{\le t})$，奖励通常只在生成结束时给一次 $R(x,y)$。</p>
+
+  <table class="notation">
+    <caption>记号（全页通用）</caption>
+    <thead><tr><th>符号</th><th>含义</th><th>形状</th></tr></thead>
+    <tbody>
+      <tr><td>$x$</td><td>提示（prompt）</td><td>序列</td></tr>
+      <tr><td>$y=(y_1,\dots,y_T)$</td><td>一条回答，也就是一条轨迹；$T=|y|$</td><td>序列</td></tr>
+      <tr><td>$s_t=(x,y_{&lt;t})$</td><td>第 $t$ 步的状态</td><td>前缀</td></tr>
+      <tr><td>$\pi_\theta(y_t\mid s_t)$</td><td>策略 = 语言模型的 next-token 分布</td><td>$|\mathcal V|$ 维</td></tr>
+      <tr><td>$R(x,y)$</td><td>序列奖励：验证器（答案对不对、测试过没过）或奖励模型给出</td><td>标量</td></tr>
+      <tr><td>$r_t$</td><td>第 $t$ 步的即时奖励；稀疏时 $r_t=0\ (t&lt;T)$，$r_T=R$</td><td>标量</td></tr>
+      <tr><td>$V^\pi(s)$</td><td>从 $s$ 出发按 $\pi$ 继续生成，得到的期望奖励</td><td>标量</td></tr>
+      <tr><td>$Q^\pi(s,a)$</td><td>先选 $a$，之后按 $\pi$ 生成的期望奖励</td><td>标量</td></tr>
+      <tr><td>$A^\pi(s,a)$</td><td>优势 $Q^\pi(s,a)-V^\pi(s)$：这个动作比平均好多少</td><td>标量</td></tr>
+      <tr><td>$\gamma$</td><td>折扣因子，LLM 里一般取 $1$</td><td>标量</td></tr>
+    </tbody>
+  </table>
+
+  <p>整条回答的对数概率是逐 token 对数概率之和，一次 teacher-forcing 前向就能算出全部 $T$ 项，和算 SFT loss 完全一样：</p>
+  <div class="eq">$$\log\pi_\theta(y\mid x)=\sum_{t=1}^{T}\log\pi_\theta(y_t\mid x,y_{&lt;t})$$</div>
+  <p>转移确定、中间奖励为 0 时，$Q(s_t,a_t)=V(s_{t+1})$，所以一个 token 的优势就是它让「最终答对的概率」涨了多少：$A(s_t,a_t)=V(s_{t+1})-V(s_t)$。</p>
+
+  <figure class="viz" id="viz-mdp">
+    <div class="viz-h"><b>一步一步生成：状态、动作、价值</b><span>题目 17+25=?，答 42 得 1 分</span></div>
+    <div class="viz-stage">
+      <div class="traj" id="mdp-traj"></div>
+      <p class="cands-h" id="mdp-ch">下一个动作的分布 π(· | s_t)，点一行即选这个动作</p>
+      <div class="cands" id="mdp-cands"></div>
+    </div>
+    <div class="viz-ctrl">
+      <button type="button" class="btn" id="mdp-step">按 π 采样一步</button>
+      <button type="button" class="btn ghost" id="mdp-run">采样到结束</button>
+      <button type="button" class="btn ghost" id="mdp-reset">重来</button>
+    </div>
+    <div class="viz-read" id="mdp-read"></div>
+    <figcaption>为了看得清，这里一个「token」是一小段文字。每行右侧是选这个动作后的 $Q(s_t,a)=V(s_{t+1})$ 和优势 $A=Q-V(s_t)$，按整棵树精确算出。整条轨迹的 $\log\pi(y\mid x)$ 逐步累加；奖励只在最后一步出现。</figcaption>
+  </figure>
+</section>
+
+<section id="pg">
+  <h2>策略梯度</h2>
+  <p>目标是最大化期望奖励 $J(\theta)=\mathbb E_{x\sim\mathcal D}\,\mathbb E_{y\sim\pi_\theta(\cdot\mid x)}[R(x,y)]$。采样这一步不可导，靠 log-derivative trick 绕过去。</p>
+  <ol class="derive">
+    <li><p>固定 $x$，期望写成对所有回答的求和：</p>$$J=\sum_{y}\pi_\theta(y\mid x)\,R(x,y)$$</li>
+    <li><p>求导；$R$ 由验证器给出，和 $\theta$ 无关：</p>$$\nabla_\theta J=\sum_y \nabla_\theta\pi_\theta(y\mid x)\,R(x,y)$$</li>
+    <li><p>用 $\nabla\pi=\pi\,\nabla\log\pi$，求和又变回期望，于是可以用采样估计：</p>$$\nabla_\theta J=\sum_y\pi_\theta(y\mid x)\,\nabla_\theta\log\pi_\theta(y\mid x)\,R=\mathbb E_{y\sim\pi_\theta}\big[R(x,y)\,\nabla_\theta\log\pi_\theta(y\mid x)\big]$$</li>
+    <li><p>序列对数概率拆成 token 之和：</p>$$\nabla_\theta J=\mathbb E\Big[R(x,y)\sum_{t=1}^{T}\nabla_\theta\log\pi_\theta(y_t\mid s_t)\Big]$$</li>
+    <li><p>采 $N$ 条回答做蒙特卡洛估计，这就是 REINFORCE；实现上把 $-R_i\log\pi_\theta(y_i\mid x)$ 当 loss 反传即可：</p>$$\hat g=\frac1N\sum_{i=1}^{N}R_i\sum_{t}\nabla_\theta\log\pi_\theta(y_{i,t}\mid s_{i,t})$$</li>
+    <li><p>减去只依赖状态的基线 $b(s_t)$ 不改变期望，因为得分函数的期望为 0：</p>$$\mathbb E_{a\sim\pi}\big[b(s_t)\nabla_\theta\log\pi_\theta(a\mid s_t)\big]=b(s_t)\sum_a\nabla_\theta\pi_\theta(a\mid s_t)=b(s_t)\,\nabla_\theta 1=0$$</li>
+    <li><p>$y_t$ 影响不到它之前的奖励，$R$ 可换成从 $t$ 起的回报（reward-to-go），其条件期望是 $Q$；再减基线 $V(s_t)$，权重就是优势：</p>$$\nabla_\theta J=\mathbb E\Big[\sum_{t}A^\pi(s_t,a_t)\,\nabla_\theta\log\pi_\theta(a_t\mid s_t)\Big]$$</li>
+  </ol>
+  <div class="note"><b>和 SFT 的关系</b><p>SFT 的梯度是 $\nabla\log\pi_\theta(y^\star\mid x)$，相当于在示范数据上取 $A\equiv1$ 的策略梯度。RL 在模型自己的样本上用优势加权，优势有正有负：好样本被拉高，差样本被压低。</p></div>
+
+  <figure class="viz" id="viz-base">
+    <div class="viz-h"><b>基线不改期望，只改方差</b><span>4 个答案的 softmax 策略，梯度投影到前两个 logit</span></div>
+    <div class="viz-grid">
+      <div class="viz-stage"><canvas id="cv-cloud" aria-label="多次批量梯度估计的散点云和真实梯度"></canvas></div>
+      <div class="viz-stage"><canvas id="cv-var" aria-label="梯度估计的方差随基线 b 变化的曲线"></canvas></div>
+    </div>
+    <div class="viz-ctrl">
+      <label for="sl-b">基线 b <input type="range" id="sl-b" min="-0.5" max="1.5" step="0.01" value="0"><output id="o-b">0.00</output></label>
+      <label for="sl-n">批大小 N <input type="range" id="sl-n" min="1" max="32" step="1" value="8"><output id="o-n">8</output></label>
+      <button type="button" class="btn ghost" id="bt-resamp">重新采样</button>
+    </div>
+    <div class="viz-read" id="rd-base"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>一次批量估计 ĝ（共 300 次）</li><li><i style="background:var(--c2)"></i>真实梯度 ∇J</li><li><i style="background:var(--c3)"></i>方差曲线 tr Cov(ĝ)</li><li><i style="background:var(--muted)"></i>b = E[R]</li></ul>
+    <figcaption>奖励 $R=(1,\,0.2,\,0.6,\,0)$。拖动 $b$：云的中心始终压在真实梯度上（无偏），云的大小随 $b$ 变。单样本估计是 $(R(a)-b)(\mathbf e_a-\pi)$，方差是 $b$ 的二次函数，最低点 $b^\star=\mathbb E[R\lVert\mathbf e_a-\pi\rVert^2]/\mathbb E[\lVert\mathbf e_a-\pi\rVert^2]$，离 $\mathbb E[R]$ 很近。实际做法就是估计 $\mathbb E[R]$：PPO 用 value model，GRPO 用同一提示下一组样本的平均。</figcaption>
+  </figure>
+</section>
+
+<section id="ppo">
+  <h2>PPO：重要性比值与 clip</h2>
+  <p>一批 rollout 很贵，希望拆成多个 mini-batch 更新好几步。第一步之后 $\theta\neq\theta_{\text{old}}$，样本就变成了「旧策略」采的，需要重要性采样纠正，同时限制每次走多远。</p>
+  <table class="notation">
+    <caption>记号</caption>
+    <thead><tr><th>符号</th><th>含义</th><th>形状</th></tr></thead>
+    <tbody>
+      <tr><td>$\pi_{\theta_\text{old}}$</td><td>采样时的策略（行为策略）</td><td>—</td></tr>
+      <tr><td>$\rho_t$</td><td>重要性比值 $\pi_\theta(y_t\mid s_t)/\pi_{\theta_\text{old}}(y_t\mid s_t)$；论文里常写 $r_t(\theta)$，本页用 $\rho$ 以免和奖励混淆</td><td>标量，每个 token 一个</td></tr>
+      <tr><td>$\hat A_t$</td><td>优势估计（PPO 用 GAE，GRPO 用组内归一化）</td><td>标量，每个 token 一个</td></tr>
+      <tr><td>$\epsilon$</td><td>clip 半径，常用 $0.2$</td><td>标量</td></tr>
+    </tbody>
+  </table>
+  <ol class="derive">
+    <li><p>重要性采样：在 $\pi_{\text{old}}$ 的样本上估计 $\pi_\theta$ 下的期望：</p>$$\mathbb E_{a\sim\pi_\theta}[f(a)]=\mathbb E_{a\sim\pi_{\text{old}}}\Big[\frac{\pi_\theta(a)}{\pi_{\text{old}}(a)}f(a)\Big]$$</li>
+    <li><p>逐 token 套用，忽略状态分布的变化（这是「近似」之处），得到代理目标：</p>$$L(\theta)=\mathbb E_t\big[\rho_t\,\hat A_t\big],\qquad \rho_t=\frac{\pi_\theta(y_t\mid s_t)}{\pi_{\theta_\text{old}}(y_t\mid s_t)}$$</li>
+    <li><p>在 $\theta=\theta_\text{old}$ 处它的梯度正好是策略梯度，因为 $\rho=1$ 且：</p>$$\nabla_\theta\rho_t\big|_{\theta_\text{old}}=\frac{\nabla_\theta\pi_\theta(y_t\mid s_t)}{\pi_{\theta_\text{old}}(y_t\mid s_t)}\Big|_{\theta_\text{old}}=\nabla_\theta\log\pi_\theta(y_t\mid s_t)\big|_{\theta_\text{old}}$$</li>
+    <li><p>离 $\theta_\text{old}$ 越远近似越差。PPO 把比值截到 $[1-\epsilon,1+\epsilon]$，再和不截的取较小者（悲观的那个）：</p>$$L^{\text{CLIP}}(\theta)=\mathbb E_t\Big[\min\big(\rho_t\hat A_t,\ \operatorname{clip}(\rho_t,1-\epsilon,1+\epsilon)\,\hat A_t\big)\Big]$$</li>
+    <li><p>$\hat A_t&gt;0$：$\rho_t&gt;1+\epsilon$ 时取到常数 $(1+\epsilon)\hat A_t$，梯度为 0，这个 token 的概率已经涨够了；$\rho_t$ 小于 1 时不截，照常往上推。</p>$$\hat A_t&gt;0:\quad L_t=\min\big(\rho_t,\,1+\epsilon\big)\hat A_t$$</li>
+    <li><p>$\hat A_t&lt;0$：$\rho_t&lt;1-\epsilon$ 时取到常数 $(1-\epsilon)\hat A_t$，梯度为 0；但 $\rho_t$ 很大时不截，惩罚随 $\rho_t$ 线性变大。dual-clip 再加一个下界 $c\hat A_t$（$c&gt;1$）防止这一端发散。</p>$$\hat A_t&lt;0:\quad L_t=\max\big(\rho_t,\,1-\epsilon\big)\hat A_t\quad(\text{dual-clip: } \max(L_t,\,c\hat A_t))$$</li>
+  </ol>
+
+  <figure class="viz" id="viz-clip">
+    <div class="viz-h"><b>clip 后的单 token 目标 L 随比值 ρ 的变化</b><span>左 Â = +1，右 Â = −1</span></div>
+    <div class="viz-grid">
+      <div class="viz-stage"><canvas id="cv-clip-p" aria-label="正优势时的 clip 目标曲线"></canvas></div>
+      <div class="viz-stage"><canvas id="cv-clip-n" aria-label="负优势时的 clip 目标曲线"></canvas></div>
+    </div>
+    <div class="viz-ctrl">
+      <label for="sl-rho">ρ <input type="range" id="sl-rho" min="0" max="3.5" step="0.01" value="1.35"><output id="o-rho">1.35</output></label>
+      <label for="sl-el">ε<sub>low</sub> <input type="range" id="sl-el" min="0.05" max="0.5" step="0.01" value="0.2"><output id="o-el">0.20</output></label>
+      <label for="sl-eh">ε<sub>high</sub> <input type="range" id="sl-eh" min="0.05" max="0.5" step="0.01" value="0.2"><output id="o-eh">0.20</output></label>
+      <label><input type="checkbox" id="ck-dual"> dual-clip c = 3</label>
+    </div>
+    <div class="viz-read" id="rd-clip"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>clip 后的目标 L(ρ)</li><li><i style="background:var(--line-2)"></i>未截断的 ρÂ</li><li><i style="background:var(--warn-soft)"></i>梯度为 0 的区间</li><li><i style="background:var(--c2)"></i>当前 ρ</li></ul>
+    <figcaption>把 $\epsilon_\text{high}$ 调到 $0.28$ 就是 DAPO 的 Clip-Higher：正优势一侧多留一点空间，低概率 token 的概率能涨得更多。每批只更新一步（严格 on-policy）时 $\rho\equiv1$，clip 永远不触发，PPO 退化成带优势的 REINFORCE。</figcaption>
+  </figure>
+  <div class="note"><b>实现细节</b><p>$\rho_t=\exp(\log\pi_\theta-\log\pi_{\text{old}})$。$\log\pi_\text{old}$ 在 rollout 结束后用训练引擎重新前向一遍得到，而不是直接用推理引擎返回的 logprob，原因见<a href="#practice">实践问题</a>。训练日志里的 clip fraction 是被截断 token 的比例，太大说明每批更新得太猛。</p></div>
+</section>
+
+<section id="gae">
+  <h2>价值模型与 GAE</h2>
+  <p class="def"><b>价值模型（critic）</b> $V_\phi(s_t)$：通常是和策略同规模的 Transformer 加一个标量头，在每个 token 位置输出一个值，回归目标是回报：$L_V=\mathbb E_t\big[(V_\phi(s_t)-\hat R_t)^2\big]$，$\hat R_t=\hat A_t+V_{\phi_\text{old}}(s_t)$。</p>
+  <p>代价是多一份模型的显存和计算；初始化不准时，早期优势全是噪声（VAPO 因此先在固定策略的样本上预训练 value）。有了 $V$，怎样把稀疏奖励分到每个 token，由 GAE 决定。</p>
+  <ol class="derive">
+    <li><p>TD 残差：一步的「惊喜」：</p>$$\delta_t=r_t+\gamma V(s_{t+1})-V(s_t)$$</li>
+    <li><p>往前看 $k$ 步的优势估计，中间的 $V$ 两两抵消：</p>$$\hat A^{(k)}_t=\sum_{l=0}^{k-1}\gamma^l\delta_{t+l}=-V(s_t)+\sum_{l=0}^{k-1}\gamma^l r_{t+l}+\gamma^kV(s_{t+k})$$</li>
+    <li><p>对所有 $k$ 取指数加权平均，权重 $(1-\lambda)\lambda^{k-1}$，整理后是 $\delta$ 的几何加权和：</p>$$\hat A^{\text{GAE}(\gamma,\lambda)}_t=(1-\lambda)\sum_{k\ge1}\lambda^{k-1}\hat A^{(k)}_t=\sum_{l\ge0}(\gamma\lambda)^l\,\delta_{t+l}$$</li>
+    <li><p>两个端点：$\lambda=0$ 只看一步，方差小但完全依赖 $V$ 准不准；$\lambda=1$ 是蒙特卡洛回报减基线，无偏但方差大：</p>$$\lambda=0:\ \hat A_t=\delta_t,\qquad \lambda=1:\ \hat A_t=\sum_{l}\gamma^l r_{t+l}-V(s_t)$$</li>
+    <li><p>实现时从序列末尾往前递推，$O(T)$：</p>$$\hat A_t=\delta_t+\gamma\lambda\,\hat A_{t+1},\qquad \hat A_{T+1}=0$$</li>
+    <li><p>LLM 里 $\gamma=1$，奖励稀疏（若用 KL-in-reward，每步还有 $-\beta\,\mathrm{KL}_t$，见下节）：</p>$$\delta_t=V(s_{t+1})-V(s_t)\ (t&lt;T),\qquad \delta_T=R-V(s_T)$$</li>
+  </ol>
+  <p>RLHF 里的 PPO 常用 $\gamma=1,\ \lambda=0.95$。长思维链的回答有上万个 token，VAPO 把两处 $\lambda$ 分开：训练 value 用 $\lambda_\text{critic}=1$，算策略优势用随长度变化的 $\lambda_\text{policy}=1-\frac{1}{\alpha l}$，$\alpha=0.05$。</p>
+
+  <figure class="viz" id="viz-gae">
+    <div class="viz-h"><b>λ 在偏差和方差之间滑动</b><span>玩具任务：15 步随机游走，终点在 0 右侧得 1 分</span></div>
+    <div class="viz-grid">
+      <div class="viz-stage"><canvas id="cv-gae-tr" aria-label="一条采样轨迹上的价值估计和每步优势"></canvas></div>
+      <div class="viz-stage"><canvas id="cv-gae-bv" aria-label="偏差平方、方差和均方误差随 λ 的曲线"></canvas></div>
+    </div>
+    <div class="viz-ctrl">
+      <label for="sl-lam">λ <input type="range" id="sl-lam" min="0" max="1" step="0.05" value="0.6"><output id="o-lam">0.60</output></label>
+      <label for="sl-cerr">critic 误差 <input type="range" id="sl-cerr" min="0" max="0.5" step="0.01" value="0.25"><output id="o-cerr">0.25</output></label>
+      <button type="button" class="btn ghost" id="bt-gae">重新采样轨迹</button>
+    </div>
+    <div class="viz-read" id="rd-gae"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>critic 估计 V̂(s_t)</li><li><i style="background:var(--muted)"></i>真实 V(s_t)</li><li><i style="background:var(--ok)"></i>Â_t &gt; 0</li><li><i style="background:var(--bad)"></i>Â_t &lt; 0</li><li><i style="background:var(--c2)"></i>偏差²</li><li><i style="background:var(--c3)"></i>方差</li><li><i style="background:var(--c4)"></i>MSE</li></ul>
+    <figcaption>左：一条轨迹上每个 token 的 $\hat A_t$。$\lambda=1$ 时所有 token 共享终点奖励（减去各自的 $\hat V$）；$\lambda=0$ 时只有让价值跳变的那几步拿到大优势。右（对数纵轴）：在所有 $(s_t,a_t)$ 上统计，偏差相对 $Q(s_t,a_t)-\hat V(s_t)$ 计算（只有这部分影响梯度）。critic 误差为 0 时 $\lambda=0$ 最好；critic 越差，MSE 最低点越靠近 1。</figcaption>
+  </figure>
+</section>
+
+<section id="kl">
+  <h2>KL 约束：放进奖励还是放进 loss</h2>
+  <p>为了不让策略离初始模型 $\pi_\text{ref}$（通常是 SFT 模型）太远，有两种加 KL 的位置：</p>
+  <ul>
+    <li><b>KL-in-reward</b>（InstructGPT 式 PPO）：每个 token 的即时奖励减去 $\beta$ 倍的对数比，再经 GAE 进入优势：$r_t=-\beta\log\frac{\pi_\theta(y_t\mid s_t)}{\pi_\text{ref}(y_t\mid s_t)}+\mathbb 1[t=T]\,R$。</li>
+    <li><b>KL-as-loss</b>（GRPO）：优势只来自 $R$，另在 loss 里加 $-\beta\,\hat D_\text{KL}$，逐 token 用 $k_3$ 估计。</li>
+  </ul>
+  <p>采样 $y\sim\pi_\theta$，记 $u=\log\frac{\pi_\text{ref}(y)}{\pi_\theta(y)}$。$\mathrm{KL}(\pi_\theta\Vert\pi_\text{ref})=\mathbb E[-u]$ 有三种单样本估计（Schulman 2020）：</p>
+  <div class="eq">$$k_1=-u,\qquad k_2=\tfrac12u^2,\qquad k_3=(e^{u}-1)-u$$</div>
+  <p>$k_1$ 无偏但会取负、方差大；$k_2$ 有偏、方差小；$k_3$ 无偏（因为 $\mathbb E[e^u]=1$）且恒 $\ge0$。</p>
+
+  <figure class="viz" id="viz-kl">
+    <div class="viz-h"><b>三种 KL 估计量：曲线与样本分布</b><span>π<sub>θ</sub> = N(μ, 1)，π<sub>ref</sub> = N(0, 1)</span></div>
+    <div class="viz-stage"><canvas id="cv-kl" aria-label="k1 k2 k3 关于 log 比值的曲线和样本分布"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="sl-mu">μ <input type="range" id="sl-mu" min="0.1" max="2" step="0.05" value="0.8"><output id="o-mu">0.80</output></label>
+    </div>
+    <div class="viz-read" id="rd-kl"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>k₁</li><li><i style="background:var(--c2)"></i>k₂</li><li><i style="background:var(--c3)"></i>k₃</li><li><i style="background:var(--surface-2)"></i>u 的分布 N(−μ²/2, μ²)</li></ul>
+    <figcaption>真值 $\mathrm{KL}=\mu^2/2$。$\mu$ 小时三者差不多；$\mu$ 变大，$k_2$ 的偏差（$\mu^4/8$）和 $k_3$ 的长尾都出现。</figcaption>
+  </figure>
+
+  <ol class="derive">
+    <li><p>把估计量当 loss 直接求导（样本不回传梯度）得到的未必是 KL 的梯度。记 $\nabla\log\pi_\theta$ 为得分函数，$\nabla_\theta u=-\nabla\log\pi_\theta(y)$：</p>$$\nabla k_1=\nabla\log\pi_\theta,\quad \nabla k_2=-u\,\nabla\log\pi_\theta,\quad \nabla k_3=(1-e^{u})\nabla\log\pi_\theta$$</li>
+    <li><p>对 $y\sim\pi_\theta$ 取期望，用 $\mathbb E[\nabla\log\pi_\theta]=0$ 和 $\mathbb E_{\pi_\theta}[e^u f]=\mathbb E_{\pi_\text{ref}}[f]$：</p>$$\mathbb E\nabla k_1=0,\quad \mathbb E\nabla k_2=\nabla\mathrm{KL}(\pi_\theta\Vert\pi_\text{ref}),\quad \mathbb E\nabla k_3=-\mathbb E_{\pi_\text{ref}}[\nabla\log\pi_\theta]=\nabla\mathrm{KL}(\pi_\text{ref}\Vert\pi_\theta)$$</li>
+  </ol>
+  <p>所以 $k_1$ 当 loss 期望梯度为 0，$k_2$ 给的是 reverse KL 的梯度，GRPO 用的 $k_3$ 给的是 forward KL 的梯度（REINFORCE++ 论文据此改用 $k_2$）。另外，可验证奖励的推理 RL 常常干脆令 $\beta=0$（DAPO 去掉了 KL 项）：模型本来就要走得离初始化很远，而且省掉 $\pi_\text{ref}$ 的前向。</p>
+</section>
+
+<section id="grpo">
+  <h2>GRPO：用组内平均代替 critic</h2>
+  <p class="def"><b>GRPO</b>（Group Relative Policy Optimization，DeepSeekMath 2024 提出，DeepSeek-R1 沿用）：同一个提示采 $G$ 条回答，用组内奖励的均值和标准差把每条回答的奖励变成优势，不要 value model。</p>
+  <table class="notation">
+    <caption>记号</caption>
+    <thead><tr><th>符号</th><th>含义</th><th>形状</th></tr></thead>
+    <tbody>
+      <tr><td>$G$</td><td>每个提示的采样数（组大小），常见 8–64</td><td>整数</td></tr>
+      <tr><td>$y_i,\ R_i$</td><td>第 $i$ 条回答及其奖励</td><td>序列，标量</td></tr>
+      <tr><td>$\hat A_{i,t}$</td><td>第 $i$ 条回答第 $t$ 个 token 的优势；GRPO 里同一条回答的所有 token 相同</td><td>标量</td></tr>
+      <tr><td>$\rho_{i,t}$</td><td>$\pi_\theta(y_{i,t}\mid s_{i,t})/\pi_{\theta_\text{old}}(y_{i,t}\mid s_{i,t})$</td><td>标量</td></tr>
+    </tbody>
+  </table>
+  <div class="eq">$$\mathcal J_\text{GRPO}=\mathbb E\Bigg[\frac1G\sum_{i=1}^{G}\frac1{|y_i|}\sum_{t=1}^{|y_i|}\Big\{\min\big(\rho_{i,t}\hat A_{i,t},\ \operatorname{clip}(\rho_{i,t},1-\epsilon,1+\epsilon)\hat A_{i,t}\big)-\beta\,\hat D_\text{KL}\Big\}\Bigg],\qquad \hat A_{i,t}=\frac{R_i-\operatorname{mean}(R_{1..G})}{\operatorname{std}(R_{1..G})}$$</div>
+  <ol class="derive">
+    <li><p>奖励是 0/1、组内答对比例为 $\hat p$ 时，均值是 $\hat p$，标准差是：</p>$$\operatorname{std}=\sqrt{\hat p(1-\hat p)}$$</li>
+    <li><p>于是答对的回答和答错的回答的优势分别是：</p>$$\hat A^+=\sqrt{\frac{1-\hat p}{\hat p}},\qquad \hat A^-=-\sqrt{\frac{\hat p}{1-\hat p}}$$</li>
+    <li><p>难题（$\hat p$ 小）里偶尔答对的那条拿到很大的正优势；全对或全错（$\hat p\in\{0,1\}$）时分子为 0，这一组没有梯度。真实正确率为 $p$ 时，一组落空的概率是：</p>$$P(\text{零信号})=p^G+(1-p)^G$$</li>
+  </ol>
+
+  <figure class="viz" id="viz-grpo">
+    <div class="viz-h"><b>采一组回答，奖励变成优势</b><span>0/1 奖励</span></div>
+    <div class="viz-grid">
+      <div class="viz-stage"><canvas id="cv-grp" aria-label="一组回答的奖励和归一化后的优势"></canvas></div>
+      <div class="viz-stage"><canvas id="cv-zero" aria-label="一组全对或全错的概率随正确率变化"></canvas></div>
+    </div>
+    <div class="viz-ctrl">
+      <label for="sl-g">G <input type="range" id="sl-g" min="2" max="16" step="1" value="8"><output id="o-g">8</output></label>
+      <label for="sl-p">正确率 p <input type="range" id="sl-p" min="0" max="1" step="0.01" value="0.3"><output id="o-p">0.30</output></label>
+      <div class="seg" id="seg-norm" role="group" aria-label="优势的计算方式"><button type="button" data-v="grpo" aria-pressed="true">GRPO</button><button type="button" data-v="dr">Dr. GRPO</button><button type="button" data-v="rloo">RLOO</button></div>
+      <button type="button" class="btn" id="bt-grp">采样一组</button>
+    </div>
+    <div class="viz-read" id="rd-grp"></div>
+    <ul class="chips"><li><i style="background:var(--ok)"></i>答对 / 正优势</li><li><i style="background:var(--bad)"></i>答错 / 负优势</li><li><i style="background:var(--c1)"></i>当前 G 的零信号概率</li><li><i style="background:var(--line-2)"></i>G = 4、16 作对照</li></ul>
+    <figcaption>把 $p$ 拉到 0 或 1，整组优势全为 0。三种算法只差优势公式：GRPO 除以组内标准差；Dr. GRPO 只减均值；RLOO 减去「其余 $G-1$ 条」的均值。右图说明：太难或太简单的题大多数组都白采了，这正是 DAPO 动态采样要解决的问题。</figcaption>
+  </figure>
+  <div class="note pit"><b>易错</b><p>GRPO 给一条回答里的所有 token 同一个优势，信用分配比 GAE 粗：一条答对的长推理里写错又改对的那几步，也一起被奖励。这对单轮数学题问题不大，到多轮 agent 里就是主要矛盾之一，见 <a href="../coding-agent/#objective">coding agent 的多轮目标</a>。</p></div>
+</section>
+
+<section id="toy">
+  <h2 data-toc="动手：REINFORCE vs GRPO">动手：同一个策略，REINFORCE 和 GRPO 怎么推</h2>
+  <p>一个只有一步的「LLM」：对提示 17+25=? 输出 5 个候选答案之一，策略是 5 个 logit 上的 softmax。每一步从同一提示采 $G$ 个答案，左边用不带基线的 REINFORCE（权重 $R_i$），右边用 GRPO（权重 $\hat A_i$）。只更新一步、$\rho\equiv1$，所以这里 GRPO 就是「组内归一化的 REINFORCE」。</p>
+  <figure class="viz" id="viz-toy">
+    <div class="viz-h"><b>概率质量怎样在答案间移动</b><span>虚线框 = 初始分布</span></div>
+    <div class="viz-grid">
+      <div class="viz-stage"><canvas id="cv-toy-a" aria-label="REINFORCE 训练中的答案概率"></canvas></div>
+      <div class="viz-stage"><canvas id="cv-toy-b" aria-label="GRPO 训练中的答案概率"></canvas></div>
+    </div>
+    <div class="viz-stage full"><canvas id="cv-toy-c" aria-label="期望奖励与熵随训练步数的曲线"></canvas></div>
+    <div class="viz-ctrl">
+      <button type="button" class="btn" id="bt-toy">继续训练</button>
+      <button type="button" class="btn ghost" id="bt-toy-r">从头开始</button>
+      <label for="sl-lr">学习率 <input type="range" id="sl-lr" min="0.05" max="1" step="0.05" value="0.3"><output id="o-lr">0.30</output></label>
+      <label for="sl-tg">G <input type="range" id="sl-tg" min="2" max="16" step="1" value="8"><output id="o-tg">8</output></label>
+      <label><input type="checkbox" id="ck-shift"> 奖励整体 +1</label>
+    </div>
+    <div class="viz-read" id="rd-toy"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>REINFORCE 期望奖励</li><li><i style="background:var(--c2)"></i>GRPO 期望奖励</li><li><i style="background:var(--line-2)"></i>虚线：各自的熵 / ln 5</li><li><i style="background:var(--ok)"></i>正确答案（42 和 42.0 都算对）</li></ul>
+    <figcaption>打开「奖励整体 +1」：REINFORCE 的权重全变成正的，采到什么就推高什么，只靠「对的推得多一点」慢慢前进，曲线明显变慢变抖；GRPO 只看组内相对好坏，对平移不变。再看熵：两个答案都对，GRPO 往往把概率全押到其中一个上，熵掉到接近 0，这就是<a href="#practice">熵塌缩</a>的最小版本。</figcaption>
+  </figure>
+</section>
+
+<section id="agg">
+  <h2>损失怎么聚合：长度偏置</h2>
+  <p>同一个 batch 里回答长短不一。每个 token 的 loss 项 $\ell_{i,t}$（clip 后的 $\rho\hat A$）怎样加起来，决定了长回答和短回答各占多少梯度。</p>
+  <div class="nscroll"><table class="notation">
+    <caption>三种聚合（verl 里的 loss_agg_mode）</caption>
+    <thead><tr><th>名称</th><th>公式</th><th>每个 token 的权重</th></tr></thead>
+    <tbody>
+      <tr><td>seq-mean-token-mean</td><td>$\frac1G\sum_i\frac1{|y_i|}\sum_t\ell_{i,t}$（原始 GRPO）</td><td>$\frac{1}{G\,|y_i|}$，随本条长度变小</td></tr>
+      <tr><td>token-mean</td><td>$\frac{1}{\sum_i|y_i|}\sum_i\sum_t\ell_{i,t}$（DAPO）</td><td>$\frac{1}{\sum_j|y_j|}$，所有 token 一样</td></tr>
+      <tr><td>seq-mean-token-sum-norm</td><td>$\frac{1}{G\,L_\text{max}}\sum_i\sum_t\ell_{i,t}$（Dr. GRPO）</td><td>$\frac{1}{G\,L_\text{max}}$，常数，不随 batch 变</td></tr>
+    </tbody>
+  </table></div>
+  <p>Dr. GRPO（Liu et al. 2025）指出原始 GRPO 有两处偏置并都去掉：一是 $1/|y_i|$：答错（$\hat A&lt;0$）时越长的回答每个 token 被罚得越少，于是错误回答越写越长；答对时越短的回答每个 token 奖励越大。二是除以组内 std：方差小（太易或太难）的题被放大权重。</p>
+
+  <figure class="viz" id="viz-agg">
+    <div class="viz-h"><b>每条回答：宽 = token 数，高 = 每个 token 的梯度权重，面积 = 这条回答的总权重</b><span>一组 4 条，2 对 2 错</span></div>
+    <div class="viz-stage"><canvas id="cv-agg" aria-label="四条回答在不同聚合方式下的每 token 权重"></canvas></div>
+    <div class="viz-ctrl">
+      <div class="seg" id="seg-agg" role="group" aria-label="聚合方式"><button type="button" data-v="seq" aria-pressed="true">seq-mean-token-mean</button><button type="button" data-v="tok">token-mean</button><button type="button" data-v="dr">Dr. GRPO</button></div>
+      <label for="sl-lw">y₄ 长度 <input type="range" id="sl-lw" min="200" max="8000" step="100" value="3000"><output id="o-lw">3000</output></label>
+    </div>
+    <div class="viz-read" id="rd-agg"></div>
+    <ul class="chips"><li><i style="background:var(--ok)"></i>答对，被推高</li><li><i style="background:var(--bad)"></i>答错，被压低</li></ul>
+    <figcaption>seq-mean-token-mean 下每条回答面积相同：$y_4$ 拉得越长，它的矩形越扁，每个错误 token 受到的惩罚越轻。token-mean 和 Dr. GRPO 下所有 token 等高，长的错误回答受到成比例的总惩罚。Dr. GRPO 的优势只减均值（这里是 $\pm0.5$），$L_\text{max}=8192$。</figcaption>
+  </figure>
+</section>
+
+<section id="variants">
+  <h2>变体：各改了哪一项</h2>
+  <h3>DAPO（2025.03）</h3>
+  <p>ByteDance Seed 与清华 AIR，Qwen2.5-32B 基座，AIME 2024 得 50 分（avg@32），训练步数是 DeepSeek-R1-Zero-Qwen-32B（47 分）的一半。在 GRPO 上改了四处并去掉 KL 项，$G=16$：</p>
+  <ul>
+    <li><b>Clip-Higher</b>：$\epsilon_\text{low}=0.2,\ \epsilon_\text{high}=0.28$，给低概率 token 上涨空间，缓解熵塌缩。</li>
+    <li><b>Dynamic Sampling</b>：多采一些，丢掉全对、全错的组，直到 batch 填满，约束 $0&lt;|\{y_i\text{ 答对}\}|&lt;G$。</li>
+    <li><b>Token-level loss</b>：上一节的 token-mean。</li>
+    <li><b>Overlong reward shaping</b>：被截断的样本不算 loss（overlong filtering），或加软惩罚。期望长度 16,384，缓冲 $L_\text{cache}=4{,}096$，硬上限 $L_\text{max}=20{,}480$：</li>
+  </ul>
+  <div class="eq">$$R_\text{length}(y)=\begin{cases}0, &amp; |y|\le L_\text{max}-L_\text{cache}\\[2pt] \dfrac{(L_\text{max}-L_\text{cache})-|y|}{L_\text{cache}}, &amp; L_\text{max}-L_\text{cache}&lt;|y|\le L_\text{max}\\[6pt] -1, &amp; |y|&gt;L_\text{max}\end{cases}$$</div>
+
+  <h3>RLOO（2024）</h3>
+  <p>Ahmadian et al.（Cohere）把整条回答当一个动作，基线用同组其余样本的均值，不需要 critic；论文的结论是 RLHF 场景下 PPO 的许多部件并不必要。基线不含 $y_i$ 自己，所以严格无偏：</p>
+  <div class="eq">$$\hat A_i=R_i-\frac{1}{G-1}\sum_{j\ne i}R_j=\frac{G}{G-1}\big(R_i-\bar R\big)$$</div>
+
+  <h3>REINFORCE++（2025.01）</h3>
+  <p>Hu et al.：KL 用 $k_1$ 逐 token 折进奖励，优势是从 $t$ 起的累计值；归一化放在整个全局 batch 上，而不是每个提示的小组内，避免小组 std 带来的偏置。变体 REINFORCE++-baseline 先减组内均值，再用全局 batch 的 std 归一化，KL 改用 $k_2$ 作 loss。</p>
+  <div class="eq">$$A_{t}=R-\beta\sum_{i=t}^{T}\mathrm{KL}_i,\qquad A^\text{norm}_t=\frac{A_t-\operatorname{mean}_\text{batch}(A)}{\operatorname{std}_\text{batch}(A)}$$</div>
+
+  <h3>GSPO（2025.07）</h3>
+  <p>Qwen 团队：比值和 clip 都放到序列级。比值按长度开 $1/|y_i|$ 次方，同一条回答的所有 token 用同一个权重。论文报告这去掉了 MoE 模型 RL 对 Routing Replay 的依赖（GRPO 下一次更新后约 10% 的被激活专家会变），用于新版 Qwen3 模型。因为比值是几何平均，clip 范围很小（实验里左右分别 $3\times10^{-4}$、$4\times10^{-4}$）。</p>
+  <div class="eq">$$s_i(\theta)=\Big(\frac{\pi_\theta(y_i\mid x)}{\pi_{\theta_\text{old}}(y_i\mid x)}\Big)^{\frac1{|y_i|}}=\exp\Big(\frac1{|y_i|}\sum_{t}\log\rho_{i,t}\Big),\qquad \mathcal J=\mathbb E\Big[\frac1G\sum_i\min\big(s_i\hat A_i,\ \operatorname{clip}(s_i,1-\epsilon,1+\epsilon)\hat A_i\big)\Big]$$</div>
+
+  <h3>CISPO（2025.06）</h3>
+  <p>MiniMax-M1：PPO 的 clip 会让 token 失去梯度，论文观察到 However、Recheck、Wait、Aha 这类低概率的「反思」token 在第一次 on-policy 更新后就被 clip 掉。CISPO 只截断重要性权重并 stop-gradient，所有 token 都保留梯度；在 Qwen2.5-32B 的对照实验里比 DAPO 快一倍（同样效果所需步数减半）。</p>
+  <div class="eq">$$\mathcal J_\text{CISPO}=\mathbb E\Big[\frac{1}{\sum_i|y_i|}\sum_i\sum_t\operatorname{sg}\big(\hat\rho_{i,t}\big)\,\hat A_{i,t}\,\log\pi_\theta(y_{i,t}\mid s_{i,t})\Big],\qquad \hat\rho_{i,t}=\operatorname{clip}(\rho_{i,t},1-\epsilon^{IS}_\text{low},1+\epsilon^{IS}_\text{high})$$</div>
+</section>
+
+<section id="practice">
+  <h2>大规模训练里的实际问题</h2>
+  <h3>异步 rollout 与陈旧度</h3>
+  <p>同步训练：用 $\theta_k$ 采一整批，等最长的那条生成完，再训练。长尾很长时 GPU 大量空转（<a href="../coding-agent/#infra">coding agent 一页有时间线图</a>）。异步训练让推理端一直生成，训练端拿到的样本来自 $\theta_{k-s}$，$s$ 叫<b>陈旧度</b>（staleness）。这时行为策略不再是 $\pi_{\theta_\text{old}}$，比值必须相对真正采样的策略计算。</p>
+  <p>AReaL（Fu et al. 2025）用解耦的 PPO 目标：行为策略 $\pi_\text{behav}$ 负责重要性修正，近端策略 $\pi_\text{prox}$（每次更新前的参数）负责 trust region；最大陈旧度 $\eta$ 默认代码任务 4、数学 8，报告相对同步系统最多 2.77× 的训练加速：</p>
+  <div class="eq">$$J(\theta)=\mathbb E_{a_t\sim\pi_\text{behav}}\Big[\sum_t\frac{\pi_\text{prox}(a_t\mid s_t)}{\pi_\text{behav}(a_t\mid s_t)}\min\big(u_t\hat A_t,\ \operatorname{clip}(u_t,1-\epsilon,1+\epsilon)\hat A_t\big)\Big],\qquad u_t=\frac{\pi_\theta(a_t\mid s_t)}{\pi_\text{prox}(a_t\mid s_t)}$$</div>
+  <h3>训推不一致与截断重要性采样</h3>
+  <p>rollout 用 vLLM / SGLang，训练用 FSDP / Megatron。同一组权重，两边的 kernel、精度、归约顺序、MoE 路由不同，给出的 token 概率也不同，于是「on-policy」训练其实是 off-policy 的。Yao et al.（2025.08，<i>Your Efficient RL Framework Secretly Brings You Off-Policy RL Training</i>）提出 TIS：在梯度上乘一个截断的修正权重，$C$ 是截断阈值：</p>
+  <div class="eq">$$\nabla_\theta J\approx\mathbb E_{y\sim\pi^\text{infer}_{\theta_\text{old}}}\Big[\min\Big(\frac{\pi^\text{train}_{\theta_\text{old}}(y_t\mid s_t)}{\pi^\text{infer}_{\theta_\text{old}}(y_t\mid s_t)},\,C\Big)\,\nabla_\theta\min\big(\rho_t\hat A_t,\ \operatorname{clip}(\rho_t,1-\epsilon,1+\epsilon)\hat A_t\big)\Big]$$</div>
+  <p>截断用一点偏差换有界方差。异步陈旧度和训推不一致是同一类问题：样本分布和被优化的分布不一样，都靠重要性比值修正。</p>
+  <h3>熵塌缩</h3>
+  <p>训练中策略熵很快下降，模型不再探索，奖励随之停滞。Cui et al.（2025）拟合出 $R=-a\,e^{H}+b$：熵耗尽（$H=0$）时性能上限是 $-a+b$；熵的变化由「动作概率」和「logit 变化」的协方差驱动，后者正比于优势，所以高概率又高优势的 token 不断吃掉熵。对策：Clip-Higher、对高协方差 token 做 Clip-Cov / KL-Cov、熵奖励。</p>
+  <h3>Reward hacking</h3>
+  <p>策略优化的是验证器给的分数，不是出题人的意图：格式规则有漏洞会被钻，LLM 当裁判时会学会讨好裁判，长度和得分相关时回答会变长。验证器越严格、越难绕过，RL 越可靠。代码任务里奖励是「测试是否通过」，相应的防护见 <a href="../coding-agent/#reward">coding agent 的奖励设计</a>。</p>
+</section>
+
+<section id="summary">
+  <h2>算法对照</h2>
+  <div class="tbl"><table class="xwide">
+    <thead><tr><th>算法</th><th>Critic</th><th>优势估计</th><th>比值 / clip</th><th>KL</th><th>聚合</th><th>备注</th></tr></thead>
+    <tbody>
+      <tr><td>REINFORCE</td><td>无</td><td>$R$ 或 $R-b$</td><td>无（on-policy）</td><td>可选</td><td>—</td><td>最简单，方差大</td></tr>
+      <tr><td>PPO（RLHF）</td><td>有</td><td>GAE，逐 token</td><td>token 级 clip</td><td>放进奖励</td><td>token-mean</td><td>多一个和策略同规模的模型</td></tr>
+      <tr><td>GRPO</td><td>无</td><td>组内 $(R-\bar R)/\sigma$</td><td>token 级 clip</td><td>loss，$k_3$</td><td>seq-mean-token-mean</td><td>DeepSeekMath / R1</td></tr>
+      <tr><td>Dr. GRPO</td><td>无</td><td>$R-\bar R$</td><td>token 级 clip</td><td>—</td><td>除以常数 $L_\text{max}$</td><td>去掉长度和难度偏置</td></tr>
+      <tr><td>DAPO</td><td>无</td><td>组内 $(R-\bar R)/\sigma$</td><td>token 级，$\epsilon_\text{high}&gt;\epsilon_\text{low}$</td><td>去掉</td><td>token-mean</td><td>动态采样、超长惩罚</td></tr>
+      <tr><td>RLOO</td><td>无</td><td>留一均值基线</td><td>原文无</td><td>放进奖励</td><td>序列级</td><td>无偏基线</td></tr>
+      <tr><td>REINFORCE++</td><td>无</td><td>全局 batch 归一化</td><td>token 级 clip</td><td>$k_1$ 进奖励（baseline 版 $k_2$ 作 loss）</td><td>token-mean</td><td>不做组内 std</td></tr>
+      <tr><td>GSPO</td><td>无</td><td>组内归一化</td><td>序列级几何平均比值</td><td>—</td><td>序列级</td><td>MoE 更稳</td></tr>
+      <tr><td>CISPO</td><td>无</td><td>组内归一化</td><td>只截 IS 权重，sg</td><td>—</td><td>token-mean</td><td>所有 token 留梯度</td></tr>
+    </tbody>
+  </table></div>
+  <p>「—」表示论文的主算法里没有这一项或没有特别规定。各框架（verl、OpenRLHF 等）把这些选项做成独立开关，实际配方常常是混搭。</p>
+</section>
+
+<section id="quiz">
+  <h2>自测</h2>
+  <details class="q"><summary>为什么减去基线 $b(s_t)$ 不改变梯度的期望？$b$ 能不能依赖当前动作 $a_t$？</summary><div><p>因为 $\mathbb E_{a\sim\pi}[\nabla\log\pi(a\mid s)]=\nabla\sum_a\pi(a\mid s)=0$，常数（或只依赖 $s$ 的量）提出来后乘的是 0。若 $b$ 依赖 $a_t$ 就提不出来，一般会引入偏差。RLOO 的基线用的是其他样本的奖励，不含 $y_i$ 自己，所以无偏。</p></div></details>
+  <details class="q"><summary>$\hat A&lt;0$ 且 $\rho=2.5$，$\epsilon=0.2$，PPO 这个 token 还有梯度吗？</summary><div><p>有。负优势时只截 $\rho&lt;1-\epsilon$ 的一侧，$\rho$ 大时目标是 $\rho\hat A$，梯度为 $\hat A$。这正是 dual-clip 想限制的情况：加下界 $c\hat A$ 后，$\rho&gt;c$ 时梯度为 0。</p></div></details>
+  <details class="q"><summary>GAE 的 $\lambda=1$ 和 $\lambda=0$ 分别对应什么？critic 很差时该往哪边调？</summary><div><p>$\lambda=1$ 是蒙特卡洛回报减 $V(s_t)$，对梯度无偏、方差大；$\lambda=0$ 是一步 TD 残差 $\delta_t$，方差小但偏差等于 critic 的误差。critic 差时往 1 调，这也是 VAPO 训练 value 时用 $\lambda=1$ 的原因。</p></div></details>
+  <details class="q"><summary>GRPO 一组 8 条全部答对，这组对梯度有什么贡献？</summary><div><p>没有（KL 项除外）。均值等于每条的奖励，优势全为 0。正确率为 $p$ 时这样白采的概率是 $p^8+(1-p)^8$，DAPO 的动态采样把这类组丢掉再补采。</p></div></details>
+  <details class="q"><summary>为什么 seq-mean-token-mean 会让错误回答变长？</summary><div><p>每条回答的总权重固定为 $|\hat A_i|/G$，摊到 $|y_i|$ 个 token 上；错误回答越长，每个 token 受的惩罚越小，长的错误写法相对「安全」。token-mean 或除以常数可以消除这个偏置。</p></div></details>
+  <details class="q"><summary>GRPO 的 KL 用 $k_3$ 当 loss，梯度对应哪一个 KL？</summary><div><p>$\mathbb E\nabla k_3=-\mathbb E_{\pi_\text{ref}}[\nabla\log\pi_\theta]$，是 forward KL $\mathrm{KL}(\pi_\text{ref}\Vert\pi_\theta)$ 的梯度。要得到 reverse KL 的梯度，应该用 $k_2$ 当 loss，或把 $k_1$ 放进奖励。</p></div></details>
+  <details class="q"><summary>权重刚同步完，推理引擎和训练引擎用的是同一组参数，为什么还需要 TIS？</summary><div><p>两边实现不同（kernel、精度、归约顺序、MoE 路由），对同一 token 给出的概率不同，采样分布 $\pi^\text{infer}$ 不等于训练时算梯度的 $\pi^\text{train}$。TIS 乘上截断后的 $\pi^\text{train}/\pi^\text{infer}$ 来修正。</p></div></details>
+</section>
+
+<section id="refs">
+  <h2>延伸阅读</h2>
+  <ol class="refs">
+    <li><b>Williams, Simple Statistical Gradient-Following Algorithms for Connectionist Reinforcement Learning</b>, Machine Learning 1992.（REINFORCE）</li>
+    <li><b>Schulman et al., High-Dimensional Continuous Control Using Generalized Advantage Estimation</b>, ICLR 2016. <a href="https://arxiv.org/abs/1506.02438">arXiv:1506.02438</a></li>
+    <li><b>Schulman et al., Proximal Policy Optimization Algorithms</b>, 2017. <a href="https://arxiv.org/abs/1707.06347">arXiv:1707.06347</a></li>
+    <li><b>Ouyang et al., Training Language Models to Follow Instructions with Human Feedback</b>, NeurIPS 2022. <a href="https://arxiv.org/abs/2203.02155">arXiv:2203.02155</a></li>
+    <li><b>Schulman, Approximating KL Divergence</b>, blog, 2020. <a href="http://joschu.net/blog/kl-approx.html">joschu.net</a></li>
+    <li><b>Shao et al., DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models</b>, 2024.（GRPO）<a href="https://arxiv.org/abs/2402.03300">arXiv:2402.03300</a></li>
+    <li><b>DeepSeek-AI, DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning</b>, 2025. <a href="https://arxiv.org/abs/2501.12948">arXiv:2501.12948</a></li>
+    <li><b>Ahmadian et al., Back to Basics: Revisiting REINFORCE Style Optimization for Learning from Human Feedback in LLMs</b>, 2024.（RLOO）<a href="https://arxiv.org/abs/2402.14740">arXiv:2402.14740</a></li>
+    <li><b>Hu et al., REINFORCE++: Stabilizing Critic-Free Policy Optimization with Global Advantage Normalization</b>, 2025. <a href="https://arxiv.org/abs/2501.03262">arXiv:2501.03262</a></li>
+    <li><b>Yu et al., DAPO: An Open-Source LLM Reinforcement Learning System at Scale</b>, 2025. <a href="https://arxiv.org/abs/2503.14476">arXiv:2503.14476</a></li>
+    <li><b>Liu et al., Understanding R1-Zero-Like Training: A Critical Perspective</b>, 2025.（Dr. GRPO）<a href="https://arxiv.org/abs/2503.20783">arXiv:2503.20783</a></li>
+    <li><b>Yue et al., VAPO: Efficient and Reliable Reinforcement Learning for Advanced Reasoning Tasks</b>, 2025. <a href="https://arxiv.org/abs/2504.05118">arXiv:2504.05118</a></li>
+    <li><b>MiniMax, MiniMax-M1: Scaling Test-Time Compute Efficiently with Lightning Attention</b>, 2025.（CISPO）<a href="https://arxiv.org/abs/2506.13585">arXiv:2506.13585</a></li>
+    <li><b>Zheng et al., Group Sequence Policy Optimization</b>, 2025.（GSPO）<a href="https://arxiv.org/abs/2507.18071">arXiv:2507.18071</a></li>
+    <li><b>Fu et al., AReaL: A Large-Scale Asynchronous Reinforcement Learning System for Language Reasoning</b>, 2025. <a href="https://arxiv.org/abs/2505.24298">arXiv:2505.24298</a></li>
+    <li><b>Yao, Liu et al., Your Efficient RL Framework Secretly Brings You Off-Policy RL Training</b>, blog, 2025.08.（TIS）<a href="https://fengyao.notion.site/off-policy-rl">fengyao.notion.site</a></li>
+    <li><b>Cui et al., The Entropy Mechanism of Reinforcement Learning for Reasoning Language Models</b>, 2025. <a href="https://arxiv.org/abs/2505.22617">arXiv:2505.22617</a></li>
+    <li><b>Ye et al., Mastering Complex Control in MOBA Games with Deep Reinforcement Learning</b>, AAAI 2020.（dual-clip PPO）<a href="https://arxiv.org/abs/1912.09729">arXiv:1912.09729</a></li>
+    <li><b>verl</b>（ByteDance Seed）：上面多数算法和 loss 聚合方式的参考实现。<a href="https://github.com/verl-project/verl">GitHub</a></li>
+  </ol>
+</section>
+
+</main>
+</div>
+
+<!-- v4u:foot -->
+<footer class="v4u-foot"><div class="v4u-foot-in"><a class="pv" href="../3d-foundation-models/"><span>上一篇</span>3D 基础模型</a><a class="nx" href="../coding-agent/"><span>下一篇</span>Coding Agent 的训练</a></div></footer>
+<!-- /v4u:foot -->
+
+<script>
+V4U.ready(() => {
+  const $ = (id) => document.getElementById(id);
+  const C = (n) => V4U.css(n);
+  const F = (px, mono) => px + 'px ' + C(mono ? '--f-mono' : '--f-body');
+  const fmt = V4U.fmt;
+  const rng = (seed) => () => { seed |= 0; seed = (seed + 0x6D2B79F5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  const softmax = (th) => { const m = Math.max(...th); const e = th.map((v) => Math.exp(v - m)); const s = e.reduce((a, b) => a + b, 0); return e.map((v) => v / s); };
+  const pick = (p, u) => { let c = 0; for (let i = 0; i < p.length; i++) { c += p[i]; if (u < c) return i; } return p.length - 1; };
+  const entropy = (p) => -p.reduce((s, v) => s + (v > 0 ? v * Math.log(v) : 0), 0);
+  // axes helper: returns pixel mappers; draws grid, ticks, frame
+  function chart(ctx, box, xr, yr, o) {
+    o = o || {};
+    const { x, y, w, h } = box;
+    const X = (v) => x + ((v - xr[0]) / (xr[1] - xr[0])) * w;
+    const Y = (v) => y + h - ((v - yr[0]) / (yr[1] - yr[0])) * h;
+    ctx.font = F(11, true); ctx.lineWidth = 1;
+    (o.yt || []).forEach((v) => {
+      ctx.strokeStyle = C('--line'); ctx.beginPath(); ctx.moveTo(x, Y(v)); ctx.lineTo(x + w, Y(v)); ctx.stroke();
+      ctx.fillStyle = C('--muted'); ctx.textAlign = 'right'; ctx.textBaseline = 'middle'; ctx.fillText(o.fy ? o.fy(v) : String(v), x - 6, Y(v));
+    });
+    (o.xt || []).forEach((v) => {
+      ctx.strokeStyle = C('--line'); ctx.beginPath(); ctx.moveTo(X(v), y + h); ctx.lineTo(X(v), y + h + 4); ctx.stroke();
+      ctx.fillStyle = C('--muted'); ctx.textAlign = 'center'; ctx.textBaseline = 'top'; ctx.fillText(o.fx ? o.fx(v) : String(v), X(v), y + h + 6);
+    });
+    ctx.strokeStyle = C('--line-2'); ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x, y + h); ctx.lineTo(x + w, y + h); ctx.stroke();
+    ctx.fillStyle = C('--ink-2'); ctx.font = F(12, true);
+    if (o.xl) { ctx.textAlign = 'right'; ctx.textBaseline = 'bottom'; ctx.fillText(o.xl, x + w, y + h - 4); }
+    if (o.yl) { ctx.textAlign = 'left'; ctx.textBaseline = 'top'; ctx.fillText(o.yl, x + 6, y + 2); }
+    return { X, Y };
+  }
+  const path = (ctx, pts, col, wd, dash) => { ctx.strokeStyle = col; ctx.lineWidth = wd || 2; ctx.setLineDash(dash || []); ctx.beginPath(); pts.forEach((p, i) => (i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]))); ctx.stroke(); ctx.setLineDash([]); };
+  const dot = (ctx, x, y, r, col) => { ctx.fillStyle = col; ctx.beginPath(); ctx.arc(x, y, r, 0, 2 * Math.PI); ctx.fill(); };
+
+  /* ---------- 1. MDP stepper ---------- */
+  (() => {
+    const rules = (pre) => {
+      const last = pre[pre.length - 1];
+      if (!last) return [['7+5=12', 0.6], ['1+2=3', 0.15], ['答 42', 0.15], ['答 32', 0.1]];
+      if (last.startsWith('答')) return null;
+      if (last === '7+5=12') return [['进 1', 0.7], ['不进位', 0.3]];
+      if (last === '进 1') return [['1+2+1=4', 0.85], ['1+2=3', 0.15]];
+      if (last === '不进位') return [['1+2=3', 0.9], ['1+2+1=4', 0.1]];
+      if (last === '1+2+1=4') return [['答 42', 0.9], ['答 52', 0.1]];
+      if (last === '1+2=3') return pre.includes('7+5=12') ? [['答 32', 0.8], ['答 42', 0.2]] : [['7+5=12', 0.7], ['答 32', 0.3]];
+      return null;
+    };
+    const reward = (pre) => (pre[pre.length - 1] === '答 42' ? 1 : 0);
+    const V = (pre) => { const d = rules(pre); return d ? d.reduce((s, [t, p]) => s + p * V([...pre, t]), 0) : reward(pre); };
+    let seq = [], ps = [];
+    const r = rng(11);
+    const trajEl = $('mdp-traj'), candEl = $('mdp-cands'), rd = $('mdp-read');
+    const render = () => {
+      const d = rules(seq), done = !d;
+      let html = '<span class="tok prompt"><b>17+25=?</b><small>x</small></span>';
+      seq.forEach((t, i) => {
+        const last = done && i === seq.length - 1;
+        html += `<span class="tok${last ? (reward(seq) ? ' win' : ' lose') : ''}"><b>${t}</b><small>${fmt(ps[i])}</small></span>`;
+      });
+      trajEl.innerHTML = html;
+      const v = V(seq);
+      if (done) {
+        candEl.innerHTML = `<p class="cands-h">生成结束（答案 token 兼作 EOS）。奖励 R = ${reward(seq)}，只在这一步给出。</p>`;
+      } else {
+        candEl.innerHTML = d.map(([t, p], k) => {
+          const q = V([...seq, t]), a = q - v;
+          return `<button type="button" class="cand" data-k="${k}"><span>${t}</span><span class="bar"><i style="width:${(p * 100).toFixed(1)}%"></i></span><span class="qa">π ${fmt(p)} · Q ${fmt(q)} · A ${a >= 0 ? '+' : '−'}${fmt(Math.abs(a))}</span></button>`;
+        }).join('');
+        candEl.querySelectorAll('.cand').forEach((b) => b.addEventListener('click', () => { const [t, p] = d[+b.dataset.k]; seq.push(t); ps.push(p); render(); }));
+      }
+      const lp = ps.reduce((s, p) => s + Math.log(p), 0);
+      rd.innerHTML = `<span>t = <b>${seq.length}</b></span><span>V(s_t) = <b>${fmt(v)}</b></span><span>log π(y≤t | x) = <b>${fmt(lp)}</b></span><span>π(y≤t | x) = <b>${fmt(Math.exp(lp), 3)}</b></span><span>R = <b>${done ? reward(seq) : '—'}</b></span>`;
+      $('mdp-step').disabled = $('mdp-run').disabled = done;
+    };
+    const step = () => { const d = rules(seq); if (!d) return; const k = pick(d.map((e) => e[1]), r()); seq.push(d[k][0]); ps.push(d[k][1]); };
+    $('mdp-step').addEventListener('click', () => { step(); render(); });
+    $('mdp-run').addEventListener('click', () => { while (rules(seq)) step(); render(); });
+    $('mdp-reset').addEventListener('click', () => { seq = []; ps = []; render(); });
+    seq = ['7+5=12']; ps = [0.6]; render();
+  })();
+
+  /* ---------- 2. baseline variance ---------- */
+  (() => {
+    const th = [0, 0.8, 0.3, -0.4], R = [1, 0.2, 0.6, 0], pi = softmax(th), K = 4, M = 300, NMAX = 32;
+    const ER = pi.reduce((s, p, a) => s + p * R[a], 0);
+    const gtrue = pi.map((p, a) => p * (R[a] - ER));
+    const g2 = (a) => pi.reduce((s, p, j) => s + ((j === a ? 1 : 0) - p) ** 2, 0); // ||e_a - pi||^2
+    const A1 = pi.reduce((s, p, a) => s + p * g2(a), 0), AR = pi.reduce((s, p, a) => s + p * R[a] * g2(a), 0), ARR = pi.reduce((s, p, a) => s + p * R[a] * R[a] * g2(a), 0);
+    const gn2 = gtrue.reduce((s, v) => s + v * v, 0);
+    const varb = (b) => ARR - 2 * b * AR + b * b * A1 - gn2; // per-sample trace of covariance
+    const bstar = AR / A1;
+    let seed = 3, acts = [];
+    const resample = () => { const r = rng(seed++); acts = Array.from({ length: M }, () => Array.from({ length: NMAX }, () => pick(pi, r()))); };
+    resample();
+    const slb = $('sl-b'), sln = $('sl-n');
+    const cloud = V4U.canvas($('cv-cloud'), (w) => Math.min(320, Math.max(240, w * 0.78)), (ctx, w, h) => {
+      const b = +slb.value, N = +sln.value;
+      const s = Math.min(w - 50, h - 40), box = { x: (w - s) / 2 + 14, y: 12, w: s - 14, h: s - 14 };
+      const P = chart(ctx, box, [-0.3, 0.5], [-0.4, 0.4], { xt: [-0.2, 0, 0.2, 0.4], yt: [-0.2, 0, 0.2], xl: '∂/∂θ₁', yl: '∂/∂θ₂' });
+      ctx.strokeStyle = C('--line-2'); ctx.beginPath(); ctx.moveTo(P.X(0), box.y); ctx.lineTo(P.X(0), box.y + box.h); ctx.moveTo(box.x, P.Y(0)); ctx.lineTo(box.x + box.w, P.Y(0)); ctx.stroke();
+      ctx.save(); ctx.beginPath(); ctx.rect(box.x, box.y, box.w, box.h); ctx.clip();
+      ctx.globalAlpha = 0.45;
+      for (let m = 0; m < M; m++) {
+        let gx = 0, gy = 0;
+        for (let n = 0; n < N; n++) { const a = acts[m][n], c = R[a] - b; gx += c * ((a === 0 ? 1 : 0) - pi[0]); gy += c * ((a === 1 ? 1 : 0) - pi[1]); }
+        dot(ctx, P.X(gx / N), P.Y(gy / N), 2.6, C('--c1'));
+      }
+      ctx.globalAlpha = 1; ctx.restore();
+      ctx.strokeStyle = C('--c2'); ctx.lineWidth = 2.5; ctx.beginPath(); ctx.moveTo(P.X(0), P.Y(0)); ctx.lineTo(P.X(gtrue[0]), P.Y(gtrue[1])); ctx.stroke();
+      dot(ctx, P.X(gtrue[0]), P.Y(gtrue[1]), 5, C('--c2'));
+    });
+    const vplot = V4U.canvas($('cv-var'), (w) => Math.min(320, Math.max(240, w * 0.78)), (ctx, w, h) => {
+      const b = +slb.value, N = +sln.value;
+      const box = { x: 46, y: 14, w: w - 60, h: h - 40 };
+      const vmax = Math.max(varb(-0.5), varb(1.5)) / N;
+      const P = chart(ctx, box, [-0.5, 1.5], [0, vmax * 1.05], { xt: [-0.5, 0, 0.5, 1, 1.5], yt: [0, vmax / 2, vmax].map((v) => +v.toPrecision(2)), fy: (v) => v.toPrecision(2), xl: 'b', yl: 'tr Cov(ĝ)' });
+      const pts = []; for (let i = 0; i <= 100; i++) { const bb = -0.5 + (2 * i) / 100; pts.push([P.X(bb), P.Y(varb(bb) / N)]); }
+      path(ctx, [[P.X(ER), box.y], [P.X(ER), box.y + box.h]], C('--muted'), 1, [4, 4]);
+      path(ctx, pts, C('--c3'), 2.5);
+      dot(ctx, P.X(bstar), P.Y(varb(bstar) / N), 4, C('--c3'));
+      dot(ctx, P.X(b), P.Y(varb(b) / N), 6, C('--c2'));
+    });
+    const rd = $('rd-base');
+    const upd = () => {
+      const b = +slb.value, N = +sln.value; $('o-b').textContent = fmt(b); $('o-n').textContent = N;
+      cloud(); vplot();
+      rd.innerHTML = `<span>E[R] = <b>${fmt(ER)}</b></span><span>b* = <b>${fmt(bstar)}</b></span><span>方差(b) / 方差(0) = <b>${fmt(varb(b) / varb(0))}</b></span><span>∇J = (<b>${fmt(gtrue[0], 3)}</b>, <b>${fmt(gtrue[1], 3)}</b>)</span>`;
+    };
+    slb.addEventListener('input', upd); sln.addEventListener('input', upd);
+    $('bt-resamp').addEventListener('click', () => { resample(); upd(); });
+    upd();
+  })();
+
+  /* ---------- 3. PPO clip ---------- */
+  (() => {
+    const sr = $('sl-rho'), sel = $('sl-el'), seh = $('sl-eh'), ck = $('ck-dual'), c = 3;
+    const L = (rho, A, el, eh, dual) => {
+      let v = Math.min(rho * A, V4U.clamp(rho, 1 - el, 1 + eh) * A);
+      if (dual && A < 0) v = Math.max(v, c * A);
+      return v;
+    };
+    const grad = (rho, A, el, eh, dual) => { const d = 1e-4; return (L(rho + d, A, el, eh, dual) - L(rho - d, A, el, eh, dual)) / (2 * d); };
+    const draw = (A) => (ctx, w, h) => {
+      const rho = +sr.value, el = +sel.value, eh = +seh.value, dual = ck.checked;
+      const box = { x: 40, y: 14, w: w - 54, h: h - 40 };
+      const yr = A > 0 ? [-0.2, 3.6] : [-3.6, 0.2];
+      const P = chart(ctx, box, [0, 3.5], yr, { xt: [0, 1, 2, 3], yt: A > 0 ? [0, 1, 2, 3] : [-3, -2, -1, 0], xl: 'ρ', yl: A > 0 ? 'L, Â = +1' : 'L, Â = −1' });
+      // zero-gradient regions
+      ctx.fillStyle = C('--warn-soft');
+      const shade = (a, b) => ctx.fillRect(P.X(a), box.y, P.X(b) - P.X(a), box.h);
+      if (A > 0) shade(1 + eh, 3.5); else { shade(0, 1 - el); if (dual) shade(c, 3.5); }
+      path(ctx, [[P.X(1), box.y], [P.X(1), box.y + box.h]], C('--line-2'), 1, [3, 3]);
+      path(ctx, [[P.X(0), P.Y(0)], [P.X(3.5), P.Y(3.5 * A)]], C('--line-2'), 1.5, [6, 4]);
+      const pts = []; for (let i = 0; i <= 350; i++) { const r = i / 100; pts.push([P.X(r), P.Y(L(r, A, el, eh, dual))]); }
+      path(ctx, pts, C('--c1'), 3);
+      dot(ctx, P.X(rho), P.Y(L(rho, A, el, eh, dual)), 6, C('--c2'));
+      ctx.fillStyle = C('--ink-2'); ctx.font = F(11, true); ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
+      if (A > 0) ctx.fillText('1+ε', P.X(1 + eh), box.y + box.h - 2); else ctx.fillText('1−ε', P.X(1 - el), box.y + 14);
+    };
+    const hf = (w) => Math.min(280, Math.max(220, w * 0.62));
+    const dp = V4U.canvas($('cv-clip-p'), hf, draw(1)), dn = V4U.canvas($('cv-clip-n'), hf, draw(-1));
+    const rd = $('rd-clip');
+    const upd = () => {
+      const rho = +sr.value, el = +sel.value, eh = +seh.value, dual = ck.checked;
+      $('o-rho').textContent = fmt(rho); $('o-el').textContent = fmt(el); $('o-eh').textContent = fmt(eh);
+      dp(); dn();
+      const gp = grad(rho, 1, el, eh, dual), gn = grad(rho, -1, el, eh, dual);
+      rd.innerHTML = `<span>Â=+1：L = <b>${fmt(L(rho, 1, el, eh, dual))}</b>，∂L/∂ρ = <b>${fmt(gp)}</b>${Math.abs(gp) < 1e-6 ? '（截断）' : ''}</span><span>Â=−1：L = <b>${fmt(L(rho, -1, el, eh, dual))}</b>，∂L/∂ρ = <b>${fmt(gn)}</b>${Math.abs(gn) < 1e-6 ? '（截断）' : ''}</span>`;
+    };
+    [sr, sel, seh].forEach((e) => e.addEventListener('input', upd)); ck.addEventListener('change', upd);
+    upd();
+  })();
+
+  /* ---------- 4. GAE ---------- */
+  (() => {
+    const T = 15, NTR = 2500, LAMS = Array.from({ length: 21 }, (_, i) => i / 20);
+    const binom = []; for (let n = 0; n <= T; n++) { binom[n] = [1]; for (let k = 1; k <= n; k++) binom[n][k] = (binom[n - 1][k - 1] || 0) + (k < n ? binom[n - 1][k] : 0); }
+    const Vtrue = (t, x) => { if (t >= T) return 0; const n = T - t; let s = 0; for (let k = 0; k <= n; k++) if (x + 2 * k - n > 0) s += binom[n][k]; return s / 2 ** n; };
+    const eta = (t, x) => { const s = Math.sin(t * 12.9898 + x * 78.233) * 43758.5453; return 2 * (s - Math.floor(s)) - 1; };
+    let err = 0.12;
+    const Vhat = (t, x) => (t >= T ? 0 : V4U.clamp(Vtrue(t, x) + err * eta(t, x), 0, 1));
+    // trajectories: positions x_0..x_T
+    const r0 = rng(5), trajs = Array.from({ length: NTR }, () => { const xs = [0]; for (let t = 0; t < T; t++) xs.push(xs[t] + (r0() < 0.5 ? 1 : -1)); return xs; });
+    const adv = (xs, lam) => { const A = new Array(T); let g = 0; for (let t = T - 1; t >= 0; t--) { const rT = t === T - 1 ? (xs[T] > 0 ? 1 : 0) : 0; const d = rT + Vhat(t + 1, xs[t + 1]) - Vhat(t, xs[t]); g = d + lam * g; A[t] = g; } return A; };
+    let curves = null;
+    const compute = () => {
+      curves = LAMS.map((lam) => {
+        const groups = new Map();
+        for (const xs of trajs) {
+          const A = adv(xs, lam);
+          for (let t = 0; t < T; t++) {
+            const e = A[t] - (Vtrue(t + 1, xs[t + 1]) + (t === T - 1 ? (xs[T] > 0 ? 1 : 0) : 0) - Vhat(t, xs[t]));
+            const key = t * 100 + xs[t + 1] + 50; let g = groups.get(key); if (!g) groups.set(key, (g = [0, 0, 0]));
+            g[0]++; g[1] += e; g[2] += e * e;
+          }
+        }
+        let n = 0, b2 = 0, vv = 0; groups.forEach(([k, s, s2]) => { const m = s / k; n += k; b2 += k * m * m; vv += s2 - k * m * m; });
+        return { lam, b2: b2 / n, v: vv / n, mse: (b2 + vv) / n };
+      });
+    };
+    const sl = $('sl-lam'), sc = $('sl-cerr');
+    const r1 = rng(21);
+    err = +sc.value; compute();
+    let cur = trajs[0];
+    const hf = (w) => Math.min(300, Math.max(230, w * 0.66));
+    const dtr = V4U.canvas($('cv-gae-tr'), hf, (ctx, w, h) => {
+      const lam = +sl.value, A = adv(cur, lam);
+      const box = { x: 36, y: 14, w: w - 48, h: h - 40 };
+      const P = chart(ctx, box, [-0.5, T + 0.5], [-1, 1], { xt: [0, 5, 10, 15], yt: [-1, -0.5, 0, 0.5, 1], xl: 't', yl: 'V̂, Â' });
+      const bw = Math.max(3, (box.w / (T + 1)) * 0.55);
+      for (let t = 0; t < T; t++) { ctx.fillStyle = A[t] >= 0 ? C('--ok') : C('--bad'); const y0 = P.Y(0), y1 = P.Y(V4U.clamp(A[t], -1, 1)); ctx.fillRect(P.X(t) - bw / 2, Math.min(y0, y1), bw, Math.abs(y1 - y0)); }
+      path(ctx, cur.slice(0, T).map((x, t) => [P.X(t), P.Y(Vtrue(t, x))]), C('--muted'), 1.5, [4, 3]);
+      path(ctx, cur.slice(0, T).map((x, t) => [P.X(t), P.Y(Vhat(t, x))]), C('--c1'), 2.5);
+      const R = cur[T] > 0 ? 1 : 0;
+      dot(ctx, P.X(T), P.Y(R), 6, R ? C('--ok') : C('--bad'));
+      ctx.fillStyle = C('--ink-2'); ctx.font = F(11, true); ctx.textAlign = 'right'; ctx.textBaseline = 'bottom'; ctx.fillText('R=' + R, P.X(T) - 8, P.Y(R) - 4);
+    });
+    const dbv = V4U.canvas($('cv-gae-bv'), hf, (ctx, w, h) => {
+      const lam = +sl.value, lg = (v) => Math.log10(Math.max(v, 1e-5));
+      const box = { x: 46, y: 14, w: w - 60, h: h - 40 };
+      const P = chart(ctx, box, [0, 1], [-4, 0], { xt: [0, 0.25, 0.5, 0.75, 1], yt: [-4, -3, -2, -1, 0], fy: (v) => '1e' + v, xl: 'λ' });
+      ctx.save(); ctx.beginPath(); ctx.rect(box.x, box.y, box.w, box.h); ctx.clip();
+      path(ctx, curves.map((c) => [P.X(c.lam), P.Y(lg(c.b2))]), C('--c2'), 2.5);
+      path(ctx, curves.map((c) => [P.X(c.lam), P.Y(lg(c.v))]), C('--c3'), 2.5);
+      path(ctx, curves.map((c) => [P.X(c.lam), P.Y(lg(c.mse))]), C('--c4'), 2.5, [6, 4]);
+      ctx.restore();
+      const best = curves.reduce((a, b) => (b.mse < a.mse ? b : a));
+      dot(ctx, P.X(best.lam), P.Y(lg(best.mse)), 5, C('--c4'));
+      path(ctx, [[P.X(lam), box.y], [P.X(lam), box.y + box.h]], C('--ink-2'), 1, [3, 3]);
+    });
+    const rd = $('rd-gae');
+    const upd = (recompute) => {
+      err = +sc.value; $('o-lam').textContent = fmt(+sl.value); $('o-cerr').textContent = fmt(err);
+      if (recompute) compute();
+      dtr(); dbv();
+      const c = curves[Math.round(+sl.value * 20)], best = curves.reduce((a, b) => (b.mse < a.mse ? b : a));
+      rd.innerHTML = `<span>偏差² = <b>${c.b2.toFixed(4)}</b></span><span>方差 = <b>${c.v.toFixed(4)}</b></span><span>MSE = <b>${c.mse.toFixed(4)}</b></span><span>MSE 最低的 λ = <b>${fmt(best.lam)}</b></span>`;
+    };
+    sl.addEventListener('input', () => upd(false)); sc.addEventListener('input', () => upd(true));
+    $('bt-gae').addEventListener('click', () => { cur = trajs[Math.floor(r1() * NTR)]; upd(false); });
+    upd(false);
+  })();
+
+  /* ---------- 5. KL estimators ---------- */
+  (() => {
+    const sl = $('sl-mu');
+    const stats = (mu) => {
+      const n = 801, out = { k1: [0, 0], k2: [0, 0], k3: [0, 0] }; let wsum = 0;
+      for (let i = 0; i < n; i++) {
+        const z = -7 + (14 * i) / (n - 1), wgt = Math.exp(-z * z / 2); const u = -mu * z - mu * mu / 2;
+        const k = { k1: -u, k2: 0.5 * u * u, k3: Math.exp(u) - 1 - u };
+        for (const key in k) { out[key][0] += wgt * k[key]; out[key][1] += wgt * k[key] * k[key]; }
+        wsum += wgt;
+      }
+      for (const key in out) { const m = out[key][0] / wsum; out[key] = [m, Math.sqrt(Math.max(0, out[key][1] / wsum - m * m))]; }
+      return out;
+    };
+    const draw = V4U.canvas($('cv-kl'), (w) => Math.min(300, Math.max(230, w * 0.42)), (ctx, w, h) => {
+      const mu = +sl.value;
+      const box = { x: 40, y: 14, w: w - 54, h: h - 40 };
+      const P = chart(ctx, box, [-4, 3], [-1.5, 4], { xt: [-4, -3, -2, -1, 0, 1, 2, 3], yt: [-1, 0, 1, 2, 3, 4], xl: 'u = log π_ref/π_θ' });
+      const m = -mu * mu / 2, s = mu, top = (box.h * 0.45);
+      ctx.fillStyle = C('--surface-2'); ctx.beginPath(); ctx.moveTo(P.X(-4), P.Y(-1.5));
+      for (let i = 0; i <= 200; i++) { const u = -4 + (7 * i) / 200; ctx.lineTo(P.X(u), P.Y(-1.5) - top * Math.exp(-((u - m) ** 2) / (2 * s * s))); }
+      ctx.lineTo(P.X(3), P.Y(-1.5)); ctx.closePath(); ctx.fill();
+      path(ctx, [[box.x, P.Y(0)], [box.x + box.w, P.Y(0)]], C('--line-2'), 1);
+      const curve = (f, col) => { const pts = []; for (let i = 0; i <= 200; i++) { const u = -4 + (7 * i) / 200; pts.push([P.X(u), P.Y(V4U.clamp(f(u), -1.6, 4.2))]); } ctx.save(); ctx.beginPath(); ctx.rect(box.x, box.y, box.w, box.h); ctx.clip(); path(ctx, pts, col, 2.5); ctx.restore(); };
+      curve((u) => -u, C('--c1')); curve((u) => 0.5 * u * u, C('--c2')); curve((u) => Math.exp(u) - 1 - u, C('--c3'));
+      path(ctx, [[P.X(m), box.y], [P.X(m), box.y + box.h]], C('--muted'), 1, [3, 3]);
+    });
+    const rd = $('rd-kl');
+    const upd = () => {
+      const mu = +sl.value; $('o-mu').textContent = fmt(mu); draw();
+      const st = stats(mu);
+      rd.innerHTML = `<span>真值 KL = <b>${fmt(mu * mu / 2, 3)}</b></span>` + ['k1', 'k2', 'k3'].map((k) => `<span>${{k1:'k₁',k2:'k₂',k3:'k₃'}[k]}：均值 <b>${fmt(st[k][0], 3)}</b> 标准差 <b>${fmt(st[k][1], 3)}</b></span>`).join('');
+    };
+    sl.addEventListener('input', upd); upd();
+  })();
+
+  /* ---------- 6. GRPO group ---------- */
+  (() => {
+    const sg = $('sl-g'), sp = $('sl-p');
+    let mode = 'grpo', R = [], seed = 9;
+    const sample = () => { const r = rng(seed++), G = +sg.value, p = +sp.value; R = Array.from({ length: G }, () => (r() < p ? 1 : 0)); };
+    const advs = () => {
+      const G = R.length, m = R.reduce((a, b) => a + b, 0) / G, sd = Math.sqrt(R.reduce((s, v) => s + (v - m) ** 2, 0) / G);
+      if (mode === 'grpo') return R.map((v) => (sd < 1e-9 ? 0 : (v - m) / sd));
+      if (mode === 'dr') return R.map((v) => v - m);
+      return R.map((v) => v - (G * m - v) / (G - 1));
+    };
+    const hf = (w) => Math.min(280, Math.max(220, w * 0.62));
+    const dg = V4U.canvas($('cv-grp'), hf, (ctx, w, h) => {
+      const A = advs(), G = R.length, pad = 12, cw = (w - 2 * pad) / G, sq = Math.min(26, cw - 6);
+      const amax = Math.max(1, ...A.map(Math.abs)) * 1.05, y0 = 20 + sq + 14, zero = y0 + (h - y0 - 22) / 2, half = (h - y0 - 22) / 2;
+      ctx.font = F(11, true); ctx.textAlign = 'center';
+      path(ctx, [[pad, zero], [w - pad, zero]], C('--line-2'), 1);
+      R.forEach((v, i) => {
+        const cx = pad + cw * (i + 0.5);
+        ctx.fillStyle = v ? C('--ok-soft') : C('--bad-soft'); ctx.strokeStyle = v ? C('--ok') : C('--bad'); ctx.lineWidth = 1.5;
+        ctx.fillRect(cx - sq / 2, 14, sq, sq); ctx.strokeRect(cx - sq / 2, 14, sq, sq);
+        ctx.fillStyle = C('--ink'); ctx.textBaseline = 'middle'; ctx.fillText(String(v), cx, 14 + sq / 2);
+        const a = A[i], bh = (Math.abs(a) / amax) * half, bw = Math.min(22, cw * 0.6);
+        ctx.fillStyle = a >= 0 ? C('--ok') : C('--bad');
+        ctx.fillRect(cx - bw / 2, a >= 0 ? zero - bh : zero, bw, Math.max(1, bh));
+        if (cw >= 30) { ctx.fillStyle = C('--ink-2'); ctx.textBaseline = a >= 0 ? 'bottom' : 'top'; ctx.fillText((a >= 0 ? '+' : '−') + fmt(Math.abs(a), 1), cx, a >= 0 ? zero - bh - 3 : zero + bh + 3); }
+      });
+      if (A.every((a) => Math.abs(a) < 1e-9)) { ctx.fillStyle = C('--warn'); ctx.font = F(13, false); ctx.textBaseline = 'bottom'; ctx.fillText('Â 全为 0', w / 2, zero - 6); }
+    });
+    const dz = V4U.canvas($('cv-zero'), hf, (ctx, w, h) => {
+      const G = +sg.value, p = +sp.value;
+      const box = { x: 40, y: 14, w: w - 54, h: h - 40 };
+      const P = chart(ctx, box, [0, 1], [0, 1], { xt: [0, 0.25, 0.5, 0.75, 1], yt: [0, 0.5, 1], xl: 'p', yl: 'P(零信号)' });
+      const curve = (g, col, wd) => { const pts = []; for (let i = 0; i <= 100; i++) { const q = i / 100; pts.push([P.X(q), P.Y(q ** g + (1 - q) ** g)]); } path(ctx, pts, col, wd); };
+      curve(4, C('--line-2'), 1.5); curve(16, C('--line-2'), 1.5); curve(G, C('--c1'), 3);
+      dot(ctx, P.X(p), P.Y(p ** G + (1 - p) ** G), 6, C('--c2'));
+    });
+    const rd = $('rd-grp');
+    const upd = (resamp) => {
+      $('o-g').textContent = sg.value; $('o-p').textContent = fmt(+sp.value);
+      if (resamp) sample();
+      dg(); dz();
+      const G = R.length, m = R.reduce((a, b) => a + b, 0) / G, sd = Math.sqrt(R.reduce((s, v) => s + (v - m) ** 2, 0) / G), A = advs();
+      const pos = A.find((_, i) => R[i] === 1), neg = A.find((_, i) => R[i] === 0), p = +sp.value, Gs = +sg.value;
+      rd.innerHTML = `<span>均值 <b>${fmt(m)}</b></span><span>std <b>${fmt(sd)}</b></span><span>答对 Â <b>${pos === undefined ? '—' : fmt(pos)}</b></span><span>答错 Â <b>${neg === undefined ? '—' : fmt(neg)}</b></span><span>零信号概率 <b>${fmt(p ** Gs + (1 - p) ** Gs, 3)}</b></span>`;
+    };
+    V4U.seg($('seg-norm'), (v) => { mode = v; if (R.length) upd(false); });
+    sg.addEventListener('input', () => upd(true)); sp.addEventListener('input', () => upd(true));
+    $('bt-grp').addEventListener('click', () => upd(true));
+    upd(true);
+  })();
+
+  /* ---------- 7. toy REINFORCE vs GRPO ---------- */
+  (() => {
+    const names = ['42', '42.0', '32', '52', '不知道'], R0 = [1, 1, 0, 0, 0], th0 = [-0.3, -1.0, 1.5, 0.6, 0.3], MAXS = 400;
+    let A, B, hist, rA, rB, anim = null;
+    const reset = () => { A = th0.slice(); B = th0.slice(); hist = []; rA = rng(101); rB = rng(202); record(); };
+    const record = () => { const pa = softmax(A), pb = softmax(B); hist.push([pa.reduce((s, p, i) => s + p * R0[i], 0), pb.reduce((s, p, i) => s + p * R0[i], 0), entropy(pa) / Math.log(5), entropy(pb) / Math.log(5)]); };
+    const step = () => {
+      const lr = +$('sl-lr').value, G = +$('sl-tg').value, sh = $('ck-shift').checked ? 1 : 0;
+      // REINFORCE, no baseline
+      let pa = softmax(A), ga = [0, 0, 0, 0, 0];
+      for (let i = 0; i < G; i++) { const a = pick(pa, rA()), w = R0[a] + sh; for (let j = 0; j < 5; j++) ga[j] += (w * ((j === a ? 1 : 0) - pa[j])) / G; }
+      A = A.map((v, j) => v + lr * ga[j]);
+      // GRPO (group-normalized)
+      let pb = softmax(B), acts = [], rs = [];
+      for (let i = 0; i < G; i++) { const a = pick(pb, rB()); acts.push(a); rs.push(R0[a] + sh); }
+      const m = rs.reduce((x, y) => x + y, 0) / G, sd = Math.sqrt(rs.reduce((s, v) => s + (v - m) ** 2, 0) / G);
+      let gb = [0, 0, 0, 0, 0];
+      if (sd > 1e-9) acts.forEach((a, i) => { const w = (rs[i] - m) / sd; for (let j = 0; j < 5; j++) gb[j] += (w * ((j === a ? 1 : 0) - pb[j])) / G; });
+      B = B.map((v, j) => v + lr * gb[j]);
+      record();
+    };
+    const p0 = softmax(th0);
+    reset();
+    const bars = (getTh, title) => (ctx, w, h) => {
+      const p = softmax(getTh()), pad = 10, cw = (w - 2 * pad) / 5, base = h - 36, top = 26;
+      ctx.font = F(13, false); ctx.fillStyle = C('--ink'); ctx.textAlign = 'left'; ctx.textBaseline = 'top'; ctx.fillText(title, pad, 4);
+      path(ctx, [[pad, base], [w - pad, base]], C('--line-2'), 1);
+      p.forEach((v, i) => {
+        const cx = pad + cw * (i + 0.5), bw = cw * 0.56, bh = (base - top) * v, b0 = (base - top) * p0[i];
+        ctx.fillStyle = R0[i] ? C('--ok') : C('--c1'); ctx.globalAlpha = R0[i] ? 0.9 : 0.55; ctx.fillRect(cx - bw / 2, base - bh, bw, bh); ctx.globalAlpha = 1;
+        ctx.strokeStyle = C('--ink-2'); ctx.setLineDash([3, 3]); ctx.lineWidth = 1; ctx.strokeRect(cx - bw / 2, base - b0, bw, b0); ctx.setLineDash([]);
+        ctx.fillStyle = C('--ink-2'); ctx.font = F(11, true); ctx.textAlign = 'center'; ctx.textBaseline = 'bottom'; ctx.fillText(fmt(v), cx, base - Math.max(bh, b0) - 3);
+        ctx.fillStyle = C('--ink'); ctx.font = F(12, true); ctx.textBaseline = 'top'; ctx.fillText(names[i], cx, base + 6);
+      });
+    };
+    const hf = (w) => Math.min(250, Math.max(200, w * 0.55));
+    const da = V4U.canvas($('cv-toy-a'), hf, bars(() => A, 'REINFORCE（权重 R）'));
+    const db = V4U.canvas($('cv-toy-b'), hf, bars(() => B, 'GRPO（权重 Â）'));
+    const dc = V4U.canvas($('cv-toy-c'), (w) => Math.min(220, Math.max(180, w * 0.25)), (ctx, w, h) => {
+      const box = { x: 40, y: 12, w: w - 54, h: h - 38 };
+      const P = chart(ctx, box, [0, MAXS], [0, 1], { xt: [0, 100, 200, 300, 400], yt: [0, 0.5, 1], xl: '步数' });
+      path(ctx, hist.map((v, i) => [P.X(i), P.Y(v[2])]), C('--c1'), 1.5, [5, 4]);
+      path(ctx, hist.map((v, i) => [P.X(i), P.Y(v[3])]), C('--c2'), 1.5, [5, 4]);
+      path(ctx, hist.map((v, i) => [P.X(i), P.Y(v[0])]), C('--c1'), 2.5);
+      path(ctx, hist.map((v, i) => [P.X(i), P.Y(v[1])]), C('--c2'), 2.5);
+    });
+    const rd = $('rd-toy'), bt = $('bt-toy');
+    const upd = () => {
+      $('o-lr').textContent = fmt(+$('sl-lr').value); $('o-tg').textContent = $('sl-tg').value;
+      da(); db(); dc();
+      const v = hist[hist.length - 1];
+      rd.innerHTML = `<span>步数 <b>${hist.length - 1}</b></span><span>REINFORCE：E[R] <b>${fmt(v[0])}</b> 熵 <b>${fmt(v[2])}</b></span><span>GRPO：E[R] <b>${fmt(v[1])}</b> 熵 <b>${fmt(v[3])}</b></span>`;
+    };
+    const stop = () => { if (anim) { anim.stop(); anim = null; } bt.textContent = '继续训练'; };
+    bt.addEventListener('click', () => {
+      if (anim) { stop(); return; }
+      if (hist.length > MAXS) return;
+      bt.textContent = '暂停';
+      anim = V4U.loop($('cv-toy-c'), () => { for (let k = 0; k < 2 && hist.length <= MAXS; k++) step(); upd(); if (hist.length > MAXS) stop(); });
+    });
+    $('bt-toy-r').addEventListener('click', () => { stop(); reset(); upd(); });
+    ['sl-lr', 'sl-tg'].forEach((id) => $(id).addEventListener('input', upd));
+    $('ck-shift').addEventListener('change', () => { stop(); reset(); for (let k = 0; k < 60; k++) step(); upd(); });
+    for (let k = 0; k < 60; k++) step(); upd();
+  })();
+
+  /* ---------- 8. loss aggregation ---------- */
+  (() => {
+    let mode = 'seq';
+    const sl = $('sl-lw'), LMAX = 8192;
+    const resp = () => [{ n: 'y₁', ok: 1, L: 300 }, { n: 'y₂', ok: 1, L: 600 }, { n: 'y₃', ok: 0, L: 500 }, { n: 'y₄', ok: 0, L: +sl.value }];
+    const weights = (rs, md) => {
+      const G = rs.length, sum = rs.reduce((s, r) => s + r.L, 0);
+      return rs.map((r) => {
+        const a = md === 'dr' ? 0.5 : 1; // |Â|: GRPO/DAPO std-normalized ±1; Dr. GRPO mean-only ±0.5
+        const per = md === 'seq' ? a / (G * r.L) : md === 'tok' ? a / sum : a / (G * LMAX);
+        return { per, tot: per * r.L };
+      });
+    };
+    const draw = V4U.canvas($('cv-agg'), (w) => (w < 500 ? 300 : 300), (ctx, w, h) => {
+      const rs = resp(), W = weights(rs, mode), lab = 76, x0 = lab + 8, xw = w - x0 - 12, rowH = (h - 30) / 4;
+      const pmax = Math.max(...W.map((v) => v.per));
+      ctx.font = F(11, true); ctx.fillStyle = C('--muted'); ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+      [0, 2000, 4000, 6000, 8000].forEach((t) => { const x = x0 + (t / 8000) * xw; path(ctx, [[x, 4], [x, h - 24]], C('--line'), 1); ctx.fillText(String(t), x, h - 20); });
+      rs.forEach((r, i) => {
+        const yb = 4 + rowH * (i + 1) - 6, hh = (W[i].per / pmax) * (rowH - 14), ww = (r.L / 8000) * xw;
+        ctx.fillStyle = r.ok ? C('--ok-soft') : C('--bad-soft'); ctx.strokeStyle = r.ok ? C('--ok') : C('--bad'); ctx.lineWidth = 1.5;
+        ctx.fillRect(x0, yb - hh, ww, hh); ctx.strokeRect(x0, yb - hh, ww, hh);
+        ctx.fillStyle = C('--ink'); ctx.font = F(12, true); ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+        ctx.fillText(`${r.n} ${r.ok ? '对' : '错'} ${r.L}`, 4, yb - (rowH - 14) / 2);
+      });
+    });
+    const rd = $('rd-agg');
+    const upd = () => {
+      $('o-lw').textContent = sl.value; draw();
+      const rs = resp(), W = weights(rs, mode);
+      rd.innerHTML = `<span>y₄ 每 token 权重 / y₃ 每 token 权重 = <b>${fmt(W[3].per / W[2].per)}</b></span><span>y₄ 总权重 / y₃ 总权重 = <b>${fmt(W[3].tot / W[2].tot)}</b></span><span>y₄ 每 token 权重 = <b>${W[3].per.toExponential(2)}</b></span>`;
+    };
+    V4U.seg($('seg-agg'), (v) => { mode = v; upd(); });
+    sl.addEventListener('input', upd);
+  })();
+});
+</script>
+</body>
+</html>

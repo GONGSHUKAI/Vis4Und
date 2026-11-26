@@ -1,0 +1,1190 @@
+<!doctype html>
+<html lang="zh-CN" data-sec="agentic-rl">
+<head>
+<!-- v4u:head -->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="icon" href="data:,">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700&family=Inter+Tight:wght@700&family=JetBrains+Mono:wght@400;700&family=Noto+Sans+SC:wght@400;700&display=swap">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<link rel="stylesheet" href="../../assets/v4u.css?v=4288b6c4">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
+<script src="../../assets/v4u.js?v=d6640e00"></script>
+<!-- /v4u:head -->
+<title>Robot-Use Agent 的训练 · Vis4Und</title>
+<meta name="description" content="让推理 VLM 像 computer-use agent 那样直接操作机器人：PEAR 的动作接口与仿真里只用成功信号的 RL（组过滤、score centering、课程），nanoAstra 的语义步骤、CP-SFT 与数字损失，以及两者的结果对照。">
+<style>
+:root[data-sec="agentic-rl"]:not([data-v4u-x]){--accent:var(--acc-rl);--accent-soft:var(--acc-rl-soft)}
+.loop-grid{display:grid;grid-template-columns:minmax(0,1.05fr) minmax(0,1fr);gap:0}
+@media (max-width:760px){.loop-grid{grid-template-columns:minmax(0,1fr)}}
+.loop-grid>.viz-stage+.viz-stage{border-left:1px solid var(--line)}
+@media (max-width:760px){.loop-grid>.viz-stage+.viz-stage{border-left:0;border-top:1px solid var(--line)}}
+.io{display:grid;gap:10px;min-width:0}
+.io h5{font:400 11.5px/1.4 var(--f-mono);letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin:0 0 4px}
+.io pre{margin:0;padding:8px 10px;font-size:12px;line-height:1.55;white-space:pre-wrap;overflow-wrap:anywhere}
+.io .think{font-size:14px;line-height:1.7;color:var(--ink-2);background:var(--accent-soft);border-radius:6px;padding:8px 10px;margin:0;max-width:none}
+.io .act pre{border-color:var(--accent)}
+.ctx{display:flex;align-items:center;gap:10px;padding:10px 16px;border-top:1px solid var(--line);font:400 12.5px/1.4 var(--f-mono);color:var(--ink-2)}
+.ctx-bar{flex:1;height:10px;border-radius:5px;background:var(--surface-2);overflow:hidden;display:flex;min-width:60px}
+.ctx-bar i{display:block;height:100%;border-right:1px solid var(--surface)}
+.ctx-bar i.p{background:var(--muted)}
+.ctx-bar i.r{background:var(--accent)}
+.cmds{margin:0;padding:10px 16px 12px 40px;border-top:1px solid var(--line);font:400 13px/1.75 var(--f-mono);color:var(--ink-2);max-width:none;columns:2 260px;column-gap:28px}
+.cmds li{margin:0;break-inside:avoid}
+.cmds li b{color:var(--ink)}
+.tag-i{display:inline-block;font:400 11.5px/1 var(--f-mono);color:var(--accent);border:1px solid var(--accent);border-radius:999px;padding:3px 7px;margin-left:6px;vertical-align:2px}
+.digits{display:flex;flex-wrap:wrap;gap:6px 18px;padding:10px 16px;border-top:1px solid var(--line);font:400 13px/1.5 var(--f-mono);color:var(--ink-2)}
+.digits span b{color:var(--ink)}
+</style>
+</head>
+<body>
+<!-- v4u:nav -->
+<nav class="v4u-nav" aria-label="站点导航"><div class="v4u-nav-in"><span class="v4u-crumb"><a href="../../"><b>Vis4Und</b></a><span class="v4u-sep">/</span><a href="../../#agentic-rl">(3) Agentic RL</a></span><span class="v4u-links"><a href="../llm-rl-basics/">补充 RL 基础</a><a href="../coding-agent/">(i) Coding Agent</a><a href="../robot-use-agent/" aria-current="page">(ii) Robot-Use Agent</a><button type="button" class="v4u-theme" aria-label="切换深浅色">深色</button></span></div></nav>
+<!-- /v4u:nav -->
+
+<header class="hero"><div class="wrap">
+  <p class="kicker">(3) Agentic RL · (ii)</p>
+  <h1>Robot-Use Agent 的训练</h1>
+  <p class="lede">让一个推理 VLM 像 computer-use agent 操作电脑那样操作机器人：每轮看相机画面和机械臂状态，写一段思维链，输出下一步末端位姿。这一页讲动作接口，以及 2026 年 11 月的两条训练路线：PEAR 在仿真里只用任务成功信号做 RL，nanoAstra 把真机示教改写成语义步骤做 SFT。</p>
+  <p class="asks-h">读完能回答</p>
+  <ul class="asks">
+    <li>Robot-use agent 和 VLA、带 harness 的机器人 agent 差在哪？</li>
+    <li>一轮里模型输入什么、输出什么？动作是绝对量还是增量？</li>
+    <li>起点成功率只有 2%、奖励只有 0/1，RL 怎么学得动？</li>
+    <li>全异步 rollout 让采样策略落后 1–2 个版本，score centering 怎么修正？</li>
+    <li>nanoAstra 为什么要给数字单独加一个 Wasserstein 损失？</li>
+  </ul>
+</div></header>
+
+<div class="wrap layout">
+<nav class="toc" id="toc" aria-label="本页目录"></nav>
+<main>
+
+<!-- ============================================================ -->
+<section id="what">
+  <h2>Robot-use agent 是什么</h2>
+  <p class="def"><b>Robot-use agent（RUA）</b>：一个多模态推理模型直接当机器人策略用。每一轮它看观测（相机图像 + 机械臂状态），在思维链里推理，再用文本写出动作；动作由逆运动学和控制器执行，执行结果成为下一轮的观测，之前所有轮都留在上下文里。</p>
+  <p>它和 computer-use agent 一一对应：截图 ↔ 相机画面，<code>click(812, 431)</code> ↔ 末端位姿 JSON，操作系统 ↔ IK + 控制器。PEAR 强调的是<strong>没有 harness</strong>：没有感知工具、抓取或运动规划器、技能库，找物体、估距离、发现动作没做到位，全靠模型自己看图。</p>
+
+  <figure class="viz" id="viz-loop">
+    <div class="viz-h"><b>一集里的几轮：观测 → 思维链 → 增量动作 → 执行</b><span>侧视图，单位 cm；内容为示意</span></div>
+    <div class="loop-grid">
+      <div class="viz-stage"><canvas id="cv-loop" aria-label="机械臂夹爪和方块的侧视图，随轮次移动"></canvas></div>
+      <div class="viz-stage io" aria-live="polite">
+        <div><h5 id="lp-obs-h">第 0 轮 · 观测（状态是绝对值）</h5><pre id="lp-obs"></pre></div>
+        <div><h5>思维链（节选）</h5><p class="think" id="lp-think"></p></div>
+        <div class="act"><h5>动作（每个量的变化）</h5><pre id="lp-act"></pre></div>
+      </div>
+    </div>
+    <div class="ctx"><span>上下文</span><div class="ctx-bar" id="lp-ctx" aria-hidden="true"></div><output id="lp-ctx-o">1.8k</output></div>
+    <div class="viz-ctrl">
+      <button type="button" class="btn ghost" id="lp-prev">上一轮</button>
+      <button type="button" class="btn" id="lp-next">下一轮</button>
+      <button type="button" class="btn ghost" id="lp-play">自动播放</button>
+      <output id="lp-round">第 0 / 5 轮</output>
+    </div>
+    <ul class="chips"><li><i style="background:var(--ink-2)"></i>当前夹爪</li><li><i style="background:var(--line-2)"></i>上一轮的夹爪</li><li><i style="background:var(--accent)"></i>本轮动作（位移）</li><li><i style="background:var(--c5)"></i>方块</li></ul>
+    <figcaption>任务是 PEAR 真机通用抓取的指令格式 “Pick up the block by 10 cm.”。字段名仿照论文附录 H 的 RoboDojo 格式，简化为单臂；思维链是示意文字。上下文条按论文的平均值增长：系统提示约 1.8k token，每轮约 4.7k token（图像、状态、思维链、动作），一集平均 19.7 轮、94k token，LIBERO 的上下文上限是 256k。</figcaption>
+  </figure>
+
+  <h3>三种用 VLM 控制机器人的方式</h3>
+  <div class="tbl"><table>
+    <thead><tr><th>方式</th><th>模型输出</th><th>谁负责几何与执行</th><th>例子</th></tr></thead>
+    <tbody>
+      <tr><td>VLA</td><td>动作头输出连续动作块（关节或末端，几十步）</td><td>模型本身；控制器高频跟踪</td><td>π0.5、OpenVLA、GR00T</td></tr>
+      <tr><td>带 harness 的 agent</td><td>工具调用或代码：调用检测、抓取、运动规划、技能库</td><td>工具和规划器</td><td>ORA、ASPIRE、Harness VLA、PyRUA-Lean</td></tr>
+      <tr><td>Robot-use agent</td><td>文本动作：下一个末端位姿（PEAR），或参数化原语序列（nanoAstra）</td><td>模型自己从图像里估；IK + 控制器只负责走到目标</td><td>PEAR、nanoAstra；也用于评测 GPT-6 Astra 这类闭源模型</td></tr>
+    </tbody>
+  </table></div>
+  <p>据 PEAR 摘要，到 2026 年 11 月，强的 robot-use 表现只出现在闭源前沿模型（GPT-6 Astra、Claude Fable 5.2）上，开源权重模型差得多。两篇论文都想回答：一个开源 VLM 怎么训成 RUA。</p>
+</section>
+
+<!-- ============================================================ -->
+<section id="interface">
+  <h2>动作接口</h2>
+  <p>接口决定了模型要学什么。两篇的选择不同：</p>
+  <div class="tbl"><table>
+    <thead><tr><th></th><th>PEAR</th><th>nanoAstra</th></tr></thead>
+    <tbody>
+      <tr><td>状态</td><td>每个“部件”的每个量的当前值，JSON；长度 cm，角度 rad</td><td>位置 cm，旋转角度（度），夹爪开度 [0, 1]（0 闭合）</td></tr>
+      <tr><td>动作</td><td>同结构的 JSON，写每个量的<strong>变化量</strong>，0 表示不动；每轮一个目标位姿</td><td>一组语义步骤，每步是每条臂的原语列表，如 <code>move x +5.0</code>、<code>gripper close</code>、<code>wait</code>；同一臂的命令合成一个运动，两臂并行</td></tr>
+      <tr><td>每次输出</td><td>思维链 + 一个 JSON 动作（放在最后的 json 代码块里）</td><td><code>progress</code>（当前进度描述）+ <code>steps</code>（平均约 3.5 条命令）；不写思维链</td></tr>
+      <tr><td>执行</td><td>控制器一直走到所有目标都到达且机器人静止，或被挡住停下，然后返回下一个观测</td><td>按顺序执行各步；可以流式执行（见<a href="#nano-results">后文</a>）</td></tr>
+      <tr><td>一集结束</td><td>仿真器报告成功、达到步数上限或上下文 token 上限、回复里没有合法动作</td><td>任务成功或轮数用完</td></tr>
+    </tbody>
+  </table></div>
+  <p>两者都是<strong>末端空间的增量动作</strong>（绝对 / 增量、基座系 / 工具系的区别见 <a href="../action-space/">运动空间</a>）。PEAR 的协议对所有机器人相同，换机器人只换部件列表和 ENVIRONMENT 段落（坐标系、相机朝向、夹爪朝向的文字描述），控制器留在模型外面：</p>
+  <div class="tbl"><table>
+    <thead><tr><th>机器人</th><th>用在</th><th>执行动作的控制器</th></tr></thead>
+    <tbody>
+      <tr><td>Franka（LIBERO，MuJoCo）</td><td>训练、评测</td><td>LIBERO 的操作空间控制器（OSC）</td></tr>
+      <tr><td>双臂 ARX（RoboDojo，Isaac）</td><td>训练、评测</td><td>IK 跟随笛卡尔路点</td></tr>
+      <tr><td>Franka + Robotiq（RoboLab-120）</td><td>零样本评测</td><td>仿真自带</td></tr>
+      <tr><td>双臂 YAM（真机）</td><td>部署，不训练</td><td>机器人自己的 IK 和控制器</td></tr>
+    </tbody>
+  </table></div>
+  <div class="note"><b>Prompt 里的坐标系描述</b><p>模型拿到的只有量的名字和数值，没有任何关于“x 是哪个方向”的隐含信息，所以 ENVIRONMENT 段要用文字写清楚，例如 RoboDojo：原点在两臂基座中点，+x 向前、+y 向左、+z 向上；头部相机里图像上方是 +x、左方是 +y；夹爪初始朝前，roll +1.57 变成朝下。模型要自己把图像方向换算成机器人坐标系。</p></div>
+</section>
+
+<!-- ============================================================ -->
+<section id="rurl">
+  <h2 data-toc="PEAR：Robot-Use RL">PEAR：仿真里的 Robot-Use RL</h2>
+  <p class="def"><b>Robot-Use RL（RURL）</b>：在仿真机器人任务上，以“仿真器报告成功”为唯一奖励，对推理模型做多轮 RL；不用示教、不做 SFT。PEAR（Post-training Engine for Agentic Robotics）是实现它的训练框架，建在 verl 和 LMCache 上。基座是 Qwen3.8-27B。</p>
+
+  <table class="notation">
+    <caption>记号（沿用 PEAR 论文；和 <a href="../llm-rl-basics/">RL 基础</a> 一页的对应关系见右列）</caption>
+    <thead><tr><th>符号</th><th>含义</th><th>备注</th></tr></thead>
+    <tbody>
+      <tr><td>$p$</td><td>系统提示：协议 + ENVIRONMENT + 任务指令</td><td>相当于 $x$</td></tr>
+      <tr><td>$o_t,\ y_t$</td><td>第 $t$ 轮的观测（状态 JSON + 图像）、模型的回复（思维链 + 动作）</td><td>$t=1,\dots,T$</td></tr>
+      <tr><td>$\tau=(o_1,y_1,\dots,o_T,y_T)$</td><td>一集（episode）</td><td>一条轨迹</td></tr>
+      <tr><td>$h_t=(p,o_1,y_1,\dots,o_t)$</td><td>第 $t$ 轮开始时的上下文</td><td></td></tr>
+      <tr><td>$y_{i,t}^{k},\ c_{i,t}^{k}$</td><td>第 $i$ 集第 $t$ 轮回复的第 $k$ 个 token，及其上下文 $(h_{i,t},y_{i,t}^{&lt;k})$</td><td>相当于 $y_t,\ s_t$</td></tr>
+      <tr><td>$\pi_\theta,\ \mu$</td><td>正在训练的策略；实际生成这一集的策略</td><td>$\mu$ 相当于 $\pi_{\theta_\text{old}}$</td></tr>
+      <tr><td>$R(\tau)\in\{0,1\}$</td><td>这一集结束时仿真器是否报告成功</td><td>唯一奖励</td></tr>
+      <tr><td>$G,\ \hat A_i$</td><td>组大小（同任务、同初始状态的 $G$ 集，PEAR 取 8）；第 $i$ 集的优势</td><td></td></tr>
+      <tr><td>$N$</td><td>一个 batch 里所有生成 token 的个数</td><td>token-mean 的分母</td></tr>
+    </tbody>
+  </table>
+
+  <h3>目标和梯度</h3>
+  <ol class="derive">
+    <li><p>目标是最大化期望成功率：</p>$$J(\theta)=\mathbb{E}_{\tau\sim\pi_\theta}\big[R(\tau)\big]$$</li>
+    <li><p>一集的概率里，只有模型生成的 token 依赖 $\theta$；观测 $o_t$ 来自仿真器，求导时是常数：</p>$$\begin{aligned}\log P_\theta(\tau)=&\sum_{t=1}^{T}\sum_{k}\log\pi_\theta\big(y_t^{k}\mid c_t^{k}\big)\\&+\underbrace{\sum_t\log P(o_{t+1}\mid h_t,y_t)}_{\text{与 }\theta\text{ 无关}}\end{aligned}$$</li>
+    <li><p>用对数导数技巧得到策略梯度。所以观测 token（图像、状态）不进损失，所有轮的思维链和动作 token 都进：</p>$$\nabla_\theta J=\mathbb{E}_\tau\Big[R(\tau)\sum_{t,k}\nabla_\theta\log\pi_\theta\big(y_t^{k}\mid c_t^{k}\big)\Big]$$</li>
+    <li><p>同一任务、同一初始状态采 $G$ 集，用组内均值做 baseline、组内标准差归一化（GRPO）：</p>$$\hat A_i=\frac{R(\tau_i)-\operatorname{mean}_j R(\tau_j)}{\operatorname{std}_j R(\tau_j)+\epsilon}$$</li>
+    <li><p>每个生成 token 都拿这一集的 $\hat A_i$，不管它是推理还是动作、在第几轮；按 batch 内生成 token 总数 $N$ 平均（token-mean），不做 PPO 裁剪，不加 KL 惩罚和熵奖励：</p>$$\begin{gathered}g=\frac1N\sum_i\hat A_i\sum_{t,k}\Big[\nabla_\theta\log\pi_\theta\big(y_{i,t}^{k}\mid c_{i,t}^{k}\big)-\bar s_{i,t}^{k}\Big]\\ \bar s_{i,t}^{k}=\mathbb{E}_{v\sim\mu(\cdot\mid c_{i,t}^{k})}\big[\nabla_\theta\log\pi_\theta(v\mid c_{i,t}^{k})\big]\end{gathered}$$<p>第一项是带组均值 baseline 的 REINFORCE；减去的 $\bar s$ 是 score centering，下面单独讲。</p></li>
+  </ol>
+
+  <h3>二值奖励下的组过滤</h3>
+  <p>奖励只有 0/1 时，一组 8 集要么全败、要么全成，$\hat A$ 全为 0，这一组不贡献梯度。PEAR 照 DAPO 的做法把这样的组丢掉、重新采样，直到凑满 128 个有效组。设当前任务的单集成功率为 $q$，一组被保留的概率是</p>
+  <div class="eq">$$\begin{gathered}f(q)=1-q^{G}-(1-q)^{G}\\ \text{凑满 128 组平均要采}\ \ \frac{128}{f(q)}\ \text{组}\end{gathered}$$</div>
+  <p>保留下来的组里，若 $k$ 集成功（$\bar q=k/G$，标准差取总体标准差 $\sqrt{\bar q(1-\bar q)}$），成功集和失败集的优势分别是</p>
+  <div class="eq">$$\hat A_{+}=\sqrt{\frac{1-\bar q}{\bar q}},\qquad \hat A_{-}=-\sqrt{\frac{\bar q}{1-\bar q}}$$</div>
+  <p>成功越稀有，那一次成功被放大得越多：8 集里只成 1 次时 $\hat A_+=2.65$、$\hat A_-=-0.38$。</p>
+
+  <figure class="viz" id="viz-group">
+    <div class="viz-h"><b>拖动单集成功率 q，看哪些组被留下</b><span>G = 8，展示 12 组</span></div>
+    <div class="viz-stage"><canvas id="cv-group" aria-label="12 组 rollout 的成功失败点阵，以及组保留率曲线"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="sl-q">q <input type="range" id="sl-q" min="0" max="1" step="0.005" value="0.02"><output id="o-q">0.020</output></label>
+      <div class="seg" id="seg-q" role="group" aria-label="预设">
+        <button type="button" data-v="0.004">LIBERO-Long 起点 0.4%</button>
+        <button type="button" data-v="0.02" aria-pressed="true">前三套起点 2%</button>
+        <button type="button" data-v="0.25">RoboDojo 起点 25%</button>
+        <button type="button" data-v="0.7">训练后 70%</button>
+      </div>
+    </div>
+    <div class="viz-read" id="rd-group"></div>
+    <ul class="chips"><li><i style="background:var(--ok)"></i>成功的一集</li><li><i style="background:var(--bad)"></i>失败的一集</li><li><i style="background:var(--line-2)"></i>被丢弃的组（全成或全败）</li><li><i style="background:var(--accent)"></i>保留概率 f(q)</li></ul>
+    <figcaption>每组右侧是成功集 / 失败集的优势。起点 q≈2% 时只有约 15% 的组有信号，要采约 860 组才凑够 128 组；q=0.4% 时只剩约 3%。这就是 PEAR 先不训 LIBERO-Long、用课程把成功率先抬起来的原因。</figcaption>
+  </figure>
+
+  <h3>全异步训练与 score centering</h3>
+  <p>PEAR 的 rollout 和参数更新完全异步，生成一集的策略 $\mu$ 比正在训练的 $\pi_\theta$ 落后一到两个版本。在策略（$\mu=\pi_\theta$）时，score 的期望恒为零：</p>
+  <div class="eq">$$\begin{aligned}\mathbb{E}_{v\sim\pi_\theta}\big[\nabla_\theta\log\pi_\theta(v)\big]&=\sum_v\pi_\theta(v)\frac{\nabla_\theta\pi_\theta(v)}{\pi_\theta(v)}\\&=\nabla_\theta\sum_v\pi_\theta(v)=\nabla_\theta 1=0\end{aligned}$$</div>
+  <p>token 从 $\mu$ 采时，这个期望不再为零，即使某个位置上选哪个 token 和成败毫无关系，梯度也会有一个系统性的漂移。Score centering 直接减掉它在 $\mu$ 下的期望。看 logits 最清楚：</p>
+  <ol class="derive">
+    <li><p>设这一位置的 logits 为 $z$，$\pi=\operatorname{softmax}(z)$，对 logits 的 score 是</p>$$\nabla_z\log\pi(y)=\mathbf e_y-\pi$$</li>
+    <li><p>它在 $\mu$ 下的期望：</p>$$\mathbb{E}_{v\sim\mu}\big[\mathbf e_v-\pi\big]=\mu-\pi$$</li>
+    <li><p>减掉后，每个 token 对 logits 的梯度变成</p>$$\begin{gathered}(\mathbf e_y-\pi)-(\mu-\pi)=\mathbf e_y-\mu\\ \mathbb{E}_{y\sim\mu}\big[\mathbf e_y-\mu\big]=0\end{gathered}$$<p>也就是用采样时的分布 $\mu$ 代替当前分布 $\pi$ 做中心化。不修正时，这个位置的期望梯度是 $\hat A(\mu-\pi)$：$\hat A&gt;0$ 把 $\pi$ 往 $\mu$ 拉，$\hat A&lt;0$ 往远推（这三步是本页的推导，不是论文原文）。</p></li>
+  </ol>
+  <p>PEAR 只用这一项修正分布差异，不用截断重要性采样（TIS，见 <a href="../llm-rl-basics/#practice">RL 基础 · 实践问题</a>）。</p>
+
+  <figure class="viz" id="viz-sc">
+    <div class="viz-h"><b>一个 token 位置：采样分布 μ 和当前分布 π 不同步时</b><span>6 个候选 token；logits 梯度</span></div>
+    <div class="viz-stage"><canvas id="cv-sc" aria-label="μ 和 π 的概率柱，以及修正前后的 logits 梯度"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="sl-lag">策略已更新的程度 <input type="range" id="sl-lag" min="0" max="1.5" step="0.01" value="0.8"><output id="o-lag">0.80</output></label>
+      <label for="sl-adv">Â <input type="range" id="sl-adv" min="-2" max="2" step="0.05" value="1"><output id="o-adv">1.00</output></label>
+      <div class="seg" id="seg-sc" role="group" aria-label="梯度类型"><button type="button" data-v="exp" aria-pressed="true">期望梯度</button><button type="button" data-v="one">单次采样</button></div>
+      <button type="button" class="btn ghost" id="bt-draw">从 μ 再抽一个</button>
+    </div>
+    <div class="viz-read" id="rd-sc"></div>
+    <ul class="chips"><li><i style="background:var(--line-2)"></i>μ：生成这一集的旧策略</li><li><i style="background:var(--c1)"></i>π：当前策略</li><li><i style="background:var(--c2)"></i><span>不修正：Â(e<sub>y</sub> − π)</span></li><li><i style="background:var(--c3)"></i><span>score centering：Â(e<sub>y</sub> − μ)</span></li></ul>
+    <figcaption>“期望梯度”假设这个位置选什么 token 与成败无关（大多数 token 如此）：不修正时仍有 Â(μ − π) 的漂移，修正后严格为 0。“策略已更新的程度”为 0 时 μ = π，两者一致。</figcaption>
+  </figure>
+
+  <h3>课程：先训有信号的任务</h3>
+  <p>基座在 LIBERO 的 Spatial / Object / Goal 上约 2%，在 LIBERO-Long 上 0.4%，在大多数 RoboDojo 任务上几乎为 0。PEAR 的办法是先训已经偶尔能成功的任务，靠迁移把其他任务的成功率抬起来，再把它们加进训练：</p>
+  <figure class="viz" id="viz-curve">
+    <div class="viz-h"><b>训练 rollout 的成功率，三个阶段</b><span>横轴 RL 步，纵轴 %</span></div>
+    <div class="viz-stage"><canvas id="cv-curve" aria-label="PEAR 训练曲线：340 步，三个课程阶段"></canvas></div>
+    <div class="viz-ctrl">
+      <div class="seg" id="seg-curve" role="group" aria-label="曲线"><button type="button" data-v="both" aria-pressed="true">逐步 + 平滑</button><button type="button" data-v="ema">只看平滑</button></div>
+    </div>
+    <div class="viz-read" id="rd-curve"><span>在图上拖动读数</span></div>
+    <ul class="chips"><li><i style="background:var(--c1s)"></i>第 1–148 步：LIBERO Goal + Spatial + Object</li><li><i style="background:var(--c3s)"></i>第 149–225 步：加入 LIBERO-Long</li><li><i style="background:var(--c5s)"></i>第 226–340 步：RoboDojo general_pickup + align_blocks</li><li><i style="background:var(--ink)"></i>LIBERO 评测（2,000 集）</li></ul>
+    <figcaption>数据取自 PEAR 博客图 2、图 7 的曲线。第 148 步（还没训过 LIBERO-Long）时 LIBERO 总评测 64.0%，其中 LIBERO-Long 已从 0.4% 升到 39.0%；第 184、225 步为 69.5%、74.4%。RoboDojo 阶段从第 225 步的 LIBERO 终点出发，两个任务的训练成功率从约 25% 升到约 70%。</figcaption>
+  </figure>
+
+  <h3>训练配置</h3>
+  <div class="tbl"><table>
+    <tbody>
+      <tr><td>算法</td><td>GRPO 组归一化优势 + DAPO 组过滤 + score centering；REINFORCE 损失，无 PPO 裁剪</td></tr>
+      <tr><td>Batch</td><td>每步 128 组 × 8 集（过滤后计数），每步更新一次</td></tr>
+      <tr><td>优化</td><td>AdamW，学习率 $10^{-6}$；token-mean；无 KL、无熵奖励；采样温度 1.0</td></tr>
+      <tr><td>推理强度</td><td>所有 rollout 都用 xhigh</td></tr>
+      <tr><td>序列长度上限</td><td>LIBERO 256k token，RoboDojo 160k token；一整集是一条训练序列</td></tr>
+      <tr><td>一集有多长</td><td>平均 94k token（提示 1.8k + 回复 92k），19.7 轮，39–59 张图；训练开始时 119k / 19.9 轮，结束时 82k / 18.5 轮</td></tr>
+      <tr><td>系统</td><td>verl 全异步；LMCache 把前缀 KV cache 放到 CPU 内存，限制并发让前缀命中率保持 95% 以上；FSDP + 序列并行装下整集；rollout 用模型自带的 MTP 层做投机解码</td></tr>
+      <tr><td>仿真</td><td>LIBERO 在 rollout 节点的 CPU 上渲染；RoboDojo 跑在单独 GPU 节点的 Isaac 容器里</td></tr>
+      <tr><td>算力</td><td>约 5 万 H100 等效 GPU 小时（论文估计新版 PEAR 约 3 万）</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<!-- ============================================================ -->
+<section id="pear-results">
+  <h2>PEAR：结果</h2>
+  <figure class="viz" id="viz-res">
+    <div class="viz-h"><b>PEAR 的结果</b><span id="res-unit">成功率 %</span></div>
+    <div class="viz-ctrl" style="border-top:0">
+      <div class="seg" id="seg-res" role="group" aria-label="结果">
+        <button type="button" data-v="libero" aria-pressed="true">LIBERO</button>
+        <button type="button" data-v="pro">换任务 / 换措辞</button>
+        <button type="button" data-v="transfer">迁移与真机</button>
+        <button type="button" data-v="robolab">RoboLab-120</button>
+        <button type="button" data-v="effort">推理长度</button>
+        <button type="button" data-v="general">通用能力</button>
+      </div>
+    </div>
+    <div class="viz-stage"><canvas id="cv-res" aria-label="PEAR 结果条形图"></canvas></div>
+    <figcaption id="res-cap"></figcaption>
+  </figure>
+  <ul>
+    <li><strong>从近零起步也能学</strong>：1.6% → 74.4%，接近 GPT-6 Astra / GPT-6.1 Sol 的 max 档，但仍低于对每个任务做示教 SFT 的 π0.5（96.9%）。</li>
+    <li><strong>差别在换任务</strong>：LIBERO-Pro 的“同一场景换一个任务”，π0.5 从 96.9% 掉到 0.75%（照旧做训练时那个任务），PEAR 模型从 74.4% 掉到 57.4%。只改措辞或物体外观时 π0.5 仍领先。</li>
+    <li><strong>迁移</strong>：只在 LIBERO 上训，换到 RoboDojo 的双臂 ARX、换仿真器，general_pickup 10.7% → 39.9%；再在 RoboDojo 上训 115 步后，真机双臂 YAM 30 次成功 18 次（基座 0 次），没有用过任何真机数据。</li>
+    <li><strong>代价是慢</strong>：xhigh 平均每轮思考 3.23k token；改用 low（0.86k token/轮）成功率降到 21.9%。GB300 上 747 token/s 时，一轮 xhigh 思考约 4.3 s。</li>
+  </ul>
+  <h3>论文自述的局限</h3>
+  <ul>
+    <li>规模小：两个仿真器、两个 RoboDojo 任务、27B 基座，受 GPU 限制没有继续放大。</li>
+    <li>没做 SFT：缺高质量同分布数据，也担心损伤通用能力；作者认为机器人数据应进预训练 / 中训练，而不是对已后训练的模型做 SFT。</li>
+    <li>慢：RL 不惩罚长度，个别轮思维链到 32k token，单步动作超过半分钟。</li>
+    <li>依赖 prompt：基座对所控制的本体了解少，难任务要在 prompt 里把本体和任务写得很细。</li>
+    <li>还不能可靠地输出动作块，只输出下一个位姿，精度部分取决于控制器，复杂动作要拆成很多轮。完整 RoboDojo 基准上，540 集里有 370 集因为 256k 上下文用完而失败。</li>
+  </ul>
+</section>
+
+<!-- ============================================================ -->
+<section id="nanoastra">
+  <h2 data-toc="nanoAstra：语义步骤 + CP-SFT">nanoAstra：语义步骤与 CP-SFT</h2>
+  <p class="def"><b>nanoAstra</b>：把 5,310 小时真机和手持夹爪示教切成“语义步骤”，让 VLM 用普通文本写出当前进度和接下来的几步参数化原语，没有单独的动作头。训练是一轮全参 SFT（基座 Qwen3.5-9B），同时混入通用 VQA 数据以保住原有能力。作者的动机是复现 GPT-6 Astra 那种直接控制机器人的泛化能力。</p>
+
+  <h3>语义步骤：在决策点切开示教</h3>
+  <p>VLA 学的是按固定频率采样的动作块，同一个行为会因为控制频率、速度、局部修正而变成不同的序列。nanoAstra 在<strong>行为决策点</strong>切开轨迹：夹爪开合、停顿、急转弯、手腕大幅旋转；子任务边界一定是切点。每段变成一个步骤，用平移、旋转、夹爪、等待四类原语表示，配一句描述局部目标的进度文本（由 Qwen3.5-122B-A10B 给子任务视频片段打标）。</p>
+
+  <figure class="viz" id="viz-seg">
+    <div class="viz-h"><b>一条抓放示教怎么切成语义步骤</b><span>侧视图 x–z，单位 cm；轨迹为示意</span></div>
+    <div class="viz-stage"><canvas id="cv-seg" aria-label="一条抓取放置轨迹，标出切点和按步骤直线执行的路径"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="sl-turn">急转弯阈值 <input type="range" id="sl-turn" min="15" max="120" step="1" value="35"><output id="o-turn">35°</output></label>
+      <label for="sl-pause">停顿最短 <input type="range" id="sl-pause" min="0.2" max="1.2" step="0.05" value="0.5"><output id="o-pause">0.50 s</output></label>
+    </div>
+    <div class="viz-read" id="rd-seg"></div>
+    <ol class="cmds" id="seg-cmds"></ol>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>夹爪张开时的轨迹</li><li><i style="background:var(--c2)"></i>夹爪闭合时的轨迹</li><li><i style="background:var(--accent)"></i>切点（决策点）</li><li><i style="background:var(--ink-2)"></i>按步骤直线执行的路径</li></ul>
+    <figcaption>示意实现：停顿 = 速度低于 0.5 cm/s 持续超过阈值；急转弯 = 前后 0.25 s 的位移方向夹角超过阈值；夹爪状态变化总是切点。每一步写成该段起止的位移（只写 x、z 两个轴，略去旋转）。调高转弯阈值时，抬起和弧形搬运会被并成一步直线，执行路径和示教偏离；这与论文失败分析里“开微波炉门的每一步都是直线平移，门只开了一半”是同一类问题。</figcaption>
+  </figure>
+
+  <h3>数据</h3>
+  <div class="tbl"><table>
+    <thead><tr><th>来源</th><th>类型</th><th>保留小时数</th></tr></thead>
+    <tbody>
+      <tr><td>ABC-130K</td><td>真机</td><td class="num">1,203.4</td></tr>
+      <tr><td>AgiBot</td><td>真机</td><td class="num">990.0</td></tr>
+      <tr><td>HiFi-UMI</td><td>手持夹爪</td><td class="num">1,784.6</td></tr>
+      <tr><td>HY-UMI</td><td>手持夹爪</td><td class="num">1,332.5</td></tr>
+      <tr><td>合计</td><td>约 818K 集，14.9M 个语义步骤样本</td><td class="num">5,310.5</td></tr>
+      <tr><td>Honey-Data-V2</td><td>通用 VQA（问答、grounding、图表文档、空间与具身理解等）</td><td class="num">1.55M 条</td></tr>
+    </tbody>
+  </table></div>
+  <p>总共约 3.65B 可训练 token，机器人 2.29B（62.7%），通用 1.36B（37.3%）。异构数据要先对齐几何约定：统一参考系、夹爪轴、位姿表示（各种四元数布局和 6D 表示都转成同一种四元数，见 <a href="../rotations/">旋转与位姿</a>）；末端参考点尽量换到两指尖中点；每集把坐标原点在每个轴上随机平移 ±30 cm，避免记住数据集特定的绝对位置；外参缺失或不准的数据集重新标定主相机，让投影的末端点落在画面里的夹爪上（相机外参见 <a href="../camera/">相机模型与标定</a>）。</p>
+
+  <h3>CP-SFT：用系统提示圈出一块输出空间</h3>
+  <p>一个专门的机器人系统提示 $c_r$ 写明本体、坐标约定、动作词表和回复格式。给定输入 $x$（图像、状态、指令、交互历史），模型输出进度 $g$ 和步骤 $A$，结构化回复空间是</p>
+  <div class="eq">$$\mathcal Y_r(c_r)=\big\{\operatorname{Serialize}(g,A)\ \big|\ g\in\mathcal G,\ A\in\mathcal A(c_r)\big\}$$</div>
+  <p>所有机器人监督都落在带 $c_r$ 的这块空间里；不带 $c_r$ 时同一个模型照常用自然语言回答。作者的意图是让适配集中在机器人上下文里，少改动其他情况下的输出分布（“软约束”，论文没有给出隔离程度的定量分析）。</p>
+
+  <h3>数字的 Wasserstein 损失</h3>
+  <p>交叉熵只看正确数字的概率：目标是 5 时，把概率放在 4 上和放在 9 上损失一样。动作里全是数字，nanoAstra 在 CE 之外加了一个改造过的 Wasserstein Number Token Loss（原方法见 Zausinger et al.）。</p>
+  <table class="notation">
+    <caption>记号</caption>
+    <thead><tr><th>符号</th><th>含义</th><th>形状</th></tr></thead>
+    <tbody>
+      <tr><td>$\nu,\ y_\nu$</td><td>回复里的一个数字，及它的目标数值</td><td>标量</td></tr>
+      <tr><td>$D_\nu$</td><td>$\nu$ 的各个数位</td><td>集合</td></tr>
+      <tr><td>$d_j,\ 10^{e_j}$</td><td>第 $j$ 位的目标数字和它的位值（$12.5$ 的三位 $e_j=1,0,-1$）</td><td>$d_j\in\{0,\dots,9\}$</td></tr>
+      <tr><td>$T_\nu,\ w_j$</td><td>$T_\nu=\sum_{j}10^{e_j}$；位权 $w_j=10^{e_j}/T_\nu$</td><td>标量</td></tr>
+      <tr><td>$\tilde p_j(v)$</td><td>第 $j$ 位上，softmax 只在 10 个数字 token 上重新归一化后的分布</td><td>10 维</td></tr>
+      <tr><td>$z_\text{true},\ z_\text{flip}$</td><td>正确符号 token 与符号相反 token 的 logit</td><td>标量</td></tr>
+      <tr><td>$\lambda$</td><td>数字损失的权重，取 0.3</td><td>标量</td></tr>
+    </tbody>
+  </table>
+  <ol class="derive">
+    <li><p>两个一维离散分布 $P,Q$ 的 Wasserstein-1 距离等于累积分布之差的面积。目标是单点分布 $\delta_{d}$ 时，把 $\tilde p$ 的每一份质量从 $v$ 搬到 $d$，代价就是距离 $|v-d|$：</p>$$W_1(\tilde p,\delta_d)=\sum_{v=0}^{9}\tilde p(v)\,|v-d|$$</li>
+    <li><p>按位值加权求和，高位错一格的代价是低位的 10 倍：</p>$$\ell^{\text{digit}}_\nu=\sum_{j\in D_\nu}w_j\sum_{v=0}^{9}\tilde p_j(v)\,|v-d_j|$$</li>
+    <li><p>数位损失看不到符号错误（$+3.0$ 和 $-3.0$ 的数位一样），所以单独监督符号；数值越大，符号错的代价越大：</p>$$\ell^{\text{sign}}_\nu=\frac{2|y_\nu|}{T_\nu}\,\sigma\big(z_\text{flip}-z_\text{true}\big)$$<p>其中 $\sigma(z_\text{flip}-z_\text{true})=\dfrac{e^{z_\text{flip}}}{e^{z_\text{flip}}+e^{z_\text{true}}}$，是两个符号 token 之间错号所占的比例；没有显式符号的数字这一项为 0。</p></li>
+    <li><p>对样本 $s$ 中的所有数字 $N_s$ 取平均，再和 CE 相加；$\mathcal B$ 是一个优化步里跨 GPU、跨梯度累积的全部原始样本，保证打包（packing）后每个样本权重相同：</p>$$\begin{gathered}\ell^{\text{num}}_s=\frac{1}{|N_s|}\sum_{\nu\in N_s}\big(\ell^{\text{digit}}_\nu+\ell^{\text{sign}}_\nu\big)\\ \mathcal L=\frac{1}{|\mathcal B|}\sum_{s\in\mathcal B}\big(\ell^{\text{CE}}_s+\lambda\,\ell^{\text{num}}_s\big)\end{gathered}$$</li>
+  </ol>
+
+  <figure class="viz" id="viz-ntl">
+    <div class="viz-h"><b>同样的交叉熵，不同的数字损失</b><span>选一个目标数和一位</span></div>
+    <div class="viz-ctrl" style="border-top:0">
+      <div class="seg" id="seg-num" role="group" aria-label="目标数"><button type="button" data-v="+12.5" aria-pressed="true">+12.5</button><button type="button" data-v="-3.0">−3.0</button><button type="button" data-v="+40.2">+40.2</button></div>
+      <div class="seg" id="seg-dig" role="group" aria-label="数位"></div>
+    </div>
+    <div class="viz-stage"><canvas id="cv-ntl" aria-label="10 个数字 token 上的预测分布"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="sl-peak">预测峰值 <input type="range" id="sl-peak" min="0" max="9" step="1" value="4"><output id="o-peak">4</output></label>
+      <label for="sl-mass">峰值概率 <input type="range" id="sl-mass" min="0.1" max="0.99" step="0.01" value="0.8"><output id="o-mass">0.80</output></label>
+      <label for="sl-flip">错号比例 σ <input type="range" id="sl-flip" min="0" max="1" step="0.01" value="0.1"><output id="o-flip">0.10</output></label>
+    </div>
+    <div class="viz-read" id="rd-ntl"></div>
+    <div class="digits" id="ntl-w"></div>
+    <ul class="chips"><li><i style="background:var(--ok)"></i>目标数字</li><li><i style="background:var(--c1)"></i>预测分布 p̃(v)</li></ul>
+    <figcaption>预测分布 = 峰值数字上放“峰值概率”，其余均分给另外 9 个数字。峰值不在目标上时，移动峰值位置不改变交叉熵（目标的概率不变），Wasserstein 项随距离线性增加。下方给出这个数各位的位权 w；数字损失按“其他位都预测准确”计算。</figcaption>
+  </figure>
+
+  <h3>训练设置</h3>
+  <p>Qwen3.5-9B 初始化，ms-swift 实现，56 张 H20 训一个 epoch；每步 56 个数据包（平均约 188 个原始样本）；AdamW，峰值学习率 $10^{-5}$，cosine 调度，warmup 1%，weight decay 0.1；最长 8,192 token，每张图 392 个视觉 token；bf16，DeepSpeed ZeRO-2；全参微调。</p>
+</section>
+
+<!-- ============================================================ -->
+<section id="nano-results">
+  <h2>nanoAstra：结果与流式执行</h2>
+  <figure class="viz" id="viz-rt">
+    <div class="viz-h"><b>RoboTwin 2.0 零样本（随机化设置，50 个任务，每任务 10 次）</b><span>成功率 %</span></div>
+    <div class="viz-stage"><canvas id="cv-rt" aria-label="RoboTwin 2.0 零样本成功率条形图"></canvas></div>
+    <ul class="chips"><li><i style="background:var(--c3)"></i>nanoAstra-9B</li><li><i style="background:var(--c2)"></i>VLA</li><li><i style="background:var(--c5)"></i>世界动作模型（WAM）</li><li><i style="background:var(--c1)"></i>VLM，带思考</li><li><i style="background:var(--line-2)"></i>VLM，不思考</li></ul>
+    <figcaption>nanoAstra 只用真实数据训练，没见过仿真轨迹和 RoboTwin 示教。它本身不思考，比不思考的 Qwen3.5-9B 高 14.6 个点，也比带思考的更大 Qwen 模型高。RoboDojo Open（8 个任务，400 集）上为 4.75%（19/400），未微调的 Qwen3.5-9B（不思考）为 0.25%。</figcaption>
+  </figure>
+
+  <h3>推理时间 vs 动作时间</h3>
+  <p>I/M = 一次推理的耗时 / 这次推理产生的动作要执行多久。小于 1 时推理可以藏在执行后面。</p>
+  <div class="tbl"><table>
+    <thead><tr><th>模型</th><th>推理</th><th>一次产出</th><th>动作时长</th><th>I/M</th></tr></thead>
+    <tbody>
+      <tr><td>π0.5</td><td class="num">101 ms</td><td class="num">45.0 步</td><td class="num">2.70 s</td><td class="num">0.037</td></tr>
+      <tr><td>StarVLA</td><td class="num">70 ms</td><td class="num">16.0 步</td><td class="num">0.96 s</td><td class="num">0.073</td></tr>
+      <tr><td>X-VLA</td><td class="num">143 ms</td><td class="num">28.6 步</td><td class="num">1.71 s</td><td class="num">0.084</td></tr>
+      <tr><td>Fast-WAM</td><td class="num">523 ms</td><td class="num">27.3 步</td><td class="num">1.64 s</td><td class="num">0.32</td></tr>
+      <tr><td>Motus</td><td class="num">1.93 s</td><td class="num">16.0 步</td><td class="num">0.96 s</td><td class="num">2.01</td></tr>
+      <tr><td>LingBot-VA</td><td class="num">8.89 s</td><td class="num">22.2 步</td><td class="num">1.33 s</td><td class="num">6.67</td></tr>
+      <tr><td>Qwen3.5-9B 带思考</td><td class="num">60.7 s</td><td class="num">1.6 条命令</td><td class="num">1.42 s</td><td class="num">42.8</td></tr>
+      <tr><td>nanoAstra（RTX 4090）</td><td class="num">3.89 s</td><td class="num">3.5 条命令</td><td class="num">2.87 s</td><td class="num">1.36</td></tr>
+      <tr><td>nanoAstra（H20）</td><td class="num">1.69 s</td><td class="num">3.5 条命令</td><td class="num">2.66 s</td><td class="num">0.64</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>流式执行</strong>：步骤一写出来就开始执行；剩下不超过两步时，把新的观测发给模型，并把这两步预填成下一次回复的开头，模型接着往后写。</p>
+
+  <figure class="viz" id="viz-stream">
+    <div class="viz-h"><b>阻塞执行 vs 流式执行</b><span>横轴时间 s</span></div>
+    <div class="viz-stage"><canvas id="cv-stream" aria-label="两种执行方式下推理和运动的时间线"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="sl-inf">一次推理耗时 <input type="range" id="sl-inf" min="0.4" max="5" step="0.01" value="1.69"><output id="o-inf">1.69 s</output></label>
+      <div class="seg" id="seg-inf" role="group" aria-label="硬件预设"><button type="button" data-v="1.69" aria-pressed="true">H20 1.69 s</button><button type="button" data-v="3.89">RTX 4090 3.89 s</button></div>
+    </div>
+    <div class="viz-read" id="rd-stream"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>模型在推理</li><li><i style="background:var(--c3)"></i>机器人在执行一步</li><li><i style="background:var(--bad)"></i>机器人在等</li></ul>
+    <figcaption>示意模拟：每次回复交替产出 3 步和 4 步（平均 3.5），每步执行 0.76 s（2.66 s / 3.5），流式时各步在推理期间均匀写出。论文实测（RoboTwin，仿真器在推理期间不暂停，每任务 5 次）：阻塞执行等待时间占 35.0%、成功率 11.2%；流式执行 6.9%、12.9%。推理慢于动作（如 RTX 4090）时，流式也藏不住等待。</figcaption>
+  </figure>
+
+  <h3>通用能力保留与失败案例</h3>
+  <div class="tbl"><table>
+    <thead><tr><th>基准</th><th>训练前</th><th>训练后</th><th>变化</th></tr></thead>
+    <tbody>
+      <tr><td>MMMU</td><td class="num">58.6</td><td class="num">53.1</td><td class="num">−5.5</td></tr>
+      <tr><td>ERQA</td><td class="num">47.3</td><td class="num">41.0</td><td class="num">−6.3</td></tr>
+      <tr><td>CV-Bench-2D</td><td class="num">82.2</td><td class="num">81.6</td><td class="num">−0.6</td></tr>
+      <tr><td>CV-Bench-3D</td><td class="num">92.6</td><td class="num">87.6</td><td class="num">−5.0</td></tr>
+    </tbody>
+  </table></div>
+  <p>VQA 精度训练初期下降后回升并稳定，没有持续恶化，但仍有 5–6 个点的损失。两个典型失败都是走了很多步后轮数用完：开微波炉门时每一步都是直线平移，门只开一半；把罐子放进篮子后，进度描述退回已完成的子任务，后来又漂到干扰物鞋子上。作者认为需要面向铰接物体的原语，以及显式记录已完成的子任务。</p>
+</section>
+
+<!-- ============================================================ -->
+<section id="compare">
+  <h2>两条路线对照</h2>
+  <div class="tbl"><table>
+    <thead><tr><th></th><th>典型 VLA（π0.5）</th><th>nanoAstra</th><th>PEAR</th></tr></thead>
+    <tbody>
+      <tr><td>模型</td><td>VLM + 动作专家</td><td>Qwen3.5-9B，全参 SFT</td><td>Qwen3.8-27B 推理模型，只做 RL</td></tr>
+      <tr><td>动作表示</td><td>连续动作块</td><td>文本原语序列 + 进度描述</td><td>文本 JSON：下一个末端位姿的增量</td></tr>
+      <tr><td>训练信号</td><td>示教模仿</td><td>5,310 h 真实示教改写后的 SFT + VQA 共训</td><td>仿真任务成功与否（0/1），没有示教</td></tr>
+      <tr><td>仿真</td><td>评测用</td><td>只评测（RoboTwin 2.0、RoboDojo）</td><td>训练和评测（LIBERO、RoboDojo）</td></tr>
+      <tr><td>思维链</td><td>无</td><td>无</td><td>有，xhigh 平均 3.23k token/轮</td></tr>
+      <tr><td>每次调用</td><td>约 0.1 s，几十步动作</td><td>H20 上 1.69 s，约 3.5 条命令，可流式执行</td><td>GB300 上约 4.3 s 思考，一个位姿，执行到位再观察</td></tr>
+      <tr><td>通用能力</td><td>—</td><td>MMMU −5.5，ERQA −6.3</td><td>9 项基准平均 −0.15，配对 95% 区间都含 0</td></tr>
+      <tr><td>短板</td><td>任务或布局一变就照旧执行训练过的动作</td><td>直线原语处理不了铰接物体；进度会漂</td><td>慢；动作块不可靠；依赖详细 prompt；长任务上下文耗尽</td></tr>
+    </tbody>
+  </table></div>
+  <div class="note"><b>解读</b><p>两篇的基座、规模、评测集都不同，表里的数字不能直接比高低。可以比较的是取舍：nanoAstra 用大量真实示教换来“不思考也能直接出动作”和低延迟，但 SFT 损失了一些通用能力；PEAR 不碰示教，用 RL 和长思维链换来换任务时的鲁棒性和几乎无损的通用能力，代价是每一步都慢。PEAR 引用的 “RL’s Razor”（在新任务上做 RL 比 SFT 遗忘少）和这两组通用能力数字的方向一致，但这不是受控对比。</p></div>
+</section>
+
+<!-- ============================================================ -->
+<section id="related">
+  <h2>相关工作</h2>
+  <div class="tbl"><table>
+    <thead><tr><th>类别</th><th>工作（据 PEAR 和 nanoAstra 的相关工作部分）</th></tr></thead>
+    <tbody>
+      <tr><td>Computer-use agent 的 RL</td><td>OpenAI CUA（先监督学习再 RL）、<a href="https://arxiv.org/abs/2406.11896">DigiRL</a>（Android）、<a href="https://arxiv.org/abs/2411.02337">WebRL</a>（网页）、<a href="https://arxiv.org/abs/2509.02544">UI-TARS-2</a>（桌面，多轮 RL）</td></tr>
+      <tr><td>闭源前沿模型直接当 RUA 的评测</td><td>GPT-6 Astra 在仿真和真机上的多篇评测（如 Astranomy、RoboICL）；RoboDojo 的 agent 赛道排行</td></tr>
+      <tr><td>带 harness 的 RUA</td><td>ORA、<a href="https://arxiv.org/abs/2607.00272">ASPIRE</a>、Harness VLA、OpenRUA、RAX、uni-robot-agent、<a href="https://arxiv.org/abs/2610.01939">PyRUA-Lean</a></td></tr>
+      <tr><td>在 harness 里训练开源模型</td><td>PyRUA-Lean（RL）；CaPtain、AgenticRoboRL、ZAP（SFT 后多轮 RL）</td></tr>
+      <tr><td>VLM 直接做操作的 agent</td><td>RoboDawn、Robo-Harness K1（nanoAstra 引用）</td></tr>
+      <tr><td>RL 算法</td><td><a href="https://arxiv.org/abs/2402.03300">GRPO（DeepSeekMath）</a>、<a href="https://arxiv.org/abs/2503.14476">DAPO</a>、Score Centering（Marek &amp; Ryabinin, 2026）、REINFORCE</td></tr>
+      <tr><td>SFT 与 RL 的遗忘和泛化</td><td><a href="https://arxiv.org/abs/2509.04259">RL’s Razor</a>、<a href="https://arxiv.org/abs/2501.17161">SFT Memorizes, RL Generalizes</a></td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<!-- ============================================================ -->
+<section id="open">
+  <h2>还没解决的问题</h2>
+  <p>以下是本页的解读，不是论文的结论。</p>
+  <ul>
+    <li><strong>延迟</strong>：PEAR 每步几秒，nanoAstra 靠不思考和流式把推理藏起来。在 RL 里加长度奖励（PEAR 留作未来工作）或把思考蒸馏短，是否会掉成功率，还没有数据。</li>
+    <li><strong>动作粒度</strong>：单个位姿太细（轮数多、上下文爆），直线原语太粗（铰接物体做不了）。介于两者之间的是让模型可靠地写出动作块或带曲线的原语。</li>
+    <li><strong>奖励</strong>：只用 0/1 成功信号，需要课程才能起步；稀疏任务（如完整 RoboDojo）大部分仍学不到。部分完成的进度分（RoboLab 的 Score 这类）能否当奖励，未验证。</li>
+    <li><strong>上下文</strong>：一集近 10 万 token，长任务会用完上下文。PEAR 的代码库后来加了通过 Claude Code 服务模型、上下文满时压缩对话的部署方式，但训练时仍是整集一条序列。</li>
+    <li><strong>两条路线能否合并</strong>：nanoAstra 式的真实示教放进中训练、再做 PEAR 式仿真 RL，正是 PEAR 作者在局限里提议的数据用法，目前没有人报告结果。</li>
+  </ul>
+</section>
+
+<!-- ============================================================ -->
+<section id="quiz">
+  <h2>自测</h2>
+  <details class="q"><summary>PEAR 的动作是绝对位姿还是增量？单位是什么？</summary><div><p>增量。状态 JSON 给每个量的当前绝对值，动作 JSON 给每个量的变化量，长度用 cm、角度用 rad，不动的量写 0。执行到所有目标到达且静止（或被挡住）才返回下一个观测。</p></div></details>
+  <details class="q"><summary>为什么第一阶段不训 LIBERO-Long？</summary><div><p>基座在 LIBERO-Long 上成功率 0.4%，8 集一组几乎全败，组过滤后几乎没有可用的组，RL 没信号。先训另外三套，LIBERO-Long 靠迁移升到 39.0% 后再加入；同时它也成了干净的迁移测试。</p></div></details>
+  <details class="q"><summary>单集成功率 2%、组大小 8 时，大约多少比例的组能留下？</summary><div><p>$f=1-0.98^8-0.02^8\approx0.149$，约 15%。凑满 128 组平均要采约 860 组。</p></div></details>
+  <details class="q"><summary>Score centering 在 logits 层面等价于什么？为什么需要它？</summary><div><p>把每个 token 的 logits 梯度从 $\mathbf e_y-\pi$ 换成 $\mathbf e_y-\mu$，即用采样时的分布做中心化。全异步时 $\mu\ne\pi$，不修正的话即使 token 与回报无关，期望梯度也有 $\hat A(\mu-\pi)$ 的漂移；修正后期望为 0。</p></div></details>
+  <details class="q"><summary>π0.5 在 LIBERO 上 96.9%，在 LIBERO-Pro “同场景换任务”上只有 0.75%，说明什么？</summary><div><p>示教模仿学到的是“这个场景做这个动作”。指令换成另一个任务时，它照旧做训练过的任务。PEAR 模型在这里是 57.4%，掉得少，因为它是读指令和画面再推理动作。只改措辞或外观时 π0.5 仍领先，因为原动作依然正确。</p></div></details>
+  <details class="q"><summary>nanoAstra 为什么要加数字的 Wasserstein 损失？符号项解决什么？</summary><div><p>交叉熵只看正确数字的概率，错成相邻数字和错得很远代价一样；Wasserstein 项按 $|v-d|$ 计代价，并按位值加权，让高位更重要。数位损失看不出 $+3.0$ 和 $-3.0$ 的区别，符号项单独惩罚错号，权重随数值大小增大。</p></div></details>
+  <details class="q"><summary>I/M = 0.64 意味着什么？为什么 RTX 4090 上流式执行效果差？</summary><div><p>H20 上一次推理 1.69 s，产生的动作要执行 2.66 s，推理比动作快，下一次回复可以在剩下两步执行完之前写出新步骤，机器人几乎不用等。RTX 4090 上推理 3.89 s，比动作长（I/M=1.36），新步骤写出的速度跟不上执行，流式也会出现等待。</p></div></details>
+</section>
+
+<section id="refs">
+  <h2>延伸阅读</h2>
+  <ol class="refs">
+    <li><b>Tang, Zhang, Guo et al., Training Reasoning Models in Simulation to Natively Use Real Robots</b>（PEAR），2026. <a href="https://arxiv.org/abs/2611.18562">arXiv:2611.18562</a> · <a href="https://mit-han-lab.github.io/pear-blog/">博客</a> · <a href="https://github.com/mit-han-lab/pear">代码</a> · <a href="https://huggingface.co/collections/mit-han-lab/pear">权重</a></li>
+    <li><b>Guo, Zhang, Mo et al., A Glimpse of Training VLMs as Foundation Models for Robotic Manipulation</b>（nanoAstra），2026. <a href="https://arxiv.org/abs/2611.29338">arXiv:2611.29338</a> · <a href="https://nanoastra.github.io/">项目页</a> · <a href="https://github.com/Hugo-AGI/nanoAstra">代码</a> · <a href="https://huggingface.co/Hugo-AGI/nanoAstra">权重</a></li>
+    <li><b>Shao et al., DeepSeekMath</b>（GRPO），2024. <a href="https://arxiv.org/abs/2402.03300">arXiv:2402.03300</a></li>
+    <li><b>Yu et al., DAPO: An Open-Source LLM Reinforcement Learning System at Scale</b>, 2025. <a href="https://arxiv.org/abs/2503.14476">arXiv:2503.14476</a></li>
+    <li><b>Zausinger et al., Regress, Don’t Guess: A Regression-like Loss on Number Tokens for Language Models</b>（Number Token Loss），2024. <a href="https://arxiv.org/abs/2411.02083">arXiv:2411.02083</a></li>
+    <li><b>Shenfeld et al., RL’s Razor: Why Online Reinforcement Learning Forgets Less</b>, 2025. <a href="https://arxiv.org/abs/2509.04259">arXiv:2509.04259</a></li>
+    <li><b>Wang et al., UI-TARS-2 Technical Report</b>（computer-use 的多轮 RL），2025. <a href="https://arxiv.org/abs/2509.02544">arXiv:2509.02544</a></li>
+    <li><b>Si et al., Fewer Tokens, Better Action</b>（PyRUA-Lean，带 harness 的对照路线），2026. <a href="https://arxiv.org/abs/2610.01939">arXiv:2610.01939</a></li>
+    <li>基准：<a href="https://arxiv.org/abs/2306.03310">LIBERO</a> · <a href="https://arxiv.org/abs/2607.04434">RoboDojo</a> · <a href="https://arxiv.org/abs/2506.18088">RoboTwin 2.0</a> · 对照的 VLA：<a href="https://arxiv.org/abs/2504.16054">π0.5</a></li>
+  </ol>
+</section>
+
+</main>
+</div>
+
+<!-- v4u:foot -->
+<footer class="v4u-foot"><div class="v4u-foot-in"><a class="pv" href="../coding-agent/"><span>上一篇</span>Coding Agent 的训练</a></div></footer>
+<!-- /v4u:foot -->
+
+<script>
+V4U.ready(() => {
+  const C = (n) => V4U.css(n);
+  const F = (px, w) => `${w || 400} ${px}px ${C('--f-body')}`;
+  const M = (px, w) => `${w || 400} ${px}px ${C('--f-mono')}`;
+  const $ = (id) => document.getElementById(id);
+  const fmt = V4U.fmt;
+
+  /* ---------- shared: horizontal bars ---------- */
+  // rows: {label, v, color, txt} or {head}
+  function barsHeight(rows, o) {
+    let h = (o.top || 6) + 26;
+    rows.forEach((r) => { h += r.head ? 22 : (o.rowH || 26); });
+    return h;
+  }
+  function hbars(ctx, w, rows, o) {
+    const lw = Math.min(o.labelW || 170, Math.max(96, w * 0.42));
+    const x0 = lw, x1 = w - 56, max = o.max;
+    const X = (v) => x0 + ((x1 - x0) * v) / max;
+    let y = o.top || 6;
+    const rh = o.rowH || 26, bh = 14;
+    const yStart = y;
+    let total = 0; rows.forEach((r) => { total += r.head ? 22 : rh; });
+    // grid
+    ctx.strokeStyle = C('--line'); ctx.lineWidth = 1;
+    ctx.fillStyle = C('--muted'); ctx.font = M(11); ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+    o.ticks.forEach((t) => {
+      const x = Math.round(X(t)) + 0.5;
+      ctx.beginPath(); ctx.moveTo(x, yStart); ctx.lineTo(x, yStart + total); ctx.stroke();
+      ctx.fillText(String(t), x, yStart + total + 6);
+    });
+    ctx.textBaseline = 'middle';
+    rows.forEach((r) => {
+      if (r.head) {
+        ctx.fillStyle = C('--ink'); ctx.font = F(12.5, 700); ctx.textAlign = 'left';
+        ctx.fillText(r.head, 0, y + 12, w); y += 22; return;
+      }
+      ctx.fillStyle = C('--ink-2'); ctx.font = F(12.5); ctx.textAlign = 'right';
+      ctx.fillText(r.label, x0 - 8, y + rh / 2, x0 - 10);
+      const bw = Math.max(1.5, X(r.v) - x0);
+      ctx.fillStyle = r.color; ctx.fillRect(x0, y + (rh - bh) / 2, bw, bh);
+      ctx.fillStyle = C('--ink'); ctx.font = M(12, r.bold ? 700 : 400); ctx.textAlign = 'left';
+      ctx.fillText(r.txt != null ? r.txt : r.v.toFixed(1), x0 + bw + 6, y + rh / 2);
+      y += rh;
+    });
+  }
+
+  /* =========================================================
+     1. Round loop
+     ========================================================= */
+  (() => {
+    const fx = (s) => s.toFixed(1);
+    const rounds = [
+      { x: 10, z: 21, g: 1, think: '指令是把方块抬起 10 cm。头部相机里方块在夹爪正前方，按桌面网格估计相距约 19 cm，夹爪已朝下张开。先平移到方块正上方，高度不变。', a: null },
+      { dx: 19.0, dz: 0, dg: 0, think: '先平移到方块正上方，高度不变。估计前方 19 cm。' },
+      { dx: 0, dz: -15.0, dg: 0, think: '夹爪在方块上方。先降到方块顶面上方约 1 cm，再从腕部相机确认两指是否在方块两侧。' },
+      { dx: 1.5, dz: -5.5, dg: 0, think: '腕部相机里右指几乎压在方块边缘，方块中心比夹爪中心靠前约 1.5 cm。前移 1.5 cm，同时降到指尖接近桌面。' },
+      { dx: 0, dz: 0, dg: -1, think: '两指分在方块两侧，高度合适。闭合夹爪。' },
+      { dx: 0, dz: 10.0, dg: 0, think: '夹爪已闭合，指间宽度和方块一致，说明夹住了。竖直抬起 10 cm。' },
+    ];
+    // compute states
+    const st = [{ x: 10, z: 21, g: 1 }];
+    for (let i = 1; i < rounds.length; i++) {
+      const p = st[i - 1], r = rounds[i];
+      st.push({ x: p.x + r.dx, z: p.z + r.dz, g: Math.max(0, p.g + r.dg) });
+    }
+    const block = { cx: 30.5, w: 5, h: 5 };
+    let cur = 0, anim = null, playT = null;
+    let view = { x: st[0].x, z: st[0].z, g: st[0].g }, prev = null;
+    const cv = $('cv-loop');
+    const draw = V4U.canvas(cv, (w) => Math.max(240, Math.min(330, w * 0.72)), (ctx, w, h) => {
+      const xmin = -3, xmax = 42, zmin = -3, zmax = 32;
+      const s = Math.min(w / (xmax - xmin), h / (zmax - zmin));
+      const ox = (w - s * (xmax - xmin)) / 2 - s * xmin, oy = h - (h - s * (zmax - zmin)) / 2 + s * zmin;
+      const P = (x, z) => [ox + s * x, oy - s * z];
+      // table
+      const [tx0, ty] = P(xmin, 0), [tx1] = P(xmax, 0);
+      ctx.fillStyle = C('--surface-2'); ctx.fillRect(tx0, ty, tx1 - tx0, h - ty);
+      ctx.strokeStyle = C('--line-2'); ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(tx0, ty); ctx.lineTo(tx1, ty); ctx.stroke();
+      // ruler ticks every 10 cm
+      ctx.fillStyle = C('--muted'); ctx.font = M(10.5); ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+      for (let x = 0; x <= 40; x += 10) { const [px, py] = P(x, 0); ctx.fillRect(px - 0.5, py, 1, 5); ctx.fillText(String(x), px, py + 7); }
+      // block (attached when closed and above table)
+      const grasped = view.g < 0.5 && Math.abs(view.x - block.cx) < 1 && cur >= 4;
+      const bz = grasped ? Math.max(0, view.z - 0.5) : 0;
+      const [bx0, by1] = P(block.cx - block.w / 2, bz + block.h), [bx1, by0] = P(block.cx + block.w / 2, bz);
+      ctx.fillStyle = C('--c5'); ctx.fillRect(bx0, by1, bx1 - bx0, by0 - by1);
+      const gripper = (x, z, g, col, lw) => {
+        const half = 2.5 + 1.5 * g; // 4 cm open half-width, 2.5 closed
+        const [ax, az] = P(x, 31), [px, pz] = P(x, z + 7);
+        ctx.strokeStyle = col; ctx.lineWidth = lw * 2; ctx.lineCap = 'round';
+        ctx.beginPath(); ctx.moveTo(ax, az); ctx.lineTo(px, pz); ctx.stroke();
+        const [l0] = P(x - half - 0.6, 0), [r0] = P(x + half + 0.6, 0);
+        ctx.lineWidth = lw * 2; ctx.beginPath(); ctx.moveTo(l0, pz); ctx.lineTo(r0, pz); ctx.stroke();
+        [-1, 1].forEach((sg) => {
+          const [fx0, fy0] = P(x + sg * (half + 0.3), z + 7), [, fy1] = P(x, z);
+          ctx.lineWidth = lw * 1.6; ctx.beginPath(); ctx.moveTo(fx0, fy0); ctx.lineTo(fx0, fy1); ctx.stroke();
+        });
+        ctx.lineCap = 'butt';
+      };
+      if (prev) gripper(prev.x, prev.z, prev.g, C('--line-2'), 1.5);
+      gripper(view.x, view.z, view.g, C('--ink-2'), 2);
+      if (prev && (Math.abs(prev.x - st[cur].x) > 0.01 || Math.abs(prev.z - st[cur].z) > 0.01)) {
+        const [a0, b0] = P(prev.x, prev.z), [a1, b1] = P(st[cur].x, st[cur].z);
+        ctx.strokeStyle = C('--accent'); ctx.lineWidth = 2; ctx.setLineDash([5, 4]);
+        ctx.beginPath(); ctx.moveTo(a0, b0); ctx.lineTo(a1, b1); ctx.stroke(); ctx.setLineDash([]);
+        const ang = Math.atan2(b1 - b0, a1 - a0);
+        ctx.fillStyle = C('--accent'); ctx.beginPath();
+        ctx.moveTo(a1, b1); ctx.lineTo(a1 - 9 * Math.cos(ang - 0.4), b1 - 9 * Math.sin(ang - 0.4)); ctx.lineTo(a1 - 9 * Math.cos(ang + 0.4), b1 - 9 * Math.sin(ang + 0.4)); ctx.fill();
+      }
+      if (cur === 5 && !anim) {
+        ctx.fillStyle = C('--ok'); ctx.font = F(13, 700); ctx.textAlign = 'right'; ctx.textBaseline = 'top';
+        ctx.fillText('成功', w - 6, 6);
+      }
+    });
+    const stateJSON = (s) => `{"arm": {"x": ${fx(s.x)}, "y": 0.0, "z": ${fx(s.z)},\n         "roll": 3.14, "pitch": 0.0, "yaw": 0.0},\n "gripper": {"width": ${s.g}}}`;
+    const actJSON = (r) => `{"arm": {"x": ${fx(r.dx)}, "y": 0, "z": ${fx(r.dz)},\n         "roll": 0, "pitch": 0, "yaw": 0},\n "gripper": {"width": ${r.dg}}}`;
+    const ctxBar = $('lp-ctx');
+    const update = () => {
+      // observation shown = state at start of the *next* decision (state after current round)
+      const obsRound = cur;
+      $('lp-obs-h').textContent = cur === 0 ? '第 1 轮开始 · 观测（状态是绝对值）' : `第 ${cur} 轮执行后 · 新观测`;
+      $('lp-obs').textContent = stateJSON(st[cur]);
+      if (cur === 0) {
+        $('lp-think').textContent = '（第 0 轮：只有系统提示、指令 “Pick up the block by 10 cm.” 和初始观测。点“下一轮”看模型的第一次回复。）';
+        $('lp-act').textContent = '—';
+      } else {
+        $('lp-think').textContent = rounds[cur].think;
+        $('lp-act').textContent = actJSON(rounds[cur]);
+      }
+      if (cur === 5) $('lp-obs-h').textContent = '第 5 轮执行后 · 仿真器报告成功，这一集结束';
+      $('lp-round').textContent = `第 ${cur} / 5 轮`;
+      const tok = 1.8 + 4.7 * cur;
+      $('lp-ctx-o').textContent = `${tok.toFixed(1)}k / 256k`;
+      let html = `<i class="p" style="width:${(1.8 / 256) * 100}%"></i>`;
+      for (let i = 0; i < cur; i++) html += `<i class="r" style="width:${(4.7 / 256) * 100}%"></i>`;
+      ctxBar.innerHTML = html;
+      $('lp-prev').disabled = cur === 0; $('lp-next').disabled = cur === 5;
+      void obsRound;
+    };
+    const go = (k) => {
+      if (k < 0 || k > 5) return;
+      const from = { x: view.x, z: view.z, g: view.g };
+      prev = k > 0 ? st[k - 1] : null;
+      cur = k; update();
+      const to = st[k];
+      if (anim) cancelAnimationFrame(anim);
+      if (matchMedia('(prefers-reduced-motion: reduce)').matches) { view = { ...to }; anim = null; draw(); return; }
+      const t0 = performance.now(), dur = 700;
+      const step = (now) => {
+        const u = Math.min(1, (now - t0) / dur), e = u * u * (3 - 2 * u);
+        view = { x: V4U.lerp(from.x, to.x, e), z: V4U.lerp(from.z, to.z, e), g: V4U.lerp(from.g, to.g, e) };
+        draw();
+        anim = u < 1 ? requestAnimationFrame(step) : null;
+        if (!anim) draw();
+      };
+      anim = requestAnimationFrame(step);
+    };
+    $('lp-next').addEventListener('click', () => go(cur + 1));
+    $('lp-prev').addEventListener('click', () => { prev = null; go(cur - 1); });
+    $('lp-play').addEventListener('click', (e) => {
+      if (playT) { clearInterval(playT); playT = null; e.target.textContent = '自动播放'; return; }
+      e.target.textContent = '停止';
+      if (cur === 5) { prev = null; cur = 0; view = { ...st[0] }; update(); draw(); }
+      playT = setInterval(() => {
+        if (cur >= 5) { clearInterval(playT); playT = null; e.target.textContent = '自动播放'; return; }
+        go(cur + 1);
+      }, 1700);
+    });
+    update(); draw();
+  })();
+
+  /* =========================================================
+     2. Group filter
+     ========================================================= */
+  (() => {
+    const G = 8, NG = 12;
+    let seed = 7;
+    const rnd = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; };
+    const U = Array.from({ length: NG }, () => Array.from({ length: G }, rnd));
+    const sl = $('sl-q'), out = $('o-q'), rd = $('rd-group');
+    const keep = (q) => 1 - Math.pow(q, G) - Math.pow(1 - q, G);
+    const draw = V4U.canvas($('cv-group'), (w) => (w < 520 ? 470 : 340), (ctx, w, h) => {
+      const q = +sl.value;
+      const narrow = w < 520;
+      // dots area
+      const gw = narrow ? w : w * 0.56;
+      const rowH = narrow ? 22 : 24.5, top = 6;
+      const r = Math.min(7, (gw - 150) / (G * 2.6));
+      let kept = 0;
+      ctx.textBaseline = 'middle';
+      for (let gi = 0; gi < NG; gi++) {
+        const y = top + gi * rowH + rowH / 2;
+        const succ = U[gi].map((u) => u < q);
+        const k = succ.filter(Boolean).length;
+        const drop = k === 0 || k === G;
+        if (!drop) kept++;
+        ctx.fillStyle = C('--muted'); ctx.font = M(11); ctx.textAlign = 'left';
+        ctx.fillText(`组${gi + 1}`, 0, y);
+        for (let i = 0; i < G; i++) {
+          const x = 40 + i * r * 2.6 + r;
+          ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2);
+          ctx.fillStyle = drop ? C('--line-2') : succ[i] ? C('--ok') : C('--bad');
+          ctx.fill();
+        }
+        const tx = 40 + G * r * 2.6 + 8;
+        ctx.font = M(11.5); ctx.textAlign = 'left';
+        if (drop) { ctx.fillStyle = C('--muted'); ctx.fillText(k === 0 ? '全败，丢弃' : '全成，丢弃', tx, y); }
+        else {
+          const qb = k / G, ap = Math.sqrt((1 - qb) / qb), an = -Math.sqrt(qb / (1 - qb));
+          ctx.fillStyle = C('--ok'); ctx.fillText(`+${ap.toFixed(2)}`, tx, y);
+          ctx.fillStyle = C('--bad'); ctx.fillText(`${an.toFixed(2)}`, tx + 46, y);
+        }
+      }
+      // curve
+      const cx0 = narrow ? 34 : gw + 44, cx1 = w - 22;
+      const cy0 = narrow ? top + NG * rowH + 22 : 14, cy1 = narrow ? h - 24 : h - 26;
+      const X = (v) => cx0 + (cx1 - cx0) * v, Y = (v) => cy1 - (cy1 - cy0) * v;
+      ctx.strokeStyle = C('--line'); ctx.lineWidth = 1; ctx.fillStyle = C('--muted'); ctx.font = M(10.5);
+      [0, 0.25, 0.5, 0.75, 1].forEach((t) => {
+        ctx.beginPath(); ctx.moveTo(X(0), Y(t) + 0.5); ctx.lineTo(X(1), Y(t) + 0.5); ctx.stroke();
+        ctx.textAlign = 'right'; ctx.textBaseline = 'middle'; ctx.fillText(t.toFixed(2).replace(/0$/, ''), X(0) - 5, Y(t));
+        ctx.textAlign = 'center'; ctx.textBaseline = 'top'; ctx.fillText(`${Math.round(t * 100)}%`, X(t), cy1 + 6);
+      });
+      ctx.strokeStyle = C('--accent'); ctx.lineWidth = 2.2; ctx.beginPath();
+      for (let i = 0; i <= 200; i++) { const v = i / 200; const px = X(v), py = Y(keep(v)); i ? ctx.lineTo(px, py) : ctx.moveTo(px, py); }
+      ctx.stroke();
+      ctx.fillStyle = C('--accent'); ctx.beginPath(); ctx.arc(X(q), Y(keep(q)), 5, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = C('--ink-2'); ctx.font = F(12); ctx.textAlign = 'left'; ctx.textBaseline = 'bottom';
+      ctx.fillText('f(q)', X(0) + 4, cy0 - 1 + 12);
+      const f = keep(q);
+      rd.innerHTML = `<span>保留概率 f(q) = <b>${(f * 100).toFixed(1)}%</b></span><span>凑满 128 组约需采 <b>${f > 1e-6 ? Math.round(128 / f).toLocaleString() : '∞'}</b> 组</span><span>本图 12 组中保留 <b>${kept}</b> 组</span>`;
+    });
+    const set = V4U.seg($('seg-q'), (v) => { sl.value = v; out.textContent = (+v).toFixed(3); draw(); });
+    void set;
+    sl.addEventListener('input', () => { out.textContent = (+sl.value).toFixed(3); $('seg-q').querySelectorAll('button').forEach((b) => b.setAttribute('aria-pressed', 'false')); draw(); });
+  })();
+
+  /* =========================================================
+     3. Score centering
+     ========================================================= */
+  (() => {
+    const toks = ['-', '1', '2', '5', '0', '+'];
+    const zMu = [2.0, 1.2, 0.6, 0.3, -0.2, -0.8];
+    const dir = [-1.2, 0.9, 0.5, 0.3, -0.1, -0.4];
+    const sm = (z) => { const m = Math.max(...z); const e = z.map((v) => Math.exp(v - m)); const s = e.reduce((a, b) => a + b, 0); return e.map((v) => v / s); };
+    const mu = sm(zMu);
+    let mode = 'exp', yIdx = 0;
+    const drawY = () => { let u = Math.random(), i = 0; while (i < mu.length - 1 && u > mu[i]) { u -= mu[i]; i++; } yIdx = i; };
+    drawY();
+    const lag = $('sl-lag'), adv = $('sl-adv'), rd = $('rd-sc');
+    const draw = V4U.canvas($('cv-sc'), (w) => (w < 520 ? 460 : 320), (ctx, w, h) => {
+      const s = +lag.value, A = +adv.value;
+      const pi = sm(zMu.map((z, i) => z + s * dir[i]));
+      const narrow = w < 520;
+      const n = toks.length;
+      // panel geometry
+      const pA = narrow ? { x: 34, y: 28, w: w - 40, h: h * 0.5 - 60 } : { x: 34, y: 30, w: w * 0.46 - 40, h: h - 62 };
+      const pB = narrow ? { x: 34, y: h * 0.5 + 34, w: w - 40, h: h * 0.5 - 60 } : { x: w * 0.5 + 34, y: 30, w: w * 0.5 - 40, h: h - 62 };
+      // panel A: probabilities
+      const pmax = 0.7;
+      const YA = (v) => pA.y + pA.h - (pA.h * v) / pmax;
+      ctx.strokeStyle = C('--line'); ctx.lineWidth = 1; ctx.fillStyle = C('--muted'); ctx.font = M(10.5); ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+      [0, 0.2, 0.4, 0.6].forEach((t) => { ctx.beginPath(); ctx.moveTo(pA.x, Math.round(YA(t)) + 0.5); ctx.lineTo(pA.x + pA.w, Math.round(YA(t)) + 0.5); ctx.stroke(); ctx.fillText(t.toFixed(1), pA.x - 5, YA(t)); });
+      const cw = pA.w / n;
+      for (let i = 0; i < n; i++) {
+        const x = pA.x + i * cw, bw = cw * 0.32;
+        ctx.fillStyle = C('--line-2'); ctx.fillRect(x + cw * 0.15, YA(mu[i]), bw, YA(0) - YA(mu[i]));
+        ctx.fillStyle = C('--c1'); ctx.fillRect(x + cw * 0.15 + bw + 2, YA(pi[i]), bw, YA(0) - YA(pi[i]));
+        ctx.fillStyle = (mode === 'one' && i === yIdx) ? C('--accent') : C('--ink-2'); ctx.font = M(13, mode === 'one' && i === yIdx ? 700 : 400); ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+        ctx.fillText(toks[i], x + cw / 2, YA(0) + 5);
+      }
+      // panel B: gradients
+      const g1 = [], g2 = [];
+      for (let i = 0; i < n; i++) {
+        if (mode === 'exp') { g1.push(A * (mu[i] - pi[i])); g2.push(0); }
+        else { const e = i === yIdx ? 1 : 0; g1.push(A * (e - pi[i])); g2.push(A * (e - mu[i])); }
+      }
+      const gmax = mode === 'exp' ? 0.5 : 2;
+      const YB = (v) => pB.y + pB.h / 2 - (pB.h / 2) * (v / gmax);
+      ctx.strokeStyle = C('--line'); ctx.fillStyle = C('--muted'); ctx.font = M(10.5); ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+      [-gmax, -gmax / 2, 0, gmax / 2, gmax].forEach((t) => { ctx.beginPath(); ctx.moveTo(pB.x, Math.round(YB(t)) + 0.5); ctx.lineTo(pB.x + pB.w, Math.round(YB(t)) + 0.5); ctx.stroke(); ctx.fillText(String(+t.toFixed(2)), pB.x - 5, YB(t)); });
+      ctx.strokeStyle = C('--ink-2'); ctx.beginPath(); ctx.moveTo(pB.x, Math.round(YB(0)) + 0.5); ctx.lineTo(pB.x + pB.w, Math.round(YB(0)) + 0.5); ctx.stroke();
+      const cwB = pB.w / n;
+      for (let i = 0; i < n; i++) {
+        const x = pB.x + i * cwB, bw = cwB * 0.32;
+        const clip = (v) => V4U.clamp(v, -gmax, gmax);
+        ctx.fillStyle = C('--c2'); const y1 = YB(clip(g1[i])); ctx.fillRect(x + cwB * 0.15, Math.min(y1, YB(0)), bw, Math.max(1, Math.abs(YB(0) - y1)));
+        ctx.fillStyle = C('--c3'); const y2 = YB(clip(g2[i])); ctx.fillRect(x + cwB * 0.15 + bw + 2, Math.min(y2, YB(0)), bw, Math.max(1, Math.abs(YB(0) - y2)));
+        ctx.fillStyle = (mode === 'one' && i === yIdx) ? C('--accent') : C('--ink-2'); ctx.font = M(13, mode === 'one' && i === yIdx ? 700 : 400); ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+        ctx.fillText(toks[i], x + cwB / 2, pB.y + pB.h + 5);
+      }
+      ctx.fillStyle = C('--ink'); ctx.font = F(12.5, 700); ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+      ctx.fillText('概率', pA.x, pA.y - 24);
+      ctx.fillText(mode === 'exp' ? '对 logits 的期望梯度' : `对 logits 的梯度（抽到 “${toks[yIdx]}”）`, pB.x, pB.y - 24);
+      const kl = mu.reduce((a, m, i) => a + m * Math.log(m / pi[i]), 0);
+      const bias = mu.reduce((a, m, i) => a + Math.abs(A * (m - pi[i])), 0);
+      rd.innerHTML = `<span>KL(μ‖π) = <b>${kl.toFixed(3)}</b></span><span>不修正的期望漂移 ‖Â(μ−π)‖₁ = <b>${bias.toFixed(3)}</b></span><span>修正后 = <b>0</b></span>`;
+      $('o-lag').textContent = s.toFixed(2); $('o-adv').textContent = A.toFixed(2);
+    });
+    // panel B title sits above; make room on wide layout via pB.y=12 (title drawn at y=0)
+    V4U.seg($('seg-sc'), (v) => { mode = v; $('bt-draw').disabled = v !== 'one'; draw(); });
+    lag.addEventListener('input', draw); adv.addEventListener('input', draw);
+    $('bt-draw').addEventListener('click', () => { drawY(); draw(); });
+  })();
+
+  /* =========================================================
+     4. Training curve (digitized from the PEAR blog, Fig. 2 and Fig. 7)
+     ========================================================= */
+  (() => {
+    const D = [[1,1.9,1.9],[2,1.9,1.9],[3,1.8,1.9],[4,1.8,1.9],[5,2.3,2.0],[6,3.0,2.1],[7,2.4,2.3],[8,3.0,2.5],[9,3.2,2.8],[10,3.4,3.0],[11,3.3,3.1],[12,4.3,3.5],[13,5.0,3.9],[14,4.8,4.2],[15,5.3,4.6],[16,6.8,5.3],[17,8.1,6.0],[18,7.1,6.4],[19,9.2,7.3],[20,12.4,8.7],[21,11.1,9.6],[22,8.6,9.6],[23,9.5,10.2],[24,12.6,10.8],[25,11.3,10.6],[26,15.0,11.4],[27,13.7,12.4],[28,14.6,13.5],[29,15.1,14.0],[30,14.1,14.5],[31,16.8,14.9],[32,19.8,16.1],[33,33.3,19.8],[34,19.1,20.6],[35,18.2,21.4],[36,15.7,21.2],[37,20.6,21.4],[38,22.9,19.3],[39,21.5,19.8],[40,22.7,20.7],[41,23.6,22.3],[42,22.8,22.7],[43,23.3,22.8],[44,21.4,22.7],[45,25.1,23.2],[46,33.4,25.2],[47,71.6,35.0],[48,25.6,35.4],[49,17.3,34.6],[50,23.4,34.3],[51,24.1,32.4],[52,27.7,23.6],[53,28.7,24.2],[54,27.6,26.3],[55,40.9,29.8],[56,35.0,32.0],[57,32.8,33.0],[58,25.3,32.3],[59,39.5,34.7],[60,34.6,33.4],[61,31.2,32.7],[62,38.3,33.8],[63,34.1,35.5],[64,42.4,36.1],[65,38.6,36.9],[66,40.0,38.7],[67,42.5,39.5],[68,36.4,40.0],[69,43.5,40.2],[70,24.0,37.3],[71,40.6,37.4],[72,38.6,36.6],[73,41.7,37.7],[74,62.1,41.4],[75,59.8,48.6],[76,50.6,50.6],[77,30.8,49.0],[78,44.0,49.5],[79,50.1,47.1],[80,37.7,42.6],[81,44.2,41.3],[82,46.0,44.4],[83,55.7,46.8],[84,45.9,45.9],[85,58.4,50.0],[86,72.8,55.7],[87,70.6,60.7],[88,55.5,60.6],[89,55.9,62.7],[90,51.3,61.2],[91,43.5,55.4],[92,42.6,49.8],[93,53.9,49.4],[94,57.3,49.7],[95,54.8,50.4],[96,53.3,52.3],[97,52.9,54.4],[98,55.7,54.8],[99,51.4,53.6],[100,55.3,53.7],[101,54.7,54.0],[102,53.5,54.1],[103,58.6,54.7],[104,54.1,55.2],[105,57.3,55.6],[106,52.9,55.3],[107,49.9,54.6],[108,67.6,56.4],[109,64.9,58.5],[110,53.6,57.8],[111,55.7,58.3],[112,55.2,59.4],[113,54.5,56.8],[114,59.8,55.7],[115,50.8,55.2],[116,65.1,57.1],[117,66.7,59.4],[118,61.8,60.9],[119,64.8,61.8],[120,65.2,64.7],[121,64.1,64.5],[122,64.9,64.2],[123,61.5,64.1],[124,59.2,63.0],[125,62.1,62.4],[126,61.3,61.8],[127,61.4,61.1],[128,80.7,65.0],[129,77.6,68.6],[130,71.2,70.4],[131,72.5,72.7],[132,72.0,74.8],[133,73.5,73.4],[134,48.9,67.6],[135,62.8,65.9],[136,75.2,66.5],[137,70.2,66.1],[138,76.9,66.8],[139,73.3,71.7],[140,73.7,73.9],[141,70.9,73.0],[142,71.2,73.2],[143,71.7,72.2],[144,71.5,71.8],[145,84.4,73.9],[146,74.4,74.6],[147,35.3,67.5],[148,62.9,65.7],[149,65.4,64.5],[150,96.8,67.0],[151,97.6,71.6],[152,85.2,81.6],[153,73.1,83.6],[154,50.6,80.7],[155,62.6,73.8],[156,37.5,61.8],[157,54.0,55.5],[158,73.4,55.6],[159,63.9,58.3],[160,55.7,56.9],[161,54.6,60.4],[162,65.6,62.7],[163,68.6,61.7],[164,62.4,61.4],[165,60.5,62.3],[166,64.0,64.2],[167,81.8,67.5],[168,74.9,68.7],[169,55.7,67.3],[170,68.3,68.9],[171,68.4,69.8],[172,64.4,66.3],[173,84.4,68.2],[174,79.5,73.0],[175,75.7,74.5],[176,42.5,69.3],[177,63.0,69.0],[178,68.7,65.9],[179,69.1,63.8],[180,70.8,62.8],[181,47.8,63.9],[182,36.1,58.5],[183,83.7,61.5],[184,55.0,58.7],[185,67.0,57.9],[186,86.1,65.6],[187,67.3,71.8],[188,81.1,71.3],[189,48.9,70.1],[190,74.6,71.6],[191,66.6,67.7],[192,73.8,69.0],[193,68.5,66.5],[194,63.4,69.4],[195,70.3,68.5],[196,69.1,69.0],[197,67.7,67.8],[198,70.9,68.3],[199,71.2,69.8],[200,69.1,69.6],[201,65.9,68.9],[202,70.4,69.5],[203,71.1,69.5],[204,68.6,69.0],[205,92.7,73.7],[206,82.3,77.0],[207,76.6,78.3],[208,61.6,76.4],[209,55.3,73.7],[210,59.6,67.1],[211,86.4,67.9],[212,76.4,67.9],[213,71.4,69.8],[214,72.0,73.2],[215,82.1,77.7],[216,65.0,73.4],[217,70.1,72.1],[219,67.6,71.4],[220,71.3,71.2],[221,70.7,68.9],[222,72.0,70.4],[223,71.8,70.7],[224,71.1,71.4],[225,71.1,71.4],[226,24.3,24.3],[227,17.6,21.0],[228,30.6,24.2],[229,19.9,23.1],[230,22.8,23.1],[231,21.0,22.4],[232,28.3,24.5],[233,18.7,22.2],[234,22.3,22.6],[235,23.9,22.8],[236,31.6,25.0],[237,25.8,24.5],[238,28.8,26.5],[239,29.3,27.9],[240,24.0,27.9],[241,33.6,28.3],[242,30.4,29.2],[243,33.1,30.1],[244,31.2,30.4],[245,28.4,31.3],[246,33.3,31.3],[247,31.9,31.6],[249,35.1,32.0],[250,56.4,37.0],[251,36.9,38.7],[252,38.8,39.9],[253,37.2,40.9],[255,40.5,41.9],[257,45.4,39.8],[258,55.1,43.4],[259,44.3,44.5],[260,38.9,44.9],[261,44.3,45.6],[262,44.4,45.4],[263,47.5,43.9],[264,71.9,49.4],[265,46.3,50.9],[266,49.6,51.9],[267,47.0,52.5],[269,47.4,52.5],[270,61.8,50.4],[271,73.3,55.8],[272,52.0,56.3],[273,53.1,57.5],[274,53.9,58.8],[275,51.7,56.8],[276,54.4,53.1],[277,52.5,53.1],[278,61.3,54.8],[279,59.7,56.0],[280,58.1,57.2],[281,91.4,64.6],[282,61.0,66.3],[283,65.0,67.1],[284,61.7,67.5],[285,57.8,67.4],[286,62.5,61.6],[287,64.5,62.3],[289,72.2,63.7],[290,85.6,68.5],[291,64.0,69.8],[292,64.7,70.1],[293,67.9,70.9],[294,61.9,68.8],[295,69.0,65.5],[296,62.8,65.2],[297,62.5,64.9],[298,63.3,63.9],[299,64.5,64.4],[300,61.3,62.9],[301,79.4,66.2],[302,61.9,66.0],[303,65.1,66.4],[304,63.7,66.3],[305,66.2,67.3],[306,75.8,66.6],[307,61.7,66.5],[308,69.0,67.3],[309,62.9,67.1],[310,77.7,69.4],[311,65.0,67.2],[312,67.4,68.4],[313,70.1,68.7],[314,76.6,71.3],[315,63.4,68.5],[316,65.4,68.6],[317,66.7,68.4],[318,76.9,69.8],[319,60.3,66.5],[320,66.0,67.0],[321,74.8,69.0],[322,66.3,68.9],[323,67.4,66.9],[324,68.0,68.5],[325,72.4,69.8],[326,79.0,70.6],[327,64.0,70.1],[328,71.8,71.0],[329,72.0,71.8],[330,68.4,71.0],[331,82.5,71.7],[332,72.3,73.4],[333,69.1,72.8],[334,68.1,72.1],[335,69.8,72.4],[336,70.9,70.1],[337,82.5,72.1],[338,69.6,72.2],[339,72.8,73.1],[340,73.0,73.7]]; // [step, raw %, smoothed %]
+    const evals = [[148, 64.0], [184, 69.5], [225, 74.4]];
+    let mode = 'both', hover = null;
+    const rd = $('rd-curve');
+    const geo = { };
+    const cv = $('cv-curve');
+    const draw = V4U.canvas(cv, (w) => (w < 520 ? 250 : 300), (ctx, w, h) => {
+      const x0 = 36, x1 = w - 16, y0 = 10, y1 = h - 24;
+      const X = (s) => x0 + ((x1 - x0) * (s - 1)) / 339, Y = (v) => y1 - ((y1 - y0) * v) / 100;
+      Object.assign(geo, { x0, x1, X });
+      const bands = [[1, 148.5, '--c1s'], [148.5, 225.5, '--c3s'], [225.5, 340, '--c5s']];
+      bands.forEach(([a, b, c]) => { ctx.fillStyle = C(c); ctx.fillRect(X(a), y0, X(b) - X(a), y1 - y0); });
+      ctx.strokeStyle = C('--line'); ctx.lineWidth = 1; ctx.fillStyle = C('--muted'); ctx.font = M(10.5);
+      [0, 25, 50, 75, 100].forEach((t) => { ctx.beginPath(); ctx.moveTo(x0, Math.round(Y(t)) + 0.5); ctx.lineTo(x1, Math.round(Y(t)) + 0.5); ctx.stroke(); ctx.textAlign = 'right'; ctx.textBaseline = 'middle'; ctx.fillText(String(t), x0 - 5, Y(t)); });
+      ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+      [1, 50, 100, 148, 225, 300, 340].forEach((s) => { if (w < 520 && (s === 50 || s === 300)) return; ctx.fillText(String(s), X(s), y1 + 6); });
+      const line = (k, col, lw, alpha) => {
+        ctx.globalAlpha = alpha; ctx.strokeStyle = col; ctx.lineWidth = lw; ctx.beginPath();
+        let started = false, last = 0;
+        D.forEach((r) => { const px = X(r[0]), py = Y(r[k]); if (!started || r[0] !== last + 1) { ctx.moveTo(px, py); started = true; } else ctx.lineTo(px, py); last = r[0]; });
+        ctx.stroke(); ctx.globalAlpha = 1;
+      };
+      if (mode === 'both') line(1, C('--accent'), 1, 0.4);
+      line(2, C('--accent'), 2.4, 1);
+      evals.forEach(([s, v]) => {
+        const px = X(s), py = Y(v);
+        ctx.fillStyle = C('--ink'); ctx.beginPath(); ctx.moveTo(px, py - 6); ctx.lineTo(px + 6, py); ctx.lineTo(px, py + 6); ctx.lineTo(px - 6, py); ctx.closePath(); ctx.fill();
+      });
+      if (hover) {
+        const px = X(hover[0]);
+        ctx.strokeStyle = C('--ink-2'); ctx.lineWidth = 1; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(px, y0); ctx.lineTo(px, y1); ctx.stroke(); ctx.setLineDash([]);
+        ctx.fillStyle = C('--accent'); ctx.beginPath(); ctx.arc(px, Y(hover[2]), 4, 0, Math.PI * 2); ctx.fill();
+      }
+    });
+    const stage = (s) => (s <= 148 ? 'LIBERO 前三套' : s <= 225 ? 'LIBERO 四套' : `RoboDojo 第 ${s - 225} 步`);
+    V4U.drag(cv, (x) => {
+      if (!geo.X) return;
+      const s = Math.round(1 + ((x - geo.x0) / (geo.x1 - geo.x0)) * 339);
+      let best = D[0]; D.forEach((r) => { if (Math.abs(r[0] - s) < Math.abs(best[0] - s)) best = r; });
+      hover = best;
+      const ev = evals.find((e) => e[0] === best[0]);
+      rd.innerHTML = `<span>第 <b>${best[0]}</b> 步（${stage(best[0])}）</span><span>当步 <b>${best[1].toFixed(1)}%</b></span><span>平滑 <b>${best[2].toFixed(1)}%</b></span>${ev ? `<span>LIBERO 评测 <b>${ev[1].toFixed(1)}%</b></span>` : ''}`;
+      draw();
+    });
+    cv.style.touchAction = 'pan-y';
+    V4U.seg($('seg-curve'), (v) => { mode = v; draw(); });
+  })();
+
+  /* =========================================================
+     5. PEAR results explorer
+     ========================================================= */
+  (() => {
+    const base = '--muted', ours = '--accent', fr = '--c1', vla = '--c2', wam = '--c5';
+    const T = {
+      libero: {
+        unit: '成功率 %', max: 100, ticks: [0, 25, 50, 75, 100], rows: () => [
+          { label: 'Qwen3.8-27B 基座', v: 1.6, color: C(base) },
+          { label: 'GPT-6.1 Sol medium', v: 48.1, color: C(fr) },
+          { label: 'GPT-6 Astra medium', v: 49.3, color: C(fr) },
+          { label: 'PEAR 模型 xhigh', v: 74.4, color: C(ours), bold: true },
+          { label: 'GPT-6.1 Sol max', v: 76.2, color: C(fr) },
+          { label: 'GPT-6 Astra max', v: 80.6, color: C(fr) },
+          { label: 'π0.5（示教 SFT）', v: 96.9, color: C(vla) },
+        ],
+        cap: 'LIBERO 四套共 2,000 集。所有 VLM 都在同一个无 harness 的循环里；effort 是各模型自己的推理时长档位。π0.5 在 LIBERO 每个任务的示教上做了 SFT，不是同一类方法，列在最后作参照。分套看：PEAR 模型 Spatial 85.8、Object 97.0、Goal 61.4、Long 53.2；Goal 和 Long 分别有 19% 和 33% 的集因 256k token 用完而结束。',
+      },
+      pro: {
+        unit: '成功率 %，LIBERO-Pro 每类 2,000 集', max: 100, ticks: [0, 25, 50, 75, 100], rows: () => [
+          { head: 'LIBERO 原任务' }, { label: 'π0.5', v: 96.9, color: C(vla) }, { label: 'PEAR 模型', v: 74.4, color: C(ours) },
+          { head: '同场景换一个任务' }, { label: 'π0.5', v: 0.75, color: C(vla), txt: '0.75' }, { label: 'PEAR 模型', v: 57.4, color: C(ours), bold: true },
+          { head: '交换物体位置' }, { label: 'π0.5', v: 20.8, color: C(vla) }, { label: 'PEAR 模型', v: 57.5, color: C(ours), bold: true },
+          { head: '改写指令措辞' }, { label: 'π0.5', v: 95.8, color: C(vla) }, { label: 'PEAR 模型', v: 73.3, color: C(ours) },
+          { head: '改变物体外观' }, { label: 'π0.5', v: 96.0, color: C(vla) }, { label: 'PEAR 模型', v: 60.2, color: C(ours) },
+        ],
+        cap: '两者都只在 LIBERO 上训练。需要换一种动作的扰动（换任务、换位置）上 π0.5 崩溃，原动作仍然正确的扰动（换措辞、换外观）上 π0.5 领先。LIBERO-Plus（只扰动观测：相机、光照、背景、噪声等）上两者掉得差不多：π0.5 −11.2，PEAR 模型 −12.2；其中机器人初始状态一项让 PEAR 模型掉了 36.5 个点。',
+      },
+      transfer: {
+        unit: '成功率 %', max: 100, ticks: [0, 25, 50, 75, 100], rows: () => [
+          { head: 'LIBERO-Long（同仿真器，新任务）' }, { label: '基座', v: 0.4, color: C(base) }, { label: '训前三套后，零样本', v: 39.0, color: C(ours) }, { label: '加入训练后', v: 53.2, color: C(ours), bold: true },
+          { head: 'RoboDojo general_pickup（新仿真器、双臂 ARX）' }, { label: '基座', v: 10.7, color: C(base) }, { label: '只训 LIBERO', v: 39.9, color: C(ours) }, { label: '再训 RoboDojo', v: 71.2, color: C(ours), bold: true },
+          { head: 'RoboDojo align_blocks' }, { label: '基座', v: 13.0, color: C(base) }, { label: '只训 LIBERO', v: 17.0, color: C(ours) }, { label: '再训 RoboDojo', v: 78.8, color: C(ours), bold: true },
+          { head: '真机双臂 YAM（30 次）' }, { label: '基座', v: 0, color: C(base), txt: '0/30' }, { label: '只训 LIBERO', v: 23.3, color: C(ours), txt: '7/30' }, { label: '再训 RoboDojo', v: 60.0, color: C(ours), txt: '18/30', bold: true },
+        ],
+        cap: '真机：对齐方块 5 个场景 × 2 次（0/10 → 1/10 → 6/10），通用抓取 10 种物体 × 2 次，指令 “Pick up the ⟨object⟩ by 10 cm.”（0/20 → 6/20 → 12/20）；超过 25 轮或单轮思考超过 32k token 判失败。没有任何真机训练数据。',
+      },
+      robolab: {
+        unit: '成功率 %，120 个任务 × 10 集', max: 50, ticks: [0, 10, 20, 30, 40, 50], rows: () => [
+          { label: 'Qwen3.8-27B 基座', v: 5.4, color: C(base) },
+          { label: 'PEAR 只训 LIBERO', v: 22.1, color: C(ours) },
+          { label: 'PEAR LIBERO+RoboDojo', v: 37.3, color: C(ours), bold: true },
+          { label: 'Cosmos3-Nano-Policy', v: 36.8, color: C(wam) },
+          { label: 'π0.5', v: 28.0, color: C(vla) },
+          { label: 'DreamZero', v: 25.7, color: C(wam) },
+          { label: 'GR00T N1.6', v: 7.2, color: C(vla) },
+        ],
+        cap: 'RoboLab-120 是第三个仿真基准（Franka + Robotiq），PEAR 模型从没训过。其他四个是 RoboLab 排行榜上的通用策略（2026 年 11 月）：橙色 VLA，黄色世界动作模型。按难度：简单 44.6、中等 35.8、复杂 13.2。',
+      },
+      effort: {
+        unit: 'LIBERO 成功率 %', max: 100, ticks: [0, 25, 50, 75, 100], rows: () => [
+          { label: 'low（0.86k token/轮）', v: 21.9, color: C('--c1') },
+          { label: 'xhigh（3.23k token/轮）', v: 74.4, color: C(ours), bold: true },
+        ],
+        cap: '同一个检查点，只改 chat template 里的推理强度；训练时只用过 xhigh。思考少了三分之二多，成功率也只剩不到三分之一。解码速度（NVFP4 权重 + DFlash2 草稿模型）：M5 Max 52 token/s，RTX 5090 221 token/s，GB300 747 token/s；评测本身用 BF16，因为 NVFP4 会降精度、拉长思维链。代码库后来发布的 DFlash2 检查点在 GB300 上到 921 token/s、RTX 5090 上 262 token/s。',
+      },
+      general: { unit: '分数变化（点），配对 95% 区间', general: true,
+        cap: '同一批题目上 RL 前后配对比较，九项的 95% 区间都包含 0，平均变化 −0.15 点。ERQA（具身推理）点估计下降最多，为 −2.0。' },
+    };
+    const G = [
+      ['AIME 2026', 98.3, 98.5, 0.2, -1.7, 2.9], ['GPQA Diamond', 89.6, 89.7, 0.1, -1.0, 1.2], ['IFBench', 73.0, 72.7, -0.3, -4.0, 3.3],
+      ['LiveCodeBench v6', 88.0, 88.4, 0.4, -2.1, 2.9], ['RealWorldQA', 84.1, 83.7, -0.4, -2.4, 1.6], ['ERQA', 68.5, 66.5, -2.0, -6.2, 2.2],
+      ['MMMU (val)', 80.7, 81.0, 0.3, -1.3, 2.0], ['MMMU-Pro 标准', 77.3, 77.6, 0.3, -1.1, 1.7], ['MMMU-Pro 视觉', 75.4, 75.4, 0.1, -1.4, 1.5],
+    ];
+    let cur = 'libero';
+    const cv = $('cv-res');
+    const draw = V4U.canvas(cv, (w) => {
+      const t = T[cur];
+      if (t.general) return 9 * 30 + 40;
+      return barsHeight(t.rows(), {});
+    }, (ctx, w, h) => {
+      const t = T[cur];
+      if (!t.general) { hbars(ctx, w, t.rows(), { max: t.max, ticks: t.ticks }); return; }
+      const lw = Math.min(210, Math.max(150, w * 0.42)), x0 = lw, x1 = w - 12, lo = -7, hi = 4;
+      const X = (v) => x0 + ((x1 - x0) * (v - lo)) / (hi - lo);
+      const rh = 30, y0 = 6, total = G.length * rh;
+      ctx.strokeStyle = C('--line'); ctx.lineWidth = 1; ctx.fillStyle = C('--muted'); ctx.font = M(11); ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+      [-6, -4, -2, 0, 2, 4].forEach((v) => { const x = Math.round(X(v)) + 0.5; ctx.beginPath(); ctx.moveTo(x, y0); ctx.lineTo(x, y0 + total); ctx.stroke(); ctx.fillText((v > 0 ? '+' : '') + v, x, y0 + total + 6); });
+      ctx.strokeStyle = C('--ink-2'); ctx.beginPath(); ctx.moveTo(Math.round(X(0)) + 0.5, y0); ctx.lineTo(Math.round(X(0)) + 0.5, y0 + total); ctx.stroke();
+      G.forEach((g, i) => {
+        const y = y0 + i * rh + rh / 2;
+        ctx.fillStyle = C('--ink-2'); ctx.font = F(12.5); ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+        ctx.fillText(`${g[0]}  ${g[1].toFixed(1)}→${g[2].toFixed(1)}`, x0 - 10, y, x0 - 12);
+        ctx.strokeStyle = C('--accent'); ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(X(g[4]), y); ctx.lineTo(X(g[5]), y); ctx.stroke();
+        ctx.fillStyle = C('--accent'); ctx.beginPath(); ctx.arc(X(g[3]), y, 4.5, 0, Math.PI * 2); ctx.fill();
+      });
+    });
+    V4U.seg($('seg-res'), (v) => { cur = v; $('res-unit').textContent = T[v].unit; $('res-cap').textContent = T[v].cap; draw(); });
+  })();
+
+  /* =========================================================
+     6. Semantic step segmentation (illustrative trajectory)
+     ========================================================= */
+  (() => {
+    const K = [ // t, x, z, grip(1 open)
+      [0.0, 0, 20, 1], [1.5, 15, 20, 1], [2.3, 15, 8, 1], [2.9, 15, 8, 1], [3.2, 15, 8, 0],
+      [4.2, 15, 20, 0], [5.8, 32, 20, 0, 'arc'], [6.6, 32, 9, 0], [6.9, 32, 9, 1], [7.6, 32, 20, 1],
+    ];
+    const mj = (u) => u * u * u * (10 - 15 * u + 6 * u * u);
+    const at = (t) => {
+      for (let i = 1; i < K.length; i++) {
+        if (t <= K[i][0]) {
+          const a = K[i - 1], b = K[i], u = (t - a[0]) / (b[0] - a[0]), e = mj(Math.max(0, Math.min(1, u)));
+          let x = a[1] + (b[1] - a[1]) * e, z = a[2] + (b[2] - a[2]) * e;
+          if (b[4] === 'arc') z += 6 * Math.sin(Math.PI * e);
+          const g = a[3] + (b[3] - a[3]) * Math.max(0, Math.min(1, u));
+          return [x, z, g];
+        }
+      }
+      const l = K[K.length - 1]; return [l[1], l[2], l[3]];
+    };
+    const HZ = 30, Tend = 7.6, NS = Math.round(Tend * HZ) + 1;
+    const S = Array.from({ length: NS }, (_, i) => { const t = i / HZ; return [t, ...at(t)]; });
+    const segment = (thDeg, pmin) => {
+      const cuts = new Set([0, NS - 1]);
+      // gripper transitions
+      for (let i = 1; i < NS; i++) if ((S[i - 1][3] >= 0.5) !== (S[i][3] >= 0.5)) cuts.add(i);
+      // pauses
+      const sp = S.map((s, i) => (i === 0 ? 0 : Math.hypot(s[1] - S[i - 1][1], s[2] - S[i - 1][2]) * HZ));
+      const still = [];
+      let i = 1;
+      while (i < NS) {
+        if (sp[i] < 0.5) { let j = i; while (j < NS && sp[j] < 0.5) j++; if ((j - i) / HZ >= pmin) { cuts.add(i); if (j < NS) cuts.add(j); still.push([i, j]); } i = j; } else i++;
+      }
+      const inStill = (k) => still.some(([a, b]) => k >= a && k <= b);
+      // sharp turns
+      const W = Math.round(0.25 * HZ), th = (thDeg * Math.PI) / 180, cand = [];
+      for (let k = W; k < NS - W; k++) {
+        if (inStill(k)) continue;
+        const a = [S[k][1] - S[k - W][1], S[k][2] - S[k - W][2]], b = [S[k + W][1] - S[k][1], S[k + W][2] - S[k][2]];
+        const na = Math.hypot(...a), nb = Math.hypot(...b);
+        if (na < 0.3 || nb < 0.3) continue;
+        const ang = Math.acos(V4U.clamp((a[0] * b[0] + a[1] * b[1]) / (na * nb), -1, 1));
+        if (ang > th) cand.push([k, ang]);
+      }
+      cand.sort((p, q) => q[1] - p[1]);
+      const NMS = Math.round(0.4 * HZ), chosen = [];
+      cand.forEach(([k]) => { if (chosen.every((c) => Math.abs(c - k) > NMS) && [...cuts].every((c) => Math.abs(c - k) > 4)) chosen.push(k); });
+      chosen.forEach((k) => cuts.add(k));
+      return [...cuts].sort((a, b) => a - b);
+    };
+    const turn = $('sl-turn'), pause = $('sl-pause'), list = $('seg-cmds'), rd = $('rd-seg');
+    let cuts = [];
+    const steps = () => {
+      const out = [];
+      for (let c = 0; c < cuts.length - 1; c++) {
+        const a = cuts[c], b = cuts[c + 1];
+        const cmds = [];
+        if (a > 0 && (S[a - 1][3] >= 0.5) !== (S[a][3] >= 0.5)) cmds.push(S[a][3] >= 0.5 ? 'gripper open' : 'gripper close');
+        const dx = S[b][1] - S[a][1], dz = S[b][2] - S[a][2];
+        if (Math.abs(dx) >= 0.5) cmds.push(`move x ${dx >= 0 ? '+' : '−'}${Math.abs(dx).toFixed(1)}`);
+        if (Math.abs(dz) >= 0.5) cmds.push(`move z ${dz >= 0 ? '+' : '−'}${Math.abs(dz).toFixed(1)}`);
+        if (!cmds.length) cmds.push('wait');
+        out.push({ a, b, cmds });
+      }
+      return out;
+    };
+    const draw = V4U.canvas($('cv-seg'), (w) => Math.max(220, Math.min(320, w * 0.52)), (ctx, w, h) => {
+      cuts = segment(+turn.value, +pause.value);
+      const xmin = -3, xmax = 36, zmin = 4, zmax = 28;
+      const s = Math.min((w - 20) / (xmax - xmin), (h - 26) / (zmax - zmin));
+      const ox = (w - s * (xmax - xmin)) / 2 - s * xmin, oy = h - 22 - (h - 22 - s * (zmax - zmin)) / 2 + s * zmin;
+      const P = (x, z) => [ox + s * x, oy - s * z];
+      ctx.strokeStyle = C('--line'); ctx.lineWidth = 1; ctx.fillStyle = C('--muted'); ctx.font = M(10.5); ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+      for (let x = 0; x <= 35; x += 5) { const [px, py] = P(x, zmin); ctx.beginPath(); ctx.moveTo(Math.round(px) + 0.5, P(x, zmax)[1]); ctx.lineTo(Math.round(px) + 0.5, py); ctx.stroke(); ctx.fillText(String(x), px, py + 4); }
+      ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+      for (let z = 5; z <= 25; z += 5) { const [px, py] = P(xmin, z); ctx.beginPath(); ctx.moveTo(px, Math.round(py) + 0.5); ctx.lineTo(P(xmax, z)[0], Math.round(py) + 0.5); ctx.stroke(); ctx.fillText(String(z), px - 3 + 14, py - 6); }
+      // trajectory colored by gripper
+      ctx.lineWidth = 3; ctx.lineCap = 'round';
+      for (let i = 1; i < NS; i++) {
+        ctx.strokeStyle = S[i][3] >= 0.5 ? C('--c1') : C('--c2');
+        const [a, b] = P(S[i - 1][1], S[i - 1][2]), [c, d] = P(S[i][1], S[i][2]);
+        ctx.beginPath(); ctx.moveTo(a, b); ctx.lineTo(c, d); ctx.stroke();
+      }
+      ctx.lineCap = 'butt';
+      // reconstructed straight-line path
+      ctx.strokeStyle = C('--ink-2'); ctx.lineWidth = 1.5; ctx.setLineDash([5, 4]); ctx.beginPath();
+      cuts.forEach((k, j) => { const [px, py] = P(S[k][1], S[k][2]); j ? ctx.lineTo(px, py) : ctx.moveTo(px, py); });
+      ctx.stroke(); ctx.setLineDash([]);
+      // cut points
+      cuts.forEach((k) => { const [px, py] = P(S[k][1], S[k][2]); ctx.fillStyle = C('--accent'); ctx.beginPath(); ctx.arc(px, py, 5, 0, Math.PI * 2); ctx.fill(); ctx.strokeStyle = C('--surface'); ctx.lineWidth = 1.5; ctx.stroke(); });
+      // deviation
+      let dev = 0;
+      for (let c = 0; c < cuts.length - 1; c++) {
+        const a = S[cuts[c]], b = S[cuts[c + 1]], vx = b[1] - a[1], vz = b[2] - a[2], L = Math.hypot(vx, vz);
+        for (let k = cuts[c]; k <= cuts[c + 1]; k++) {
+          const px = S[k][1] - a[1], pz = S[k][2] - a[2];
+          const d = L < 1e-6 ? Math.hypot(px, pz) : Math.abs(px * vz - pz * vx) / L;
+          dev = Math.max(dev, d);
+        }
+      }
+      const st = steps();
+      list.innerHTML = st.map((x) => `<li><b>${x.cmds.join(', ')}</b> <span>（${(x.a / HZ).toFixed(2)}–${(x.b / HZ).toFixed(2)} s）</span></li>`).join('');
+      rd.innerHTML = `<span>30 Hz 控制步 <b>${NS - 1}</b></span><span>语义步骤 <b>${st.length}</b></span><span>直线执行与示教的最大偏差 <b>${dev.toFixed(1)} cm</b></span>`;
+      $('o-turn').textContent = `${turn.value}°`; $('o-pause').textContent = `${(+pause.value).toFixed(2)} s`;
+    });
+    turn.addEventListener('input', draw); pause.addEventListener('input', draw);
+  })();
+
+  /* =========================================================
+     7. Number token loss
+     ========================================================= */
+  (() => {
+    let num = '+12.5', pos = 0;
+    const parse = (s) => {
+      const sign = s[0] === '-' ? -1 : 1, body = s.replace(/^[+-]/, '');
+      const [ip, fp = ''] = body.split('.');
+      const digs = [];
+      for (let i = 0; i < ip.length; i++) digs.push({ d: +ip[i], e: ip.length - 1 - i });
+      for (let i = 0; i < fp.length; i++) digs.push({ d: +fp[i], e: -(i + 1) });
+      const T = digs.reduce((a, x) => a + Math.pow(10, x.e), 0);
+      digs.forEach((x) => { x.w = Math.pow(10, x.e) / T; });
+      return { sign, val: sign * parseFloat(body), digs, T };
+    };
+    const peak = $('sl-peak'), mass = $('sl-mass'), flip = $('sl-flip'), rd = $('rd-ntl'), wbox = $('ntl-w');
+    const segD = $('seg-dig');
+    const build = () => {
+      const N = parse(num);
+      segD.innerHTML = N.digs.map((x, i) => `<button type="button" data-v="${i}" aria-pressed="${i === pos ? 'true' : 'false'}">第 ${i + 1} 位（10<sup>${x.e}</sup>）</button>`).join('');
+      V4U.seg(segD, (v) => { pos = +v; draw(); });
+    };
+    const draw = V4U.canvas($('cv-ntl'), (w) => (w < 520 ? 200 : 220), (ctx, w, h) => {
+      const N = parse(num); if (pos >= N.digs.length) pos = 0;
+      const D = N.digs[pos], d = D.d, pk = +peak.value, m = +mass.value, sflip = +flip.value;
+      const p = Array.from({ length: 10 }, (_, v) => (v === pk ? m : (1 - m) / 9));
+      const x0 = 34, x1 = w - 6, y0 = 8, y1 = h - 26;
+      const Y = (v) => y1 - ((y1 - y0) * v) / 1;
+      ctx.strokeStyle = C('--line'); ctx.lineWidth = 1; ctx.fillStyle = C('--muted'); ctx.font = M(10.5); ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+      [0, 0.25, 0.5, 0.75, 1].forEach((t) => { ctx.beginPath(); ctx.moveTo(x0, Math.round(Y(t)) + 0.5); ctx.lineTo(x1, Math.round(Y(t)) + 0.5); ctx.stroke(); ctx.fillText(String(t), x0 - 5, Y(t)); });
+      const cw = (x1 - x0) / 10;
+      for (let v = 0; v < 10; v++) {
+        const x = x0 + v * cw;
+        if (v === d) { ctx.fillStyle = C('--ok-soft'); ctx.fillRect(x + 2, y0, cw - 4, y1 - y0); }
+        ctx.fillStyle = C('--c1'); ctx.fillRect(x + cw * 0.22, Y(p[v]), cw * 0.56, y1 - Y(p[v]));
+        ctx.fillStyle = v === d ? C('--ok') : C('--ink-2'); ctx.font = M(13, v === d ? 700 : 400); ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+        ctx.fillText(String(v), x + cw / 2, y1 + 6);
+      }
+      const ce = -Math.log(p[d]);
+      const W = p.reduce((a, pv, v) => a + pv * Math.abs(v - d), 0);
+      const ld = D.w * W, ls = N.sign !== 0 ? ((2 * Math.abs(N.val)) / N.T) * sflip : 0;
+      rd.innerHTML = `<span>目标第 ${pos + 1} 位 = <b>${d}</b></span><span>交叉熵 −log p̃(${d}) = <b>${ce.toFixed(3)}</b></span><span>W₁ = Σ p̃(v)|v−${d}| = <b>${W.toFixed(3)}</b></span><span>ℓ<sup>digit</sup> = w·W₁ = <b>${ld.toFixed(3)}</b></span><span>ℓ<sup>sign</sup> = 2|y|/T·σ = <b>${ls.toFixed(3)}</b></span>`;
+      wbox.innerHTML = `<span>T = <b>${N.T.toFixed(N.T % 1 ? 2 : 0)}</b></span>` + N.digs.map((x, i) => `<span>第 ${i + 1} 位 ${x.d}：w = <b>${x.w.toFixed(3)}</b></span>`).join('') + `<span>符号项系数 2|y|/T = <b>${((2 * Math.abs(N.val)) / N.T).toFixed(2)}</b></span>`;
+      $('o-peak').textContent = String(pk); $('o-mass').textContent = m.toFixed(2); $('o-flip').textContent = sflip.toFixed(2);
+    });
+    V4U.seg($('seg-num'), (v) => { num = v; pos = 0; build(); draw(); });
+    [peak, mass, flip].forEach((el) => el.addEventListener('input', draw));
+  })();
+
+  /* =========================================================
+     8. RoboTwin bars
+     ========================================================= */
+  (() => {
+    const rows = () => [
+      { label: 'nanoAstra-9B', v: 17.8, color: C('--c3'), bold: true },
+      { label: 'LingBot-VLA-2.0', v: 10.8, color: C('--c2') },
+      { label: 'DM0.5', v: 2.4, color: C('--c2') },
+      { label: 'Xiaomi-Robotics-1', v: 2.0, color: C('--c2') },
+      { label: 'π0.5', v: 1.4, color: C('--c2') },
+      { label: 'DreamZero', v: 0.2, color: C('--c5') },
+      { label: 'LingBot-VA', v: 0.0, color: C('--c5') },
+      { label: 'Qwen3.8-27B 思考', v: 10.8, color: C('--c1') },
+      { label: 'Qwen3.5-35B-A3B 思考', v: 9.0, color: C('--c1') },
+      { label: 'Qwen3.5-397B-A17B 思考', v: 9.0, color: C('--c1') },
+      { label: 'Qwen3.5-9B 思考', v: 8.2, color: C('--c1') },
+      { label: 'Qwen3.5-397B-A17B', v: 4.0, color: C('--line-2') },
+      { label: 'Qwen3.8-27B', v: 3.6, color: C('--line-2') },
+      { label: 'Qwen3.5-35B-A3B', v: 3.4, color: C('--line-2') },
+      { label: 'Qwen3.5-9B', v: 3.2, color: C('--line-2') },
+    ];
+    V4U.canvas($('cv-rt'), () => barsHeight(rows(), { rowH: 24 }), (ctx, w) => hbars(ctx, w, rows(), { max: 20, ticks: [0, 5, 10, 15, 20], rowH: 24, labelW: 190 }));
+  })();
+
+  /* =========================================================
+     9. Blocking vs streaming
+     ========================================================= */
+  (() => {
+    const STEP = 2.66 / 3.5, HORIZON = 16;
+    const sl = $('sl-inf'), rd = $('rd-stream');
+    const kOf = (r) => (r % 2 === 0 ? 3 : 4);
+    const simBlocking = (I) => {
+      const inf = [], mov = []; let t = 0, r = 0;
+      while (t < HORIZON) { inf.push([t, t + I]); t += I; const k = kOf(r++); for (let j = 0; j < k; j++) { mov.push([t, t + STEP]); t += STEP; } }
+      return { inf, mov };
+    };
+    const simStreaming = (I) => {
+      // Steps run as soon as they are written; when at most two steps are left unstarted,
+      // a new query goes out (after the current reply finishes) and those steps are prefilled.
+      const inf = [], mov = [], queue = [];
+      let r = 0, inflightEnd = 0, robotFree = 0, guard = 0;
+      const query = (ts) => { const k = kOf(r++); inf.push([ts, ts + I]); inflightEnd = ts + I; for (let j = 1; j <= k; j++) queue.push(ts + (I * j) / k); };
+      query(0);
+      while (robotFree < HORIZON && queue.length && guard++ < 500) {
+        const s0 = Math.max(robotFree, queue.shift());
+        mov.push([s0, s0 + STEP]); robotFree = s0 + STEP;
+        if (queue.length <= 2) query(Math.max(s0, inflightEnd));
+      }
+      return { inf, mov };
+    };
+    const idle = (mov, until) => {
+      let busy = 0; mov.forEach(([a, b]) => { busy += Math.max(0, Math.min(b, until) - Math.min(a, until)); });
+      return 1 - busy / until;
+    };
+    const draw = V4U.canvas($('cv-stream'), () => 184, (ctx, w, h) => {
+      const I = +sl.value;
+      const B = simBlocking(I), Sm = simStreaming(I);
+      const x0 = w < 520 ? 70 : 92, x1 = w - 8;
+      const X = (t) => x0 + ((x1 - x0) * t) / HORIZON;
+      const lanes = [
+        { y: 8, name: '阻塞 · 推理', items: B.inf, col: C('--c1') },
+        { y: 40, name: '阻塞 · 执行', items: B.mov, col: C('--c3'), gaps: true },
+        { y: 98, name: '流式 · 推理', items: Sm.inf, col: C('--c1') },
+        { y: 130, name: '流式 · 执行', items: Sm.mov, col: C('--c3'), gaps: true },
+      ];
+      const lh = 22;
+      ctx.strokeStyle = C('--line'); ctx.lineWidth = 1; ctx.fillStyle = C('--muted'); ctx.font = M(10.5); ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+      for (let t = 0; t <= HORIZON; t += 2) { const x = Math.round(X(t)) + 0.5; ctx.beginPath(); ctx.moveTo(x, 4); ctx.lineTo(x, 158); ctx.stroke(); ctx.fillText(String(t), x, 162); }
+      lanes.forEach((L) => {
+        ctx.fillStyle = C('--ink-2'); ctx.font = F(12); ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+        ctx.fillText(L.name, x0 - 8, L.y + lh / 2, x0 - 10);
+        if (L.gaps) { ctx.fillStyle = C('--bad-soft'); ctx.fillRect(X(0), L.y, X(HORIZON) - X(0), lh); }
+        L.items.forEach(([a, b]) => {
+          if (a >= HORIZON) return;
+          const xa = X(a), xb = X(Math.min(b, HORIZON));
+          ctx.fillStyle = L.col; ctx.fillRect(xa + 0.5, L.y, Math.max(1, xb - xa - 1), lh);
+        });
+      });
+      // idle markers on gaps: draw thin red baseline
+      [lanes[1], lanes[3]].forEach((L) => { ctx.fillStyle = C('--bad'); ctx.fillRect(X(0), L.y + lh - 2, X(HORIZON) - X(0), 2); L.items.forEach(([a, b]) => { if (a < HORIZON) { ctx.fillStyle = C('--c3'); ctx.fillRect(X(a), L.y + lh - 2, X(Math.min(b, HORIZON)) - X(a), 2); } }); });
+      const ib = idle(B.mov, HORIZON), is = idle(Sm.mov, HORIZON);
+      rd.innerHTML = `<span>I/M ≈ ${I.toFixed(2)} / 2.66 = <b>${(I / 2.66).toFixed(2)}</b>（动作时长按 H20 实测 2.66 s）</span><span>阻塞时机器人在等 <b>${(ib * 100).toFixed(0)}%</b></span><span>流式时机器人在等 <b>${(is * 100).toFixed(0)}%</b></span>`;
+      $('o-inf').textContent = `${I.toFixed(2)} s`;
+    });
+    V4U.seg($('seg-inf'), (v) => { sl.value = v; draw(); });
+    sl.addEventListener('input', () => { $('seg-inf').querySelectorAll('button').forEach((b) => b.setAttribute('aria-pressed', 'false')); draw(); });
+  })();
+});
+</script>
+</body>
+</html>

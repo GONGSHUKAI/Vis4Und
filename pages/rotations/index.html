@@ -1,0 +1,958 @@
+<!doctype html>
+<html lang="zh-CN" data-sec="robotics">
+<head>
+<!-- v4u:head -->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="icon" href="data:,">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700&family=Inter+Tight:wght@700&family=JetBrains+Mono:wght@400;700&family=Noto+Sans+SC:wght@400;700&display=swap">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<link rel="stylesheet" href="../../assets/v4u.css?v=4288b6c4">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
+<script src="../../assets/v4u.js?v=d6640e00"></script>
+<!-- /v4u:head -->
+<title>旋转与位姿表示 · Vis4Und</title>
+<meta name="description" content="旋转矩阵、欧拉角、轴角、四元数、6D 表示和齐次变换：定义、互相换算、插值，以及网络该输出哪一种。">
+<style>
+.pane-t{font:700 13px/1.4 var(--f-body);color:var(--ink-2);margin:0 0 6px}
+.viz-stage canvas{touch-action:pan-y}
+.mono-tbl td{font-family:var(--f-mono);font-size:13.5px}
+</style>
+</head>
+<body>
+<!-- v4u:nav -->
+<nav class="v4u-nav" aria-label="站点导航"><div class="v4u-nav-in"><span class="v4u-crumb"><a href="../../"><b>Vis4Und</b></a><span class="v4u-sep">/</span><a href="../../#robotics">(1) 机器人学</a></span><span class="v4u-links"><a href="../rotations/" aria-current="page">补充 旋转与位姿</a><a href="../action-space/">(i) 运动空间</a><a href="../camera/">(ii) 相机</a><button type="button" class="v4u-theme" aria-label="切换深浅色">深色</button></span></div></nav>
+<!-- /v4u:nav -->
+
+<header class="hero"><div class="wrap">
+  <p class="kicker">(1) 机器人学 · 补充</p>
+  <h1>旋转与位姿表示</h1>
+  <p class="lede">末端动作、相机外参、物体位姿里都有一个旋转。这页用同一套记号讲旋转矩阵、欧拉角、轴角、四元数、6D 表示和齐次变换：怎么定义、怎么互相换算、怎么插值，以及网络该输出哪一种。</p>
+  <p class="asks-h">读完能回答</p>
+  <ul class="asks">
+    <li>左乘一个旋转和右乘一个旋转，分别绕的是哪根轴？</li>
+    <li>欧拉角的万向锁是怎样丢掉一个自由度的？</li>
+    <li>四元数 q 和 −q 为什么是同一个旋转，插值时要注意什么？</li>
+    <li>为什么 4 维及以下的旋转表示都不连续，6D 表示怎么还原成旋转矩阵？</li>
+    <li>${}^{A}T_{B}$ 怎么读，世界系下的位姿增量和工具系下的有什么不同？</li>
+  </ul>
+</div></header>
+
+<div class="wrap layout">
+<nav class="toc" id="toc" aria-label="本页目录"></nav>
+<main>
+
+<section id="so3">
+  <h2 data-toc="旋转矩阵">旋转矩阵与 SO(3)</h2>
+  <p class="def"><b>旋转矩阵</b> $R\in\mathbb{R}^{3\times3}$ 满足 $R^\top R=I$ 且 $\det R=+1$。所有旋转矩阵构成群 $SO(3)$：9 个数，6 个正交约束，剩 3 个自由度。</p>
+
+  <table class="notation">
+    <caption>全页记号</caption>
+    <thead><tr><th>符号</th><th>含义</th><th>形状</th></tr></thead>
+    <tbody>
+      <tr><td>$R,\ {}^{A}R_{B}$</td><td>旋转矩阵；B 系的姿态在 A 系下的表示</td><td>$3\times3$</td></tr>
+      <tr><td>$\mathbf p,\ {}^{A}\mathbf p$</td><td>点或向量；它在 A 系下的坐标</td><td>$\mathbb{R}^3$</td></tr>
+      <tr><td>$\mathbf e_x,\mathbf e_y,\mathbf e_z$</td><td>标准基向量</td><td>$\mathbb{R}^3$</td></tr>
+      <tr><td>$R_x(\phi),R_y(\theta),R_z(\psi)$</td><td>绕 x / y / z 轴的基本旋转</td><td>$3\times3$</td></tr>
+      <tr><td>$\hat{\boldsymbol\omega},\ \theta$</td><td>单位转轴、转角（右手定则，逆时针为正）</td><td>$\|\hat{\boldsymbol\omega}\|=1$；rad</td></tr>
+      <tr><td>$[\mathbf v]_\times$</td><td>由向量构成的反对称矩阵（hat 算子）</td><td>$3\times3$</td></tr>
+      <tr><td>$q=(w,x,y,z)$</td><td>单位四元数，本页标量在前</td><td>$\mathbb{R}^4$，$\|q\|=1$</td></tr>
+      <tr><td>$T,\ {}^{A}T_{B}$</td><td>齐次变换：B 系在 A 系下的位姿</td><td>$4\times4$</td></tr>
+    </tbody>
+  </table>
+
+  <p>$R=[\,R\mathbf e_x\ \ R\mathbf e_y\ \ R\mathbf e_z\,]$：第 $k$ 列就是第 $k$ 根基向量转过去以后的方向。三列两两垂直、长度为 1，所以 $R^\top R=I$，逆矩阵就是转置；$\det R=+1$ 排除了镜像（保持右手系）。</p>
+  <p>同一个矩阵有两种读法：</p>
+  <ul>
+    <li><b>主动</b>（active）：在一个坐标系里把向量转过去，$\mathbf p'=R\,\mathbf p$。</li>
+    <li><b>被动</b>（passive）：点不动，换一个坐标系描述它。若 B 系三根轴在 A 系下就是 ${}^{A}R_{B}$ 的三列，则 ${}^{A}\mathbf p={}^{A}R_{B}\,{}^{B}\mathbf p$，反过来 ${}^{B}\mathbf p={}^{A}R_{B}^{\top}\,{}^{A}\mathbf p$。</li>
+  </ul>
+
+  <figure class="viz" id="viz-mat">
+    <div class="viz-h"><b>R 的三列就是转过去的三根轴</b><span>单位：度 / 无量纲</span></div>
+    <div class="viz-stage"><canvas id="cv-mat" aria-label="世界坐标系、旋转后的坐标系和一个点"></canvas></div>
+    <div class="viz-ctrl">
+      <div class="seg" id="sg-mat-ax" role="group" aria-label="转轴"><button type="button" data-v="z" aria-pressed="true">绕 z</button><button type="button" data-v="x">绕 x</button><button type="button" data-v="d">绕 (1,1,1)</button></div>
+      <label for="sl-mat">θ <input type="range" id="sl-mat" min="-180" max="180" step="1" value="50"><output id="o-mat">50°</output></label>
+      <div class="seg" id="sg-mat-mode" role="group" aria-label="读法"><button type="button" data-v="act" aria-pressed="true">主动 p′ = R p</button><button type="button" data-v="pas">被动 ᴮp = Rᵀ ᴬp</button></div>
+    </div>
+    <div class="viz-read" id="rd-mat"></div>
+    <ul class="chips"><li><i style="background:var(--bad)"></i>x 轴 / R 第 1 列</li><li><i style="background:var(--ok)"></i>y 轴 / 第 2 列</li><li><i style="background:var(--c1)"></i>z 轴 / 第 3 列</li><li><i style="background:var(--c3)"></i>点 p</li><li><i style="background:var(--c4)"></i>转轴</li></ul>
+    <figcaption>细线是 A 系（世界），粗线是转过 θ 的 B 系。主动读法：点跟着转（虚线弧）。被动读法：点不动，虚线沿 B 系三根轴走到点上，三段长度就是 ${}^{B}\mathbf p$。可拖动画面换视角。</figcaption>
+  </figure>
+
+  <div class="note pit"><b>易错</b><p>拿到一个 <code>R</code> 或 <code>T</code> 先问清方向：是 world←body 还是 body←world。变量名写成 <code>T_base_ee</code>（左边目标系、右边源系），和 ${}^{\text{base}}T_{\text{ee}}$ 一一对应，链式相乘时一眼能查对。</p></div>
+</section>
+
+<section id="compose">
+  <h2 data-toc="左乘与右乘">组合顺序：左乘与右乘</h2>
+  <p class="def"><b>左乘</b> $R'=R_{\mathbf a}(\phi)\,R$：绕<b>世界系</b>的固定轴 $\mathbf a$ 再转 $\phi$。<b>右乘</b> $R'=R\,R_{\mathbf a}(\phi)$：绕物体<b>自身</b>（body）的轴再转 $\phi$。</p>
+  <ol class="derive">
+    <li><p>绕世界轴 $\mathbf a$ 转：物体上每个点都被 $R_{\mathbf a}(\phi)$ 作用一次，所以直接左乘。</p>$$R'=R_{\mathbf a}(\phi)\,R$$</li>
+    <li><p>物体自身的第 $k$ 根轴在世界系下是 $R\mathbf a$（$\mathbf a=\mathbf e_k$）。绕它转 = 先用 $R^\top$ 把它转回 $\mathbf a$，绕 $\mathbf a$ 转，再用 $R$ 转回来：</p>$$R_{R\mathbf a}(\phi)=R\,R_{\mathbf a}(\phi)\,R^\top$$</li>
+    <li><p>把第 2 步当作世界轴旋转代入第 1 步：</p>$$R'=R_{R\mathbf a}(\phi)\,R=R\,R_{\mathbf a}(\phi)\,R^\top R=R\,R_{\mathbf a}(\phi)$$</li>
+    <li><p>所以乘积 $R_2R_1$ 有两种等价读法：先 $R_1$、再绕世界轴做 $R_2$；或先 $R_2$、再绕自身轴做 $R_1$。三维旋转一般不可交换：</p>$$R_z(90^\circ)R_x(90^\circ)\ne R_x(90^\circ)R_z(90^\circ)$$</li>
+  </ol>
+
+  <figure class="viz" id="viz-comp">
+    <div class="viz-h"><b>同样两次旋转，左乘和右乘落在不同姿态</b><span>单位：度</span></div>
+    <div class="viz-grid">
+      <div class="viz-stage"><p class="pane-t">左乘 $R_{\mathbf a}(\beta)\,R_x(\alpha)$：第二次绕世界轴</p><canvas id="cv-comp-l" aria-label="左乘：第二次旋转绕世界轴"></canvas></div>
+      <div class="viz-stage"><p class="pane-t">右乘 $R_x(\alpha)\,R_{\mathbf a}(\beta)$：第二次绕自身轴</p><canvas id="cv-comp-r" aria-label="右乘：第二次旋转绕物体自身的轴"></canvas></div>
+    </div>
+    <div class="viz-ctrl">
+      <label for="sl-comp-a">α <input type="range" id="sl-comp-a" min="-180" max="180" step="5" value="90"><output id="o-comp-a">90°</output></label>
+      <div class="seg" id="sg-comp" role="group" aria-label="第二次旋转的轴"><button type="button" data-v="z" aria-pressed="true">a = z</button><button type="button" data-v="y">a = y</button></div>
+      <label for="sl-comp-b">β <input type="range" id="sl-comp-b" min="-180" max="180" step="5" value="90"><output id="o-comp-b">90°</output></label>
+      <label for="sl-comp-t">进度 <input type="range" id="sl-comp-t" min="0" max="2" step="0.01" value="2"><output id="o-comp-t">2.00</output></label>
+      <button type="button" class="btn ghost" id="bt-comp">播放</button>
+    </div>
+    <div class="viz-read" id="rd-comp"></div>
+    <ul class="chips"><li><i style="background:var(--c4)"></i>当前这一步的转轴</li><li><i style="background:var(--bad-soft)"></i>物体 +x 面</li><li><i style="background:var(--ok-soft)"></i>+y 面</li><li><i style="background:var(--c1s)"></i>+z 面</li></ul>
+    <figcaption>进度 0→1：两边都先绕 x 转 α，完全一样。进度 1→2：左边绕世界 z 轴（竖直虚线），右边绕物体自己的 z 轴（转过 α 之后它已经躺平）。拖动任一画面，两个视角同步。</figcaption>
+  </figure>
+  <p>角速度也有两种：$\dot R=[\boldsymbol\omega]_\times R$ 里的 $\boldsymbol\omega$ 在世界系下（左乘），$\dot R=R\,[\boldsymbol\omega_b]_\times$ 里的 $\boldsymbol\omega_b$ 在物体系下（右乘），$\boldsymbol\omega=R\,\boldsymbol\omega_b$。</p>
+</section>
+
+<section id="euler">
+  <h2>欧拉角</h2>
+  <p class="def"><b>欧拉角</b>用依次绕三根坐标轴的三个转角表示旋转。必须同时说清两件事：轴的顺序；每次绕的是固定的世界轴（<b>外旋</b>，extrinsic）还是转动后的新轴（<b>内旋</b>，intrinsic）。</p>
+  <ul>
+    <li><b>12 种顺序</b>：相邻两次不能绕同一根轴，$3\times2\times2=12$。6 种 Tait–Bryan（xyz, xzy, yxz, yzx, zxy, zyx，三轴各一次）+ 6 种 proper Euler（xyx, xzx, yxy, yzy, zxz, zyz，首尾同轴）。每种再分内旋、外旋。</li>
+    <li><b>内旋 = 倒序外旋</b>：由上一节，内旋 Z→Y′→X″ 依次右乘，外旋 x→y→z 依次左乘，结果是同一个矩阵：$$R=R_z(\psi)\,R_y(\theta)\,R_x(\phi)$$</li>
+    <li><b>RPY</b>：roll $\phi$ 绕 x、pitch $\theta$ 绕 y、yaw $\psi$ 绕 z，最常见的就是上式。URDF 的 <code>&lt;origin rpy&gt;</code> 规定为绕固定轴先 roll、再 pitch、最后 yaw，即上式。</li>
+    <li><b>SciPy</b>：<code>Rotation.from_euler(seq, angles)</code> 小写 <code>'xyz'</code> 是外旋，大写 <code>'XYZ'</code> 是内旋；<code>from_euler('xyz', [φ,θ,ψ])</code> 与 <code>from_euler('ZYX', [ψ,θ,φ])</code> 相等。</li>
+    <li><b>反解</b>（上式）：$\theta=-\arcsin R_{31}\in[-90^\circ,90^\circ]$，$\psi=\operatorname{atan2}(R_{21},R_{11})$，$\phi=\operatorname{atan2}(R_{32},R_{33})$。$\cos\theta=0$ 时后两式的分子分母都为 0。</li>
+  </ul>
+
+  <h3>万向锁</h3>
+  <ol class="derive">
+    <li><p>令 pitch $\theta=90^\circ$：</p>$$R_y(90^\circ)=\begin{bmatrix}0&0&1\\0&1&0\\-1&0&0\end{bmatrix}$$</li>
+    <li><p>展开三连乘，记 $\delta=\phi-\psi$：</p>$$R_z(\psi)R_y(90^\circ)R_x(\phi)=\begin{bmatrix}0&\sin\delta&\cos\delta\\0&\cos\delta&-\sin\delta\\-1&0&0\end{bmatrix}$$</li>
+    <li><p>只依赖 $\delta=\phi-\psi$：$\psi,\phi$ 同时加同一个量，姿态不变，三个角只剩 2 个有效自由度。</p></li>
+    <li><p>用角速度看：yaw 轴是世界 $\mathbf e_z$，pitch 轴是 $R_z(\psi)\mathbf e_y$，roll 轴是 $R_z(\psi)R_y(\theta)\mathbf e_x$，</p>$$\boldsymbol\omega=\underbrace{\begin{bmatrix}c_\psi c_\theta&-s_\psi&0\\s_\psi c_\theta&c_\psi&0\\-s_\theta&0&1\end{bmatrix}}_{E(\psi,\theta)}\begin{bmatrix}\dot\phi\\\dot\theta\\\dot\psi\end{bmatrix}$$</li>
+    <li><p>按第 3 列展开得 $\det E=c_\psi^2c_\theta+s_\psi^2c_\theta=\cos\theta$。$\theta=\pm90^\circ$ 时 $E$ 降秩：roll 轴和 yaw 轴重合，有一个方向的角速度用任何欧拉角速率都产生不了；在它附近，要产生这个方向的小角速度需要很大的 $\dot\phi,\dot\psi$。</p></li>
+  </ol>
+
+  <figure class="viz" id="viz-gimbal">
+    <div class="viz-h"><b>三层万向节：pitch 到 90° 时外环和内环的转轴重合</b><span>单位：度</span></div>
+    <div class="viz-stage"><canvas id="cv-gimbal" aria-label="三层万向节和其中的物体"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="sl-g-y">yaw ψ <input type="range" id="sl-g-y" min="-180" max="180" step="1" value="30"><output id="o-g-y">30°</output></label>
+      <label for="sl-g-p">pitch θ <input type="range" id="sl-g-p" min="-90" max="90" step="1" value="90"><output id="o-g-p">90°</output></label>
+      <label for="sl-g-r">roll φ <input type="range" id="sl-g-r" min="-180" max="180" step="1" value="20"><output id="o-g-r">20°</output></label>
+      <button type="button" class="btn ghost" id="bt-gimbal">ψ、φ 同时加</button>
+    </div>
+    <div class="viz-read" id="rd-gimbal"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>yaw 环 / 轴（世界 z）</li><li><i style="background:var(--c2)"></i>pitch 环 / 轴</li><li><i style="background:var(--c3)"></i>roll 环 / 轴（物体 x）</li></ul>
+    <figcaption>默认 θ = 90°：点「ψ、φ 同时加」，两个环都在转，物体却不动，因为姿态只取决于 φ − ψ。把 θ 调离 90° 再点一次，物体就会动。</figcaption>
+  </figure>
+
+  <div class="note pit"><b>易错</b><p>网络直接回归欧拉角有两处毛病：yaw 179° 和 −179° 几乎是同一个姿态，数值却差 358°；pitch 接近 ±90° 时三个角对姿态的变化极其敏感。每步增量很小（远小于 1 rad）时这两处都碰不到，所以小增量动作用 RPY 问题不大。</p></div>
+</section>
+
+<section id="axis-angle">
+  <h2 data-toc="轴角与 exp/log">轴角、旋转向量与 exp / log</h2>
+  <p class="def"><b>轴角</b>：任何三维旋转都等于绕某根单位轴 $\hat{\boldsymbol\omega}$ 转角 $\theta$（欧拉旋转定理）。<b>旋转向量</b> $\mathbf r=\theta\hat{\boldsymbol\omega}\in\mathbb{R}^3$ 把两者压成 3 个数。</p>
+  <p><b>hat 算子</b>把向量变成反对称矩阵，使矩阵乘法等于叉积；所有 $3\times3$ 反对称矩阵构成李代数 $\mathfrak{so}(3)$，逆运算记作 $(\cdot)^\vee$：</p>
+  <div class="eq">$$[\boldsymbol\omega]_\times=\begin{bmatrix}0&-\omega_z&\omega_y\\\omega_z&0&-\omega_x\\-\omega_y&\omega_x&0\end{bmatrix},\qquad [\boldsymbol\omega]_\times\mathbf v=\boldsymbol\omega\times\mathbf v$$</div>
+
+  <h3>Rodrigues 公式</h3>
+  <p>记 $K=[\hat{\boldsymbol\omega}]_\times$。</p>
+  <ol class="derive">
+    <li><p>把 $\mathbf v$ 拆成平行于轴和垂直于轴的两部分：</p>$$\mathbf v_\parallel=(\hat{\boldsymbol\omega}\cdot\mathbf v)\,\hat{\boldsymbol\omega},\qquad \mathbf v_\perp=\mathbf v-\mathbf v_\parallel$$</li>
+    <li><p>平行部分不动；垂直部分在垂直于轴的平面里转 $\theta$。这个平面的一组正交基是 $\mathbf v_\perp$ 和 $\hat{\boldsymbol\omega}\times\mathbf v_\perp$（两者等长）：</p>$$\mathbf v'=\mathbf v_\parallel+\cos\theta\,\mathbf v_\perp+\sin\theta\,\hat{\boldsymbol\omega}\times\mathbf v_\perp$$</li>
+    <li><p>用 $K$ 改写：$\hat{\boldsymbol\omega}\times\mathbf v_\perp=\hat{\boldsymbol\omega}\times\mathbf v=K\mathbf v$，再用双叉积公式：</p>$$K^2\mathbf v=\hat{\boldsymbol\omega}\times(\hat{\boldsymbol\omega}\times\mathbf v)=(\hat{\boldsymbol\omega}\cdot\mathbf v)\hat{\boldsymbol\omega}-\mathbf v=-\mathbf v_\perp$$</li>
+    <li><p>代入 $\mathbf v_\perp=-K^2\mathbf v$，$\mathbf v_\parallel=\mathbf v+K^2\mathbf v$：</p>$$\mathbf v'=\mathbf v+K^2\mathbf v-\cos\theta\,K^2\mathbf v+\sin\theta\,K\mathbf v$$</li>
+    <li><p>对任意 $\mathbf v$ 成立，提出矩阵：</p>$$R=I+\sin\theta\,K+(1-\cos\theta)\,K^2$$</li>
+  </ol>
+
+  <figure class="viz" id="viz-rod">
+    <div class="viz-h"><b>Rodrigues：平行分量不动，垂直分量在圆上转</b><span>单位：度</span></div>
+    <div class="viz-stage"><canvas id="cv-rod" aria-label="向量绕轴旋转的分解"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="sl-rod-az">轴方位 <input type="range" id="sl-rod-az" min="-180" max="180" step="1" value="30"><output id="o-rod-az">30°</output></label>
+      <label for="sl-rod-el">轴仰角 <input type="range" id="sl-rod-el" min="-90" max="90" step="1" value="55"><output id="o-rod-el">55°</output></label>
+      <label for="sl-rod-th">θ <input type="range" id="sl-rod-th" min="-180" max="180" step="1" value="120"><output id="o-rod-th">120°</output></label>
+    </div>
+    <div class="viz-read" id="rd-rod"></div>
+    <ul class="chips"><li><i style="background:var(--c4)"></i>转轴 ω̂</li><li><i style="background:var(--muted)"></i>v</li><li><i style="background:var(--c5)"></i>v∥</li><li><i style="background:var(--c1)"></i>cosθ · v⊥</li><li><i style="background:var(--c2)"></i>sinθ · ω̂×v⊥</li><li><i style="background:var(--c3)"></i>v′ = R v</li></ul>
+    <figcaption>v′ = v∥ + cosθ·v⊥ + sinθ·ω̂×v⊥，就是推导第 2 步；读数里用 log 从矩阵 R 反解出 θ 和 ω̂。θ 过 ±180° 时反解出的轴会翻成 −ω̂。</figcaption>
+  </figure>
+
+  <h3>exp 与 log</h3>
+  <ol class="derive">
+    <li><p>指数映射按级数定义：</p>$$\exp([\mathbf r]_\times)=\sum_{n\ge0}\frac{(\theta K)^n}{n!}$$</li>
+    <li><p>由第 3 步，$K^3\mathbf v=K(-\mathbf v_\perp)=-K\mathbf v$，即 $K^3=-K$，于是 $K^{2m+1}=(-1)^mK$，$K^{2m+2}=(-1)^mK^2$。</p></li>
+    <li><p>奇次项、偶次项分别合并成 $\sin$、$1-\cos$ 的级数：</p>$$\exp([\mathbf r]_\times)=I+\Big(\theta-\tfrac{\theta^3}{3!}+\cdots\Big)K+\Big(\tfrac{\theta^2}{2!}-\tfrac{\theta^4}{4!}+\cdots\Big)K^2=I+\sin\theta\,K+(1-\cos\theta)K^2$$</li>
+    <li><p>和 Rodrigues 相同，所以 $R=\exp([\mathbf r]_\times)$。反过来取迹：$\operatorname{tr}K=0$，$\operatorname{tr}K^2=-2$，</p>$$\operatorname{tr}R=1+2\cos\theta\ \Rightarrow\ \theta=\arccos\frac{\operatorname{tr}R-1}{2}\in[0,\pi]$$</li>
+    <li><p>$K^2$ 对称、$K$ 反对称，所以反对称部分只剩 $K$ 项：</p>$$R-R^\top=2\sin\theta\,K\ \Rightarrow\ \hat{\boldsymbol\omega}=\frac{(R-R^\top)^\vee}{2\sin\theta}$$</li>
+    <li><p>两个特殊点：$\theta\to0$ 时轴无定义，用 $\mathbf r\approx\tfrac12(R-R^\top)^\vee$；$\theta=\pi$ 时 $\sin\theta=0$，改用 $R=2\hat{\boldsymbol\omega}\hat{\boldsymbol\omega}^\top-I$，取最大对角元所在的列求轴，$\pm\hat{\boldsymbol\omega}$ 都对。</p></li>
+  </ol>
+  <div class="note"><b>旋转向量的不连续点</b><p>$\|\mathbf r\|=\pi$ 时 $\mathbf r$ 与 $-\mathbf r$ 是同一个旋转；把 $\theta$ 限制在 $[0,\pi]$ 后，转角刚过 $180^\circ$，$\mathbf r$ 从 $\pi\hat{\boldsymbol\omega}$ 跳到 $-\pi\hat{\boldsymbol\omega}$ 附近。两个旋转之间的误差常写成 $\log(R_1^\top R_2)^\vee$，它的模 $\arccos\frac{\operatorname{tr}(R_1^\top R_2)-1}{2}$ 就是测地距离。</p></div>
+</section>
+
+<section id="quat">
+  <h2>单位四元数</h2>
+  <p class="def"><b>四元数</b> $q=w+x\mathbf i+y\mathbf j+z\mathbf k$，$\mathbf i^2=\mathbf j^2=\mathbf k^2=\mathbf{ijk}=-1$，写成（标量，向量）$=(w,\mathbf v)$。绕 $\hat{\boldsymbol\omega}$ 转 $\theta$ 的单位四元数是 $q=\big(\cos\tfrac\theta2,\ \sin\tfrac\theta2\,\hat{\boldsymbol\omega}\big)$。</p>
+  <div class="eq">$$q_1q_2=\big(w_1w_2-\mathbf v_1\cdot\mathbf v_2,\ \ w_1\mathbf v_2+w_2\mathbf v_1+\mathbf v_1\times\mathbf v_2\big),\qquad q^*=(w,-\mathbf v)=q^{-1}$$</div>
+  <p>叉积项使乘法不可交换；组合顺序和矩阵一致：$q_2q_1\leftrightarrow R_2R_1$。旋转一个向量：把它写成纯四元数 $(0,\mathbf p)$，两边各乘一次：</p>
+  <div class="eq">$$(0,\ \mathbf p')=q\,(0,\mathbf p)\,q^*$$</div>
+
+  <h3>为什么是半角</h3>
+  <p>记 $c=\cos\frac\theta2$，$s=\sin\frac\theta2$，$q=(c,\,s\hat{\boldsymbol\omega})$。</p>
+  <ol class="derive">
+    <li><p>先左乘：</p>$$q\,(0,\mathbf p)=\big(-s\,\hat{\boldsymbol\omega}\cdot\mathbf p,\ \ c\,\mathbf p+s\,\hat{\boldsymbol\omega}\times\mathbf p\big)$$</li>
+    <li><p>再右乘 $q^*=(c,-s\hat{\boldsymbol\omega})$：标量部分 $-cs\,\hat{\boldsymbol\omega}\cdot\mathbf p+cs\,\hat{\boldsymbol\omega}\cdot\mathbf p=0$；向量部分用 $(\hat{\boldsymbol\omega}\times\mathbf p)\times\hat{\boldsymbol\omega}=\mathbf p_\perp$ 整理得</p>$$\mathbf p'=s^2(\hat{\boldsymbol\omega}\cdot\mathbf p)\hat{\boldsymbol\omega}+c^2\mathbf p+2cs\,\hat{\boldsymbol\omega}\times\mathbf p-s^2\,\mathbf p_\perp$$</li>
+    <li><p>代入 $\mathbf p=\mathbf p_\parallel+\mathbf p_\perp$，用 $c^2+s^2=1$、$c^2-s^2=\cos\theta$、$2cs=\sin\theta$：</p>$$\mathbf p'=\mathbf p_\parallel+\cos\theta\,\mathbf p_\perp+\sin\theta\,\hat{\boldsymbol\omega}\times\mathbf p$$</li>
+    <li><p>正是 Rodrigues 第 2 步。$q$ 在两边各出现一次，每次贡献半个角。</p></li>
+  </ol>
+
+  <h3>双重覆盖：$q$ 与 $-q$</h3>
+  <p>$-q=\big(\cos(\tfrac\theta2+\pi),\ \sin(\tfrac\theta2+\pi)\hat{\boldsymbol\omega}\big)$ 是绕同一根轴转 $\theta+2\pi$，与 $q$ 是同一个旋转；从公式看，$q\,\mathbf p\,q^*$ 对 $q$ 是二次的，符号抵消。单位四元数（三维球面 $S^3$）到 $SO(3)$ 是 2 对 1 的映射。</p>
+
+  <figure class="viz" id="viz-cover">
+    <div class="viz-h"><b>物体转一整圈，四元数只走半圈</b><span>单位：度</span></div>
+    <div class="viz-stage"><canvas id="cv-cover" aria-label="四元数在单位圆上的位置和物体的转角"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="sl-cover">θ <input type="range" id="sl-cover" min="0" max="720" step="1" value="300"><output id="o-cover">300°</output></label>
+      <button type="button" class="btn ghost" id="bt-cover">播放</button>
+    </div>
+    <div class="viz-read" id="rd-cover"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>q（实心）与 −q（空心）</li><li><i style="background:var(--c2)"></i>物体（绕 z 转 θ）</li><li><i style="background:var(--c3)"></i>w ≥ 0 规范化后的 q</li></ul>
+    <figcaption>左：绕固定轴旋转时 $q=(\cos\frac\theta2,\sin\frac\theta2\,\hat{\boldsymbol\omega})$ 落在一个单位圆上。θ = 360° 时 q = (−1, 0)，物体已经回到原位。规范化到 w ≥ 0 的那个点（绿色）在 θ = 180° 处从圆的上端跳到下端。</figcaption>
+  </figure>
+
+  <h3>与旋转矩阵互换</h3>
+  <div class="eq">$$R(q)=\begin{bmatrix}1-2(y^2+z^2)&2(xy-wz)&2(xz+wy)\\2(xy+wz)&1-2(x^2+z^2)&2(yz-wx)\\2(xz-wy)&2(yz+wx)&1-2(x^2+y^2)\end{bmatrix}$$</div>
+  <ol class="derive">
+    <li><p>对角线相加：$\operatorname{tr}R=3-4(x^2+y^2+z^2)=4w^2-1$，</p>$$w=\tfrac12\sqrt{1+\operatorname{tr}R}$$</li>
+    <li><p>对称位置相减，平方项抵消：$R_{32}-R_{23}=4wx$，$R_{13}-R_{31}=4wy$，$R_{21}-R_{12}=4wz$。</p></li>
+    <li><p>$w$ 接近 0（转角接近 $180^\circ$）时除以 $4w$ 误差大。实际实现（Shepperd 法）先比较 $\operatorname{tr}R$ 和三个对角元，挑最大的那个分量开方，其余三个由对称位置的和或差求出。</p></li>
+  </ol>
+
+  <h3>插值：slerp 与 nlerp</h3>
+  <ul>
+    <li><b>slerp</b>：$\cos\Omega=q_0\cdot q_1$，沿 $S^3$ 上的大圆匀速走：$$\operatorname{slerp}(q_0,q_1;t)=\frac{\sin((1-t)\Omega)}{\sin\Omega}\,q_0+\frac{\sin(t\Omega)}{\sin\Omega}\,q_1=q_0\,(q_0^*q_1)^t$$ 两个姿态之间的转角是 $2\Omega$，角速度恒定。</li>
+    <li><b>最短路径</b>：若 $q_0\cdot q_1\lt0$，先把 $q_1$ 换成 $-q_1$（同一个旋转），否则会绕远路转 $360^\circ-2\Omega$ 的另一侧。</li>
+    <li><b>nlerp</b>：$\dfrac{(1-t)q_0+tq_1}{\|(1-t)q_0+tq_1\|}$，路径和 slerp 是同一条弧，速度不均匀：中间快、两头慢；$\Omega$ 小时差别可以忽略。</li>
+    <li>对欧拉角线性插值走的不是最短弧；对矩阵元素线性插值得到的根本不是旋转矩阵。</li>
+  </ul>
+
+  <figure class="viz" id="viz-slerp">
+    <div class="viz-h"><b>slerp 在弧上等距，nlerp 在弦上等距</b><span>单位：度</span></div>
+    <div class="viz-grid">
+      <div class="viz-stage"><p class="pane-t">$q_0,q_1$ 张成的平面（四元数空间）</p><canvas id="cv-slerp" aria-label="单位圆上的插值点"></canvas></div>
+      <div class="viz-stage"><p class="pane-t">实际转过的角度 vs t</p><canvas id="cv-slerp-p" aria-label="转过角度随 t 变化的曲线"></canvas></div>
+    </div>
+    <div class="viz-ctrl">
+      <label for="sl-sl-ang">两姿态夹角 <input type="range" id="sl-sl-ang" min="10" max="350" step="1" value="300"><output id="o-sl-ang">300°</output></label>
+      <label for="sl-sl-t">t <input type="range" id="sl-sl-t" min="0" max="1" step="0.01" value="0.5"><output id="o-sl-t">0.50</output></label>
+      <div class="seg" id="sg-slerp" role="group" aria-label="是否取最短路径"><button type="button" data-v="raw" aria-pressed="true">不处理</button><button type="button" data-v="short">点积 &lt; 0 时取 −q₁</button></div>
+    </div>
+    <div class="viz-read" id="rd-slerp"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>slerp</li><li><i style="background:var(--c2)"></i>nlerp</li><li><i style="background:var(--muted)"></i>q₀、q₁、−q₁</li></ul>
+    <figcaption>q₀ 是单位旋转，q₁ 是绕同一根轴转「两姿态夹角」，所以四元数平面里两点相隔一半的角。夹角超过 180° 时点积为负：取 −q₁ 走短路，不处理就绕长路。夹角接近 360° 且不处理时，弦几乎穿过圆心，nlerp 在中间几乎瞬间转完。</figcaption>
+  </figure>
+
+  <h3>各库的存储顺序</h3>
+  <p>同一个 4 维数组按错顺序读，得到的是另一个合法旋转，不会报错。例：单位旋转在 wxyz 下是 <code>[1,0,0,0]</code>，被当成 xyzw 读就成了绕 x 转 $180^\circ$。</p>
+  <div class="tbl"><table>
+    <thead><tr><th>库 / 格式</th><th>顺序</th><th>说明（截至 2026-11）</th></tr></thead>
+    <tbody>
+      <tr><td>SciPy <code>Rotation</code></td><td class="num">x y z w</td><td><code>as_quat()</code> / <code>from_quat()</code> 默认标量在后，可传 <code>scalar_first=True</code>；<code>as_quat(canonical=True)</code> 取 w ≥ 0 的那一个</td></tr>
+      <tr><td>Eigen <code>Quaterniond</code></td><td class="num">构造 w x y z<br>存储 x y z w</td><td>构造函数参数 w 在前；内部系数和 <code>coeffs()</code> 是 [x, y, z, w]，用 <code>Map</code> 读裸数组时按 xyzw</td></tr>
+      <tr><td>MuJoCo</td><td class="num">w x y z</td><td>XML 的 <code>quat</code>、free / ball 关节的 <code>qpos</code>，单位旋转 (1, 0, 0, 0)</td></tr>
+      <tr><td>PyTorch3D</td><td class="num">w x y z</td><td>文档写明 real part first</td></tr>
+      <tr><td>Isaac Lab ≤ 2.x</td><td class="num">w x y z</td><td>与 Isaac Sim 的约定一致</td></tr>
+      <tr><td>Isaac Lab 3.0</td><td class="num">x y z w</td><td>3.0（2026-10 正式发布）改为 xyzw，与 PhysX、Warp、Newton 对齐；硬编码的四元数需要改</td></tr>
+      <tr><td>ROS <code>geometry_msgs/Quaternion</code></td><td class="num">x y z w</td><td>字段名就是 x, y, z, w</td></tr>
+      <tr><td>PyBullet</td><td class="num">x y z w</td><td><code>getQuaternionFromEuler</code> 返回 [x, y, z, w]</td></tr>
+      <tr><td>SAPIEN / ManiSkill</td><td class="num">w x y z</td><td><code>Pose.q</code>，单位旋转 [1, 0, 0, 0]</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="sixd">
+  <h2 data-toc="连续性与 6D">连续表示与 6D</h2>
+  <p class="def"><b>连续表示</b>：把旋转映射成网络回归目标的函数 $g:SO(3)\to\mathbb{R}^d$ 必须连续，并且能还原（$f(g(R))=R$）。否则两个很近的旋转可能对应相距很远的目标，网络要拟合一个跳变函数。</p>
+  <ul>
+    <li><b>定理</b>（Zhou et al., CVPR 2019）：$SO(3)$ 同胚于实射影空间 $\mathbb{RP}^3$，而 $\mathbb{RP}^3$ 能嵌入 $\mathbb{R}^5$、不能嵌入任何 $d\lt5$ 的 $\mathbb{R}^d$。所以 <b>4 维及以下</b>的表示（欧拉角 3、旋转向量 3、四元数 4）都必有不连续点；5 维（立体投影构造）和 6 维存在连续表示。</li>
+    <li><b>四元数为什么也不行</b>：要么允许 $\pm q$ 两个目标（不是函数），要么规定 $w\ge0$，于是在 $w=0$（转角 $180^\circ$）处跳变。</li>
+    <li><b>6D 表示</b>：$g(R)$ 取 $R$ 的前两列 $[\mathbf a_1,\mathbf a_2]$，显然连续；从网络任意的 6 维输出还原 $R$ 用 Gram–Schmidt。</li>
+  </ul>
+  <ol class="derive">
+    <li><p>第一列只归一化：</p>$$\mathbf b_1=\frac{\mathbf a_1}{\|\mathbf a_1\|}$$</li>
+    <li><p>第二列去掉在 $\mathbf b_1$ 上的分量再归一化：</p>$$\mathbf b_2=\frac{\mathbf a_2-(\mathbf b_1\cdot\mathbf a_2)\,\mathbf b_1}{\|\mathbf a_2-(\mathbf b_1\cdot\mathbf a_2)\,\mathbf b_1\|}$$</li>
+    <li><p>第三列由叉积给出，自动保证右手系 $\det R=+1$：</p>$$\mathbf b_3=\mathbf b_1\times\mathbf b_2,\qquad R=[\,\mathbf b_1\ \mathbf b_2\ \mathbf b_3\,]$$</li>
+    <li><p>只要 $\mathbf a_1,\mathbf a_2$ 不共线 $f$ 就连续，而 $g(R)$ 给出的两列正交，离共线很远。</p></li>
+  </ol>
+  <p><b>9D + SVD</b>（Levinson et al., NeurIPS 2020）：网络输出任意 $3\times3$ 矩阵 $M=U\Sigma V^\top$，取 Frobenius 范数下最近的旋转 $R=U\,\mathrm{diag}(1,1,\det(UV^\top))\,V^\top$。它对三列一视同仁；Gram–Schmidt 把误差都压到第一列不动、后两列吸收。</p>
+
+  <figure class="viz" id="viz-cont">
+    <div class="viz-h"><b>同一条连续旋转路径，各表示的数值曲线</b><span>横轴：转角 s（度）</span></div>
+    <div class="viz-grid">
+      <div class="viz-stage"><p class="pane-t">物体绕固定斜轴转 s</p><canvas id="cv-cont3" aria-label="绕固定轴旋转的物体"></canvas></div>
+      <div class="viz-stage"><p class="pane-t">表示的各个分量</p><canvas id="cv-contp" aria-label="表示分量随转角变化的曲线"></canvas></div>
+    </div>
+    <div class="viz-ctrl">
+      <div class="seg" id="sg-cont" role="group" aria-label="表示"><button type="button" data-v="eul" aria-pressed="true">欧拉 ZYX</button><button type="button" data-v="quat">四元数 w≥0</button><button type="button" data-v="rv">旋转向量</button><button type="button" data-v="six">6D</button></div>
+      <label for="sl-cont">s <input type="range" id="sl-cont" min="0" max="360" step="1" value="200"><output id="o-cont">200°</output></label>
+    </div>
+    <div class="viz-read" id="rd-cont"></div>
+    <ul class="chips" id="ch-cont"></ul>
+    <figcaption>转轴是固定的斜轴，旋转从 0 连续转到 360°。红色竖虚线标出数值跳变的位置：欧拉角在 yaw 过 ±180° 处跳；四元数和旋转向量都在 s = 180° 处跳；6D 是矩阵前两列，全程是光滑的三角函数。</figcaption>
+  </figure>
+
+  <figure class="viz" id="viz-gs">
+    <div class="viz-h"><b>Gram–Schmidt 把两根任意向量变成旋转矩阵</b><span>噪声 σ：无量纲</span></div>
+    <div class="viz-stage"><canvas id="cv-gs" aria-label="网络输出的两列和正交化后的三列"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="sl-gs">输出噪声 σ <input type="range" id="sl-gs" min="0" max="0.8" step="0.01" value="0.2"><output id="o-gs">0.20</output></label>
+      <button type="button" class="btn ghost" id="bt-gs">重新采样</button>
+    </div>
+    <div class="viz-read" id="rd-gs"></div>
+    <ul class="chips"><li><i style="background:var(--muted)"></i>真值 R*</li><li><i style="background:var(--c1)"></i>a₁（虚）→ b₁（实）</li><li><i style="background:var(--c2)"></i>a₂（虚）→ b₂（实）</li><li><i style="background:var(--c3)"></i>b₃ = b₁ × b₂</li><li><i style="background:var(--c5)"></i>被减掉的 (b₁·a₂)b₁</li></ul>
+    <figcaption>模拟网络输出：真值矩阵 R* 加高斯噪声得到 3×3 的 M。6D 只用 M 的前两列做 Gram–Schmidt；9D 用整个 M 做 SVD 投影。读数给出两者与真值的测地角误差。</figcaption>
+  </figure>
+
+  <div class="note pit"><b>易错：前两列还是前两行</b><p>Zhou et al. 原文取前两<b>列</b>。PyTorch3D 的 <code>matrix_to_rotation_6d</code> 文档写的是 dropping the last row，即取前两<b>行</b>；UMI 代码里的 <code>mat_to_rot6d</code> 也取前两行。两种都连续，但同一个 6 维向量按两种约定解码出来是互为转置（互逆）的旋转，混用不会报错。</p></div>
+</section>
+
+<section id="se3">
+  <h2 data-toc="位姿与 SE(3)">位姿与 SE(3)</h2>
+  <p class="def"><b>齐次变换</b> ${}^{A}T_{B}=\begin{bmatrix}{}^{A}R_{B}&{}^{A}\mathbf t_{B}\\\mathbf 0^\top&1\end{bmatrix}\in SE(3)$ 表示 B 系在 A 系下的位姿：${}^{A}R_{B}$ 的三列是 B 的三根轴，${}^{A}\mathbf t_{B}$ 是 B 原点在 A 系下的坐标。作用在齐次坐标 $\tilde{\mathbf p}=(\mathbf p,1)$ 上：${}^{A}\tilde{\mathbf p}={}^{A}T_{B}\,{}^{B}\tilde{\mathbf p}$。</p>
+  <p><b>读法</b>：右下标是输入坐标所在的系，左上标是输出坐标所在的系。相乘时相邻的内侧标号必须相同并「消掉」：</p>
+  <div class="eq">$${}^{A}T_{C}={}^{A}T_{B}\,{}^{B}T_{C},\qquad {}^{W}T_{O}={}^{W}T_{E}\,{}^{E}T_{C}\,{}^{C}T_{O}$$</div>
+  <p>第二式：正运动学给出末端位姿 ${}^{W}T_{E}$，手眼标定给出相机在末端上的位姿 ${}^{E}T_{C}$，检测给出物体在相机系下的位姿 ${}^{C}T_{O}$（相机坐标系约定见 <a href="../camera/">相机模型与标定</a>）。</p>
+
+  <h3>逆变换与相对位姿</h3>
+  <ol class="derive">
+    <li><p>正向：</p>$${}^{A}\mathbf p=R\,{}^{B}\mathbf p+\mathbf t$$</li>
+    <li><p>解出 ${}^{B}\mathbf p$，用 $R^{-1}=R^\top$：</p>$${}^{B}\mathbf p=R^\top({}^{A}\mathbf p-\mathbf t)=R^\top\,{}^{A}\mathbf p-R^\top\mathbf t$$</li>
+    <li><p>写回矩阵，平移部分是 $-R^\top\mathbf t$，不是 $-\mathbf t$：</p>$${}^{B}T_{A}=({}^{A}T_{B})^{-1}=\begin{bmatrix}R^\top&-R^\top\mathbf t\\\mathbf 0^\top&1\end{bmatrix}$$</li>
+    <li><p>两个都在 A 系下已知的位姿，相对位姿：</p>$${}^{B}T_{C}=({}^{A}T_{B})^{-1}\,{}^{A}T_{C}$$</li>
+  </ol>
+
+  <figure class="viz" id="viz-chain">
+    <div class="viz-h"><b>坐标系链：拖动 A、B 两个坐标系和点 p</b><span>平面示意（SE(2)），单位：m / 度</span></div>
+    <div class="viz-stage"><canvas id="cv-chain" aria-label="世界系 W、坐标系 A、B 和点 p"></canvas></div>
+    <div class="viz-ctrl">
+      <div class="seg" id="sg-chain" role="group" aria-label="显示哪种分解"><button type="button" data-v="AB" aria-pressed="true">看 ᴬt_B</button><button type="button" data-v="Bp">看 ᴮp</button></div>
+      <button type="button" class="btn ghost" id="bt-chain">复位</button>
+    </div>
+    <div class="viz-read" id="rd-chain"></div>
+    <ul class="chips"><li><i style="background:var(--bad)"></i>x 轴</li><li><i style="background:var(--ok)"></i>y 轴</li><li><i style="background:var(--c4)"></i>沿 A 或 B 的轴分解</li><li><i style="background:var(--c3)"></i>点 p</li></ul>
+    <figcaption>拖坐标系的原点圆点平移，拖 x 轴末端的圆点旋转，拖绿色的点移动 p。虚线沿 A 系（或 B 系）的两根轴走到目标点，两段长度就是读数里的坐标。读数中的 ${}^{W}T_{B}$ 由 ${}^{W}T_{A}\,{}^{A}T_{B}$ 算出，与直接量出的一致。</figcaption>
+  </figure>
+
+  <h3>位姿增量：世界系还是工具系</h3>
+  <p>末端从 $T_t$ 走到 $T_{t+1}$（都在基座/世界系 W 下），增量有两种写法：</p>
+  <ul>
+    <li><b>世界系增量</b>（左乘）：$T_{t+1}=\Delta_W\,T_t$，$\Delta_W=T_{t+1}T_t^{-1}$。</li>
+    <li><b>工具系增量</b>（右乘）：$T_{t+1}=T_t\,\Delta_E$，$\Delta_E=T_t^{-1}T_{t+1}$。</li>
+    <li>两者共轭：$\Delta_W=T_t\,\Delta_E\,T_t^{-1}$，转角相同、转轴所在的系不同。</li>
+    <li>展开 $\Delta_W$：旋转 $R_{t+1}R_t^\top$，平移 $\mathbf p_{t+1}-R_{t+1}R_t^\top\mathbf p_t$，<b>不等于</b> $\mathbf p_{t+1}-\mathbf p_t$；它的旋转绕的是世界原点。</li>
+    <li>数据集里的「基座系 delta」通常是解耦的：$\Delta\mathbf p=\mathbf p_{t+1}-\mathbf p_t$，$\Delta R=R_{t+1}R_t^\top$，旋转轴的方向用世界系、但绕末端自身的原点转。robosuite / LIBERO 的 OSC 控制器就按这种方式执行（<code>goal_pos = current_pos + delta</code>，<code>goal_ori = R_err · R_current</code>）。</li>
+  </ul>
+  <p>三种写法在同一个动作下走出的轨迹对比，见 <a href="../action-space/#frame">运动空间 · 增量在哪个坐标系</a>。</p>
+</section>
+
+<section id="compare">
+  <h2>对照与选择</h2>
+  <div class="tbl"><table>
+    <thead><tr><th>表示</th><th>参数</th><th>约束</th><th>作为回归目标连续？</th><th>奇异 / 歧义</th><th>插值</th><th>常见用途</th></tr></thead>
+    <tbody>
+      <tr><td>旋转矩阵</td><td class="num">9</td><td>$R^\top R=I$, det = 1</td><td>连续</td><td>无</td><td>元素线性插值不是旋转</td><td>组合、正运动学、计算</td></tr>
+      <tr><td>欧拉角 / RPY</td><td class="num">3</td><td>无</td><td>否：±180° 处跳</td><td>万向锁（pitch = ±90°）；12 种顺序 × 内外旋</td><td>差</td><td>给人看、URDF、遥操作界面、小增量动作</td></tr>
+      <tr><td>旋转向量 / 轴角</td><td class="num">3</td><td>无（轴角 4 个数，轴单位长）</td><td>否：‖r‖ = π 处 r ≡ −r</td><td>θ = 0 时轴无定义</td><td>同轴时线性</td><td>角速度、姿态误差、LIBERO 的增量动作</td></tr>
+      <tr><td>单位四元数</td><td class="num">4</td><td>‖q‖ = 1</td><td>否：q ≡ −q，规范化后 180° 处跳</td><td>双重覆盖</td><td>slerp</td><td>仿真器与数据存储、插值、姿态滤波</td></tr>
+      <tr><td>6D（两列）</td><td class="num">6</td><td>两列不共线</td><td>连续</td><td>无</td><td>先还原成矩阵</td><td>网络输出（UMI 的动作）</td></tr>
+      <tr><td>9D + SVD</td><td class="num">9</td><td>无</td><td>连续</td><td>无</td><td>先投影</td><td>网络输出</td></tr>
+      <tr><td>齐次变换</td><td class="num">16（6 自由度）</td><td>旋转块 ∈ SO(3)</td><td>旋转部分同上</td><td>同所用旋转表示</td><td>平移线性 + 旋转 slerp</td><td>坐标系链、外参、末端位姿</td></tr>
+    </tbody>
+  </table></div>
+  <ul>
+    <li><b>网络输出绝对姿态</b>（末端绝对姿态、物体位姿、chunk 末端可能转得较多的相对姿态）：用 6D 或 9D + SVD，损失取矩阵元素的 L2 或测地角 $\arccos\frac{\operatorname{tr}(R^\top\hat R)-1}{2}$。</li>
+    <li><b>每步的小增量</b>：旋转向量、RPY 都离不连续点很远，直接回归即可。</li>
+    <li><b>一定要输出四元数</b>：损失用对符号不敏感的 $1-|q\cdot\hat q|$ 或 $\min(\|q-\hat q\|,\|q+\hat q\|)$，输出后再归一化。</li>
+    <li><b>存储与通信</b>：四元数最紧凑，但必须写明 wxyz 还是 xyzw。</li>
+  </ul>
+</section>
+
+<section id="quiz">
+  <h2>自测</h2>
+  <details class="q"><summary>${}^{W}R_{E}$ 的第 3 列是什么？</summary><div><p>末端坐标系的 z 轴在世界系下的方向。夹爪常把 z 定义成接近方向，所以第 3 列就是「夹爪指向哪」。</p></div></details>
+  <details class="q"><summary>「从单位姿态出发，先绕世界 z 转 30°，再绕自身 x 转 20°」写成矩阵是什么？</summary><div><p>第一步得 $R_z(30^\circ)$；绕自身轴是右乘，所以 $R=R_z(30^\circ)R_x(20^\circ)$。等价读法：先绕世界 x 转 20°，再绕世界 z 转 30°。</p></div></details>
+  <details class="q"><summary>SciPy 的 <code>from_euler('xyz', [φ,θ,ψ])</code> 与 <code>from_euler('ZYX', [ψ,θ,φ])</code> 一样吗？</summary><div><p>一样，都是 $R_z(\psi)R_y(\theta)R_x(\phi)$：前者外旋（依次左乘），后者内旋（依次右乘），轴序和角度顺序都倒过来。</p></div></details>
+  <details class="q"><summary>一个按 xyzw 存的单位旋转 <code>[0,0,0,1]</code> 被当成 wxyz 读，会得到什么？</summary><div><p>w = 0、z = 1：绕 z 轴转 180°。代码不会报错，只是姿态整个转了半圈。</p></div></details>
+  <details class="q"><summary>为什么直接用 L2 回归四元数会出问题，怎么改？</summary><div><p>q 与 −q 是同一个旋转。标签不规范化时同一姿态有两个目标；规范化到 w ≥ 0 后在 180° 附近跳变。改用 $1-|q\cdot\hat q|$ 这类符号无关的损失，或改用 6D / 9D 输出。</p></div></details>
+  <details class="q"><summary>OpenCV 外参 $[R\,|\,\mathbf t]$ 满足 $\mathbf x_{cam}=R\mathbf X_{world}+\mathbf t$，它是 ${}^{W}T_{C}$ 还是 ${}^{C}T_{W}$？相机在世界系下的位置是多少？</summary><div><p>把世界坐标变成相机坐标，所以是 ${}^{C}T_{W}$。相机中心在世界系下是 ${}^{W}T_{C}$ 的平移，即 $-R^\top\mathbf t$。</p></div></details>
+  <details class="q"><summary>$\Delta_W=T_{t+1}T_t^{-1}$ 和 $\Delta_E=T_t^{-1}T_{t+1}$ 的转角一样吗？</summary><div><p>一样。两者共轭（$\Delta_W=T_t\Delta_ET_t^{-1}$），旋转部分 $R_{t+1}R_t^\top$ 与 $R_t^\top R_{t+1}$ 的迹相同，所以转角相同，只是转轴分别用世界系和工具系表示。</p></div></details>
+  <details class="q"><summary>slerp 和 nlerp 的路径一样吗？</summary><div><p>一样，都在 $q_0,q_1$ 张成的大圆弧上；区别是速度：slerp 匀角速度，nlerp 是弦上等距再投影到弧上，中间快两头慢。</p></div></details>
+</section>
+
+<section id="refs">
+  <h2>延伸阅读</h2>
+  <ol class="refs">
+    <li><b>Zhou, Barnes, Lu, Yang, Li. On the Continuity of Rotation Representations in Neural Networks</b>, CVPR 2019. <a href="https://arxiv.org/abs/1812.07035">arXiv:1812.07035</a></li>
+    <li><b>Levinson, Esteves, Chen, Snavely, Kanazawa, Rostamizadeh, Makadia. An Analysis of SVD for Deep Rotation Estimation</b>, NeurIPS 2020. <a href="https://arxiv.org/abs/2006.14616">arXiv:2006.14616</a></li>
+    <li><b>Solà, Deray, Atchuthan. A Micro Lie Theory for State Estimation in Robotics</b>, 2018. <a href="https://arxiv.org/abs/1812.01537">arXiv:1812.01537</a></li>
+    <li><b>Solà. Quaternion Kinematics for the Error-State Kalman Filter</b>, 2017. <a href="https://arxiv.org/abs/1711.02508">arXiv:1711.02508</a></li>
+    <li><b>Lynch, Park. Modern Robotics: Mechanics, Planning, and Control</b>, Cambridge University Press 2017，第 3 章（刚体运动）。<a href="https://hades.mech.northwestern.edu/index.php/Modern_Robotics">书籍主页</a></li>
+    <li><b>Chi et al. Universal Manipulation Interface</b>, RSS 2024. <a href="https://arxiv.org/abs/2402.10329">arXiv:2402.10329</a>；代码 <a href="https://github.com/real-stanford/universal_manipulation_interface">GitHub</a>（<code>umi/common/pose_util.py</code> 中的 6D 约定）</li>
+    <li><b>SciPy <code>scipy.spatial.transform.Rotation</code></b> 文档（欧拉角大小写约定、四元数顺序）。<a href="https://docs.scipy.org/doc/scipy/reference/generated/scipy.spatial.transform.Rotation.html">docs.scipy.org</a></li>
+  </ol>
+</section>
+
+</main>
+</div>
+
+<!-- v4u:foot -->
+<footer class="v4u-foot"><div class="v4u-foot-in"><a class="nx" href="../action-space/"><span>下一篇</span>机器人的运动空间</a></div></footer>
+<!-- /v4u:foot -->
+
+<script>
+V4U.ready(() => {
+  const $ = (id) => document.getElementById(id);
+  const C = (n) => V4U.css(n);
+  const { PI, cos, sin, atan2, asin, acos, hypot, sqrt } = Math;
+  const D = PI / 180;
+  const f2 = (x, d = 2) => V4U.fmt(x, d);
+  const fv = (v, d = 2) => '(' + v.map((x) => f2(x, d)).join(', ') + ')';
+
+  // ---------- 3-vector / 3x3 helpers (matrices are arrays of rows) ----------
+  const add = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+  const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+  const sc = (a, s) => [a[0] * s, a[1] * s, a[2] * s];
+  const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+  const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+  const nrm = (a) => hypot(a[0], a[1], a[2]);
+  const unit = (a) => sc(a, 1 / (nrm(a) || 1));
+  const I3 = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+  const mm = (A, B) => A.map((r) => [0, 1, 2].map((j) => r[0] * B[0][j] + r[1] * B[1][j] + r[2] * B[2][j]));
+  const mv = (A, v) => A.map((r) => r[0] * v[0] + r[1] * v[1] + r[2] * v[2]);
+  const tp = (A) => [0, 1, 2].map((i) => [A[0][i], A[1][i], A[2][i]]);
+  const col = (A, k) => [A[0][k], A[1][k], A[2][k]];
+  const fromCols = (a, b, c) => [[a[0], b[0], c[0]], [a[1], b[1], c[1]], [a[2], b[2], c[2]]];
+  const det3 = (A) => dot(col(A, 0), cross(col(A, 1), col(A, 2)));
+  const rotAxis = (n, t) => {
+    const [x, y, z] = unit(n), c = cos(t), s = sin(t), k = 1 - c;
+    return [[c + x * x * k, x * y * k - z * s, x * z * k + y * s], [y * x * k + z * s, c + y * y * k, y * z * k - x * s], [z * x * k - y * s, z * y * k + x * s, c + z * z * k]];
+  };
+  const Rx = (a) => rotAxis([1, 0, 0], a), Ry = (a) => rotAxis([0, 1, 0], a), Rz = (a) => rotAxis([0, 0, 1], a);
+  const logR = (R) => {
+    const th = acos(V4U.clamp((R[0][0] + R[1][1] + R[2][2] - 1) / 2, -1, 1));
+    if (th < 1e-7) return [[0, 0, 1], 0];
+    if (PI - th < 1e-4) {
+      const d = [R[0][0], R[1][1], R[2][2]], k = d.indexOf(Math.max(...d));
+      return [unit([0, 1, 2].map((i) => (R[i][k] + (i === k ? 1 : 0)) / 2)), th];
+    }
+    return [unit([R[2][1] - R[1][2], R[0][2] - R[2][0], R[1][0] - R[0][1]]), th];
+  };
+  const geo = (A, B) => logR(mm(tp(A), B))[1];
+  const R2q = (R) => { // Shepperd, returns wxyz with w >= 0
+    const t = R[0][0] + R[1][1] + R[2][2];
+    let q;
+    if (t > Math.max(R[0][0], R[1][1], R[2][2])) { const w = sqrt(1 + t) / 2; q = [w, (R[2][1] - R[1][2]) / (4 * w), (R[0][2] - R[2][0]) / (4 * w), (R[1][0] - R[0][1]) / (4 * w)]; }
+    else if (R[0][0] >= R[1][1] && R[0][0] >= R[2][2]) { const x = sqrt(1 + R[0][0] - R[1][1] - R[2][2]) / 2; q = [(R[2][1] - R[1][2]) / (4 * x), x, (R[0][1] + R[1][0]) / (4 * x), (R[0][2] + R[2][0]) / (4 * x)]; }
+    else if (R[1][1] >= R[2][2]) { const y = sqrt(1 - R[0][0] + R[1][1] - R[2][2]) / 2; q = [(R[0][2] - R[2][0]) / (4 * y), (R[0][1] + R[1][0]) / (4 * y), y, (R[1][2] + R[2][1]) / (4 * y)]; }
+    else { const z = sqrt(1 - R[0][0] - R[1][1] + R[2][2]) / 2; q = [(R[1][0] - R[0][1]) / (4 * z), (R[0][2] + R[2][0]) / (4 * z), (R[1][2] + R[2][1]) / (4 * z), z]; }
+    return q[0] < 0 ? q.map((v) => -v) : q;
+  };
+  const eulZYX = (R) => [atan2(R[2][1], R[2][2]), asin(V4U.clamp(-R[2][0], -1, 1)), atan2(R[1][0], R[0][0])];
+
+  // ---------- drawing helpers ----------
+  const dashed = (ctx, fn, pat = [5, 4]) => { ctx.save(); ctx.setLineDash(pat); fn(); ctx.restore(); };
+  const head = (ctx, A, B, col, s = 9) => {
+    const dx = B.x - A.x, dy = B.y - A.y, L = hypot(dx, dy); if (L < 3) return;
+    const ux = dx / L, uy = dy / L; s = Math.min(s, L * 0.45);
+    ctx.fillStyle = col; ctx.beginPath(); ctx.moveTo(B.x, B.y);
+    ctx.lineTo(B.x - s * ux - s * 0.42 * uy, B.y - s * uy + s * 0.42 * ux);
+    ctx.lineTo(B.x - s * ux + s * 0.42 * uy, B.y - s * uy - s * 0.42 * ux); ctx.closePath(); ctx.fill();
+  };
+  const arrow3 = (ctx, P, a, b, col, w = 2.5, dash) => {
+    const A = P.project(a), B = P.project(b); if (!A || !B) return;
+    ctx.save(); if (dash) ctx.setLineDash(dash);
+    ctx.strokeStyle = col; ctx.lineWidth = w; ctx.beginPath(); ctx.moveTo(A.x, A.y); ctx.lineTo(B.x, B.y); ctx.stroke(); ctx.restore();
+    head(ctx, A, B, col);
+  };
+  const arrow2 = (ctx, ax, ay, bx, by, col, w = 2.5, dash) => {
+    ctx.save(); if (dash) ctx.setLineDash(dash);
+    ctx.strokeStyle = col; ctx.lineWidth = w; ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.stroke(); ctx.restore();
+    head(ctx, { x: ax, y: ay }, { x: bx, y: by }, col);
+  };
+  const frame3 = (ctx, P, o, R, len, w, labels) => {
+    const cols = [C('--bad'), C('--ok'), C('--c1')];
+    for (let k = 0; k < 3; k++) {
+      const tip = add(o, sc(col(R, k), len));
+      if (w >= 2) arrow3(ctx, P, o, tip, cols[k], w); else P.line(o, tip, cols[k], w);
+      if (labels) P.text(add(o, sc(col(R, k), len * 1.08)), labels[k], cols[k], '12px ' + C('--f-mono'));
+    }
+  };
+  const FACES = [[0, 1, 3, 2, 0, -1], [4, 5, 7, 6, 0, 1], [0, 1, 5, 4, 1, -1], [2, 3, 7, 6, 1, 1], [0, 2, 6, 4, 2, -1], [1, 3, 7, 5, 2, 1]];
+  const drawBox = (P, R, c, h) => {
+    const V = [];
+    for (let i = 0; i < 8; i++) V.push(add(c, mv(R, [(i & 4 ? 1 : -1) * h[0], (i & 2 ? 1 : -1) * h[1], (i & 1 ? 1 : -1) * h[2]])));
+    const fills = [C('--bad-soft'), C('--ok-soft'), C('--c1s')], neg = C('--surface-2'), line = C('--ink-2');
+    FACES.map((f) => ({ f, d: P.depth(sc(add(add(V[f[0]], V[f[1]]), add(V[f[2]], V[f[3]])), 0.25)) }))
+      .sort((a, b) => b.d - a.d)
+      .forEach(({ f }) => P.poly([V[f[0]], V[f[1]], V[f[2]], V[f[3]]], f[5] > 0 ? fills[f[4]] : neg, line, 1));
+  };
+  const ring = (P, c, u, v, r, colr, w) => {
+    let prev = null;
+    for (let i = 0; i <= 64; i++) {
+      const a = (i / 64) * 2 * PI, p = add(c, add(sc(u, r * cos(a)), sc(v, r * sin(a))));
+      if (prev) P.line(prev, p, colr, w);
+      prev = p;
+    }
+  };
+  const mono = (px = 11) => px + 'px ' + C('--f-mono');
+  const rng = (seed) => () => { seed = (seed + 0x6D2B79F5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  const gaussOf = (r) => () => sqrt(-2 * Math.log(r() || 1e-9)) * cos(2 * PI * r());
+  const segBind = (id, cb) => V4U.seg($(id), cb);
+  // simple 2D plot frame: returns mappers
+  const plotFrame = (ctx, x0, y0, w, h, xr, yr, xt, yt, fmtx = (v) => v, fmty = (v) => v) => {
+    const X = (v) => x0 + ((v - xr[0]) / (xr[1] - xr[0])) * w, Y = (v) => y0 + h - ((v - yr[0]) / (yr[1] - yr[0])) * h;
+    ctx.strokeStyle = C('--line'); ctx.lineWidth = 1; ctx.font = mono(11); ctx.fillStyle = C('--muted');
+    yt.forEach((v) => { ctx.beginPath(); ctx.moveTo(x0, Y(v)); ctx.lineTo(x0 + w, Y(v)); ctx.stroke(); ctx.textAlign = 'right'; ctx.textBaseline = 'middle'; ctx.fillText(fmty(v), x0 - 5, Y(v)); });
+    xt.forEach((v) => { ctx.textAlign = 'center'; ctx.textBaseline = 'top'; ctx.fillText(fmtx(v), X(v), y0 + h + 5); });
+    ctx.strokeStyle = C('--line-2'); ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x0, y0 + h); ctx.lineTo(x0 + w, y0 + h); ctx.stroke();
+    ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+    return { X, Y };
+  };
+
+  // ================= 1. rotation matrix: columns, active / passive =================
+  {
+    const sl = $('sl-mat'), o = $('o-mat'), rd = $('rd-mat');
+    const AX = { x: [1, 0, 0], z: [0, 0, 1], d: [1, 1, 1] };
+    let axis = 'z', mode = 'act';
+    const p0 = [0.8, 0.15, 0.55];
+    const V = V4U.orbit3d($('cv-mat'), { height: 340, dist: 3.3, yaw: -0.55, pitch: 0.4, target: [0.1, 0, 0.3] }, (ctx, P) => {
+      const th = +sl.value * D, n = unit(AX[axis]), R = rotAxis(n, th);
+      o.textContent = sl.value + '°';
+      dashed(ctx, () => P.line(sc(n, -1.25), sc(n, 1.35), C('--c4'), 1.5));
+      frame3(ctx, P, [0, 0, 0], I3, 1.15, 1, ['x', 'y', 'z']);
+      frame3(ctx, P, [0, 0, 0], R, 0.9, 3.5, ['x′', 'y′', 'z′']);
+      const c3 = C('--c3');
+      let out;
+      if (mode === 'act') {
+        const pr = mv(R, p0);
+        let prev = p0;
+        for (let i = 1; i <= 40; i++) { const q = mv(rotAxis(n, (th * i) / 40), p0); dashed(ctx, () => P.line(prev, q, c3, 1.5), [3, 3]); prev = q; }
+        P.point(p0, 5, C('--muted')); P.text(p0, 'p', C('--muted'));
+        P.point(pr, 6, c3); P.text(pr, 'p′', c3);
+        out = `<span>p′ = R p = <b>${fv(pr)}</b></span>`;
+      } else {
+        const pb = mv(tp(R), p0);
+        let a = [0, 0, 0];
+        for (let k = 0; k < 3; k++) { const b = add(a, sc(col(R, k), pb[k])); dashed(ctx, () => P.line(a, b, C('--c4'), 2), [4, 3]); a = b; }
+        P.point(p0, 6, c3); P.text(p0, 'p', c3);
+        out = `<span>ᴬp = <b>${fv(p0)}</b></span><span>ᴮp = Rᵀ ᴬp = <b>${fv(pb)}</b></span>`;
+      }
+      const RtR = mm(tp(R), R); let e = 0; for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) e = Math.max(e, Math.abs(RtR[i][j] - (i === j ? 1 : 0)));
+      rd.innerHTML = `<span>第 1 列 <b>${fv(col(R, 0))}</b></span><span>第 2 列 <b>${fv(col(R, 1))}</b></span><span>第 3 列 <b>${fv(col(R, 2))}</b></span>${out}<span>det R = <b>${f2(det3(R), 3)}</b></span><span>max|RᵀR − I| = <b>${e.toExponential(0)}</b></span>`;
+    });
+    sl.addEventListener('input', V.redraw);
+    segBind('sg-mat-ax', (v) => { axis = v; V.redraw(); });
+    segBind('sg-mat-mode', (v) => { mode = v; V.redraw(); });
+  }
+
+  // ================= 2. composition order =================
+  {
+    const sa = $('sl-comp-a'), sb = $('sl-comp-b'), st = $('sl-comp-t'), rd = $('rd-comp');
+    let ax = 'z';
+    const E = { z: [0, 0, 1], y: [0, 1, 0] };
+    const state = () => {
+      const a = +sa.value * D, b = +sb.value * D, t = +st.value, A = Rx(a * Math.min(1, t)), s = Math.max(0, t - 1);
+      const n = E[ax], Bm = rotAxis(n, b * s);
+      return { a, b, t, A, Afull: Rx(a), n, L: mm(Bm, A), Rr: mm(A, Bm) };
+    };
+    const draw = (side) => (ctx, P) => {
+      const S = state(), R = side === 'L' ? S.L : S.Rr;
+      $('o-comp-a').textContent = sa.value + '°'; $('o-comp-b').textContent = sb.value + '°'; $('o-comp-t').textContent = f2(S.t);
+      frame3(ctx, P, [0, 0, 0], I3, 1.05, 1, ['x', 'y', 'z']);
+      let axisW;
+      if (S.t <= 1) axisW = [1, 0, 0];
+      else axisW = side === 'L' ? S.n : mv(S.Afull, S.n);
+      dashed(ctx, () => P.line(sc(axisW, -1.2), sc(axisW, 1.25), C('--c4'), 2));
+      drawBox(P, R, [0, 0, 0], [0.42, 0.26, 0.12]);
+      frame3(ctx, P, [0, 0, 0], R, 0.7, 2.5);
+    };
+    const opts = { height: 280, dist: 3.3, yaw: -0.75, pitch: 0.38 };
+    const VL = V4U.orbit3d($('cv-comp-l'), opts, draw('L'));
+    const VR = V4U.orbit3d($('cv-comp-r'), opts, draw('R'));
+    const both = () => {
+      VL.redraw(); VR.redraw();
+      const S = state(), L = mm(rotAxis(S.n, S.b), S.Afull), Rr = mm(S.Afull, rotAxis(S.n, S.b));
+      let d = 0; for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) d += (L[i][j] - Rr[i][j]) ** 2;
+      rd.innerHTML = `<span>左乘后物体 x 轴 <b>${fv(col(S.L, 0))}</b></span><span>右乘后物体 x 轴 <b>${fv(col(S.Rr, 0))}</b></span><span>最终 ‖R_a(β)R_x(α) − R_x(α)R_a(β)‖_F = <b>${f2(sqrt(d))}</b></span><span>两者夹角 <b>${f2(geo(L, Rr) / D, 0)}°</b></span>`;
+    };
+    const sync = (src, dst, cv) => cv.addEventListener('pointermove', () => { dst.view.yaw = src.view.yaw; dst.view.pitch = src.view.pitch; dst.redraw(); });
+    sync(VL, VR, $('cv-comp-l')); sync(VR, VL, $('cv-comp-r'));
+    [sa, sb, st].forEach((s) => s.addEventListener('input', both));
+    segBind('sg-comp', (v) => { ax = v; both(); });
+    let anim = null;
+    $('bt-comp').addEventListener('click', (e) => {
+      if (anim) { anim.stop(); anim = null; e.target.textContent = '播放'; return; }
+      e.target.textContent = '暂停'; if (+st.value >= 2) st.value = 0;
+      anim = V4U.loop($('cv-comp-l'), (t, dt) => { let v = +st.value + dt * 0.6; if (v >= 2) { v = 2; anim.stop(); anim = null; e.target.textContent = '播放'; } st.value = v; both(); });
+    });
+    both();
+  }
+
+  // ================= 3. gimbal lock =================
+  {
+    const sy = $('sl-g-y'), sp = $('sl-g-p'), sr = $('sl-g-r'), rd = $('rd-gimbal');
+    const V = V4U.orbit3d($('cv-gimbal'), { height: 360, dist: 3.8, yaw: -0.2, pitch: 0.35 }, (ctx, P) => {
+      const psi = +sy.value * D, th = +sp.value * D, phi = +sr.value * D;
+      $('o-g-y').textContent = Math.round(+sy.value) + '°'; $('o-g-p').textContent = Math.round(+sp.value) + '°'; $('o-g-r').textContent = Math.round(+sr.value) + '°';
+      const R1 = Rz(psi), R2 = mm(R1, Ry(th)), R3 = mm(R2, Rx(phi));
+      const ez = [0, 0, 1], pitchAx = col(R1, 1), rollAx = col(R2, 0);
+      frame3(ctx, P, [0, 0, 0], I3, 1.35, 1, ['x', 'y', 'z']);
+      dashed(ctx, () => { P.line(sc(ez, -1.3), sc(ez, 1.3), C('--c1'), 1.5); P.line(sc(pitchAx, -1.3), sc(pitchAx, 1.3), C('--c2'), 1.5); P.line(sc(rollAx, -1.3), sc(rollAx, 1.3), C('--c3'), 1.5); });
+      ring(P, [0, 0, 0], pitchAx, ez, 1.05, C('--c1'), 4);
+      ring(P, [0, 0, 0], pitchAx, col(R2, 0), 0.88, C('--c2'), 4);
+      ring(P, [0, 0, 0], col(R3, 0), col(R3, 2), 0.72, C('--c3'), 4);
+      drawBox(P, R3, [0, 0, 0], [0.45, 0.22, 0.06]);
+      frame3(ctx, P, [0, 0, 0], R3, 0.55, 2.5);
+      const ang = acos(Math.min(1, Math.abs(dot(ez, rollAx)))) / D;
+      const locked = Math.abs(Math.abs(+sp.value) - 90) < 0.5;
+      rd.innerHTML = `<span>yaw 轴与 roll 轴夹角 <b>${f2(ang, 1)}°</b></span><span>det E = cos θ = <b>${f2(cos(th), 3)}</b></span><span>φ − ψ = <b>${f2(((+sr.value - +sy.value + 540) % 360) - 180, 0)}°</b></span><span>${locked ? '<b>锁死</b>：姿态只取决于 φ − ψ' : '未锁死：三个角各管一个方向'}</span>`;
+    });
+    [sy, sp, sr].forEach((s) => s.addEventListener('input', V.redraw));
+    let anim = null;
+    const wrap = (v) => ((v + 540) % 360) - 180;
+    $('bt-gimbal').addEventListener('click', (e) => {
+      if (anim) { anim.stop(); anim = null; e.target.textContent = 'ψ、φ 同时加'; return; }
+      e.target.textContent = '停止';
+      anim = V4U.loop($('cv-gimbal'), (t, dt) => { sy.value = wrap(+sy.value + dt * 40); sr.value = wrap(+sr.value + dt * 40); V.redraw(); });
+    });
+  }
+
+  // ================= 4. Rodrigues =================
+  {
+    const saz = $('sl-rod-az'), sel = $('sl-rod-el'), sth = $('sl-rod-th'), rd = $('rd-rod');
+    const v = [0.95, -0.35, 0.25];
+    const V = V4U.orbit3d($('cv-rod'), { height: 360, dist: 3.0, yaw: -0.25, pitch: 0.3, target: [0.25, 0, 0.35] }, (ctx, P) => {
+      const az = +saz.value * D, el = +sel.value * D, th = +sth.value * D;
+      $('o-rod-az').textContent = saz.value + '°'; $('o-rod-el').textContent = sel.value + '°'; $('o-rod-th').textContent = sth.value + '°';
+      const n = [cos(el) * cos(az), cos(el) * sin(az), sin(el)];
+      const vpar = sc(n, dot(n, v)), vperp = sub(v, vpar), wv = cross(n, vperp);
+      const cpart = sc(vperp, cos(th)), spart = sc(wv, sin(th));
+      const vp = add(vpar, add(cpart, spart));
+      frame3(ctx, P, [0, 0, 0], I3, 0.9, 1, ['x', 'y', 'z']);
+      dashed(ctx, () => P.line(sc(n, -1.2), sc(n, 1.45), C('--c4'), 2));
+      P.text(sc(n, 1.45), 'ω', C('--c4'));
+      ring(P, vpar, vperp, wv, 1, C('--line-2'), 1.2);
+      let prev = v;
+      for (let i = 1; i <= 48; i++) { const a = (th * i) / 48, q = add(vpar, add(sc(vperp, cos(a)), sc(wv, sin(a)))); P.line(prev, q, C('--c3'), 2); prev = q; }
+      dashed(ctx, () => P.line(vpar, v, C('--muted'), 1.2), [3, 3]);
+      arrow3(ctx, P, [0, 0, 0], v, C('--muted'), 2.5);
+      arrow3(ctx, P, [0, 0, 0], vpar, C('--c5'), 3);
+      arrow3(ctx, P, vpar, add(vpar, cpart), C('--c1'), 3);
+      arrow3(ctx, P, add(vpar, cpart), vp, C('--c2'), 3);
+      arrow3(ctx, P, [0, 0, 0], vp, C('--c3'), 3);
+      P.text(v, 'v', C('--muted')); P.text(vp, 'v′', C('--c3'));
+      const R = rotAxis(n, th), [lax, lth] = logR(R), Rv = mv(R, v);
+      rd.innerHTML = `<span>ω̂ = <b>${fv(n)}</b></span><span>‖v⊥‖ = <b>${f2(nrm(vperp))}</b></span><span>R v = <b>${fv(Rv)}</b></span><span>log R → θ = <b>${f2(lth / D, 1)}°</b>, ω̂ = <b>${fv(lax)}</b></span><span>r = θω̂ = <b>${fv(sc(lax, lth))}</b></span>`;
+    });
+    [saz, sel, sth].forEach((s) => s.addEventListener('input', V.redraw));
+  }
+
+  // ================= 5. double cover =================
+  {
+    const sl = $('sl-cover'), rd = $('rd-cover');
+    const redraw = V4U.canvas($('cv-cover'), (w) => (w < 560 ? 520 : 300), (ctx, w, h) => {
+      const th = +sl.value * D; $('o-cover').textContent = sl.value + '°';
+      const stack = w < 560;
+      const r = stack ? Math.min(w * 0.36, 105) : Math.min(h * 0.36, w * 0.17);
+      const cx = stack ? w / 2 : w * 0.27, cy = stack ? r + 34 : h / 2;
+      const ox = stack ? w / 2 : w * 0.73, oy = stack ? cy + r + 34 + r : h / 2;
+      // circle
+      ctx.strokeStyle = C('--line-2'); ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(cx, cy, r, 0, 2 * PI); ctx.stroke();
+      ctx.strokeStyle = C('--line'); ctx.beginPath(); ctx.moveTo(cx - r - 14, cy); ctx.lineTo(cx + r + 14, cy); ctx.moveTo(cx, cy - r - 14); ctx.lineTo(cx, cy + r + 14); ctx.stroke();
+      ctx.fillStyle = C('--muted'); ctx.font = mono(11);
+      ctx.fillText('w', cx + r + 4, cy - 6); ctx.fillText('sin(θ/2)', cx + 6, cy - r - 4);
+      // traced path
+      const half = th / 2;
+      ctx.strokeStyle = C('--c1'); ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(cx, cy, r, 0, -half, true); ctx.stroke();
+      const qx = cx + r * cos(half), qy = cy - r * sin(half), nx = cx - r * cos(half), ny = cy + r * sin(half);
+      dashed(ctx, () => { ctx.strokeStyle = C('--muted'); ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(qx, qy); ctx.lineTo(nx, ny); ctx.stroke(); }, [3, 3]);
+      ctx.fillStyle = C('--c1'); ctx.beginPath(); ctx.arc(qx, qy, 6.5, 0, 2 * PI); ctx.fill();
+      ctx.strokeStyle = C('--c1'); ctx.lineWidth = 2; ctx.fillStyle = C('--surface'); ctx.beginPath(); ctx.arc(nx, ny, 6.5, 0, 2 * PI); ctx.fill(); ctx.stroke();
+      const canonUp = cos(half) >= 0;
+      const kx = canonUp ? qx : nx, ky = canonUp ? qy : ny;
+      ctx.strokeStyle = C('--c3'); ctx.lineWidth = 2.5; ctx.beginPath(); ctx.arc(kx, ky, 11, 0, 2 * PI); ctx.stroke();
+      ctx.fillStyle = C('--ink-2'); ctx.font = mono(12); ctx.fillText('q', qx + 10, qy - 8); ctx.fillText('−q', nx + 10, ny + 16);
+      // object rotating by th (spiral trace shows total turn)
+      const R0 = Math.min(r * 0.9, 90);
+      ctx.strokeStyle = C('--c2'); ctx.lineWidth = 2; ctx.beginPath();
+      for (let i = 0; i <= 120; i++) { const a = (th * i) / 120, rr = R0 * (0.55 + (0.45 * a) / (4 * PI)); const x = ox + rr * cos(a), y = oy - rr * sin(a); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }
+      ctx.stroke();
+      const L = R0 * 0.75, ca = cos(th), sa = sin(th);
+      const T = (x, y) => [ox + x * ca - y * sa, oy - (x * sa + y * ca)];
+      ctx.strokeStyle = C('--ink'); ctx.lineWidth = 3; ctx.beginPath();
+      [[0, 0], [L, 0]].forEach(([x, y], i) => { const [X, Y] = T(x, y); i ? ctx.lineTo(X, Y) : ctx.moveTo(X, Y); }); ctx.stroke();
+      ctx.beginPath(); [[L * 0.65, -L * 0.22], [L, -L * 0.22], [L, L * 0.22], [L * 0.65, L * 0.22]].forEach(([x, y], i) => { const [X, Y] = T(x, y); i ? ctx.lineTo(X, Y) : ctx.moveTo(X, Y); }); ctx.stroke();
+      ctx.fillStyle = C('--ink'); ctx.beginPath(); ctx.arc(ox, oy, 4, 0, 2 * PI); ctx.fill();
+      const w0 = cos(half), z0 = sin(half), sgn = w0 >= 0 ? 1 : -1;
+      rd.innerHTML = `<span>q = (w, 0, 0, z) = <b>(${f2(w0)}, 0, 0, ${f2(z0)})</b></span><span>−q = <b>(${f2(-w0)}, 0, 0, ${f2(-z0)})</b></span><span>规范化 w≥0 → <b>(${f2(sgn * w0)}, 0, 0, ${f2(sgn * z0)})</b></span><span>物体实际朝向 θ mod 360° = <b>${(+sl.value % 360)}°</b></span>`;
+    });
+    sl.addEventListener('input', redraw);
+    let anim = null;
+    $('bt-cover').addEventListener('click', (e) => {
+      if (anim) { anim.stop(); anim = null; e.target.textContent = '播放'; return; }
+      e.target.textContent = '暂停';
+      anim = V4U.loop($('cv-cover'), (t, dt) => { let v = +sl.value + dt * 60; if (v > 720) v -= 720; sl.value = v; redraw(); });
+    });
+  }
+
+  // ================= 6. slerp vs nlerp =================
+  {
+    const sa = $('sl-sl-ang'), stt = $('sl-sl-t'), rd = $('rd-slerp');
+    let shortest = true;
+    const N = 8;
+    const geom = () => {
+      const phi = +sa.value * D, half = phi / 2;
+      let tgt = half; // angle of q1 in the (q0, q1) plane
+      const flipped = shortest && cos(half) < 0;
+      if (flipped) tgt = half - PI;
+      const slerpA = (t) => t * tgt;
+      const nlerpA = (t) => atan2(t * sin(tgt), 1 - t + t * cos(tgt));
+      return { phi, half, tgt, flipped, slerpA, nlerpA };
+    };
+    const left = V4U.canvas($('cv-slerp'), 280, (ctx, w, h) => {
+      const G = geom(), t = +stt.value;
+      $('o-sl-ang').textContent = sa.value + '°'; $('o-sl-t').textContent = f2(t);
+      const r = Math.min(w, h) * 0.38, cx = w / 2, cy = h / 2;
+      const P = (a, rr = r) => [cx + rr * cos(a), cy - rr * sin(a)];
+      ctx.strokeStyle = C('--line-2'); ctx.lineWidth = 1.2; ctx.beginPath(); ctx.arc(cx, cy, r, 0, 2 * PI); ctx.stroke();
+      // arc travelled
+      ctx.strokeStyle = C('--c1s'); ctx.lineWidth = 8; ctx.beginPath(); ctx.arc(cx, cy, r, 0, -G.tgt, G.tgt > 0); ctx.stroke();
+      // chord
+      const [ax, ay] = P(0), [bx, by] = P(G.tgt);
+      dashed(ctx, () => { ctx.strokeStyle = C('--muted'); ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.stroke(); }, [4, 3]);
+      for (let i = 0; i <= N; i++) {
+        const tt = i / N;
+        const [sx, sy] = P(G.slerpA(tt));
+        const chx = ax + (bx - ax) * tt, chy = ay + (by - ay) * tt;
+        const [nx, ny] = P(G.nlerpA(tt));
+        ctx.strokeStyle = C('--c2s'); ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(nx, ny); ctx.stroke();
+        ctx.fillStyle = C('--c2'); ctx.beginPath(); ctx.arc(chx, chy, 2.5, 0, 2 * PI); ctx.fill();
+        ctx.beginPath(); ctx.arc(nx, ny, 4, 0, 2 * PI); ctx.fill();
+        ctx.fillStyle = C('--c1'); ctx.beginPath(); ctx.arc(sx, sy, 4, 0, 2 * PI); ctx.fill();
+      }
+      const [s1x, s1y] = P(G.slerpA(t), r + 12), [n1x, n1y] = P(G.nlerpA(t), r - 12);
+      ctx.fillStyle = C('--c1'); ctx.beginPath(); ctx.arc(s1x, s1y, 6, 0, 2 * PI); ctx.fill();
+      ctx.fillStyle = C('--c2'); ctx.beginPath(); ctx.arc(n1x, n1y, 6, 0, 2 * PI); ctx.fill();
+      // labels
+      ctx.font = mono(12); ctx.fillStyle = C('--ink-2');
+      const lab = (a, s, off = 16) => { const [x, y] = P(a, r + off); ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(s, x, y); };
+      lab(0, 'q₀', 18); lab(G.half, 'q₁'); lab(G.half - PI, '−q₁');
+      ctx.fillStyle = C('--muted');
+      [[G.half, 4], [G.half - PI, 4]].forEach(([a, rr]) => { const [x, y] = P(a); ctx.beginPath(); ctx.arc(x, y, rr, 0, 2 * PI); ctx.fill(); });
+      ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+    });
+    const right = V4U.canvas($('cv-slerp-p'), 280, (ctx, w, h) => {
+      const G = geom(), t = +stt.value, tot = 2 * G.tgt / D;
+      const lo = Math.min(0, tot), hi = Math.max(0, tot);
+      const yt = [lo, (lo + hi) / 2, hi].map((v) => Math.round(v));
+      const F = plotFrame(ctx, 46, 12, w - 62, h - 42, [0, 1], [lo, hi === lo ? lo + 1 : hi], [0, 0.25, 0.5, 0.75, 1], yt, (v) => v, (v) => v + '°');
+      const curve = (fn, colr) => { ctx.strokeStyle = colr; ctx.lineWidth = 2.5; ctx.beginPath(); for (let i = 0; i <= 100; i++) { const tt = i / 100, y = (2 * fn(tt)) / D; i ? ctx.lineTo(F.X(tt), F.Y(y)) : ctx.moveTo(F.X(tt), F.Y(y)); } ctx.stroke(); };
+      curve(G.slerpA, C('--c1')); curve(G.nlerpA, C('--c2'));
+      dashed(ctx, () => { ctx.strokeStyle = C('--ink-2'); ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(F.X(t), 12); ctx.lineTo(F.X(t), h - 30); ctx.stroke(); });
+      const ds = 2 * G.tgt, dn = (2 * (G.nlerpA(0.51) - G.nlerpA(0.49))) / 0.02;
+      rd.innerHTML = `<span>q₀·q₁ = <b>${f2(cos(G.half))}</b>${G.flipped ? '（已取 −q₁）' : ''}</span><span>总转角 <b>${f2(Math.abs(tot), 0)}°</b></span><span>t 时 slerp <b>${f2((2 * G.slerpA(t)) / D, 1)}°</b>，nlerp <b>${f2((2 * G.nlerpA(t)) / D, 1)}°</b></span><span>t = 0.5 处 nlerp 角速度 / slerp = <b>${f2(dn / ds)}</b></span>`;
+    });
+    const both = () => { left(); right(); };
+    [sa, stt].forEach((s) => s.addEventListener('input', both));
+    segBind('sg-slerp', (v) => { shortest = v === 'short'; both(); });
+  }
+
+  // ================= 7. continuity of representations =================
+  {
+    const sl = $('sl-cont'), rd = $('rd-cont'), chips = $('ch-cont');
+    let rep = 'eul';
+    const n = unit([0.3, 0.45, 0.84]);
+    const Rof = (s) => rotAxis(n, s);
+    const reps = {
+      eul: { names: ['roll φ', 'pitch θ', 'yaw ψ'], yr: [-PI, PI], yt: [-PI, 0, PI], fy: (v) => (v === 0 ? '0' : v > 0 ? 'π' : '−π'), f: (R) => eulZYX(R), thr: 1.5 },
+      quat: { names: ['w', 'x', 'y', 'z'], yr: [-1, 1], yt: [-1, 0, 1], fy: (v) => v, f: (R) => R2q(R), thr: 0.5 },
+      rv: { names: ['r_x', 'r_y', 'r_z'], yr: [-PI, PI], yt: [-PI, 0, PI], fy: (v) => (v === 0 ? '0' : v > 0 ? 'π' : '−π'), f: (R) => { const [a, t] = logR(R); return sc(a, t); }, thr: 1.5 },
+      six: { names: ['a₁x', 'a₁y', 'a₁z', 'a₂x', 'a₂y', 'a₂z'], yr: [-1, 1], yt: [-1, 0, 1], fy: (v) => v, f: (R) => [...col(R, 0), ...col(R, 1)], thr: 0.5 },
+    };
+    const series = {};
+    Object.keys(reps).forEach((k) => {
+      const S = []; for (let i = 0; i <= 360; i++) S.push(reps[k].f(Rof(i * D)));
+      const jumps = []; for (let i = 1; i <= 360; i++) if (S[i].some((v, j) => Math.abs(v - S[i - 1][j]) > reps[k].thr)) jumps.push(i - 0.5);
+      series[k] = { S, jumps };
+    });
+    const cols = ['--c1', '--c2', '--c3', '--c4', '--c5', '--c6'];
+    const V3 = V4U.orbit3d($('cv-cont3'), { height: 280, dist: 3.3, yaw: -0.6, pitch: 0.35 }, (ctx, P) => {
+      const s = +sl.value * D;
+      frame3(ctx, P, [0, 0, 0], I3, 1.0, 1, ['x', 'y', 'z']);
+      dashed(ctx, () => P.line(sc(n, -1.3), sc(n, 1.3), C('--c4'), 2));
+      const R = Rof(s);
+      drawBox(P, R, [0, 0, 0], [0.45, 0.26, 0.1]);
+      frame3(ctx, P, [0, 0, 0], R, 0.65, 2.5);
+    });
+    const plot = V4U.canvas($('cv-contp'), 280, (ctx, w, h) => {
+      const s = +sl.value; $('o-cont').textContent = s + '°';
+      const Rp = reps[rep], { S, jumps } = series[rep];
+      const F = plotFrame(ctx, 40, 12, w - 54, h - 42, [0, 360], Rp.yr, [0, 90, 180, 270, 360], Rp.yt, (v) => v + '°', Rp.fy);
+      jumps.forEach((j) => dashed(ctx, () => { ctx.strokeStyle = C('--bad'); ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(F.X(j), 12); ctx.lineTo(F.X(j), h - 30); ctx.stroke(); }));
+      Rp.names.forEach((nm, k) => {
+        ctx.strokeStyle = C(cols[k]); ctx.lineWidth = 2; ctx.beginPath();
+        for (let i = 0; i <= 360; i++) {
+          const y = S[i][k];
+          if (i && Math.abs(y - S[i - 1][k]) > Rp.thr) { ctx.stroke(); ctx.beginPath(); ctx.moveTo(F.X(i), F.Y(y)); }
+          else if (i) ctx.lineTo(F.X(i), F.Y(y)); else ctx.moveTo(F.X(i), F.Y(y));
+        }
+        ctx.stroke();
+      });
+      dashed(ctx, () => { ctx.strokeStyle = C('--ink-2'); ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(F.X(s), 12); ctx.lineTo(F.X(s), h - 30); ctx.stroke(); });
+      const cur = Rp.f(Rof(s * D));
+      rd.innerHTML = `<span>${rep === 'six' ? '6D' : rep === 'eul' ? '欧拉角（rad）' : rep === 'quat' ? '四元数' : '旋转向量（rad）'} = <b>${fv(cur)}</b></span><span>跳变 <b>${jumps.length}</b> 处</span>`;
+    });
+    const both = () => { V3.redraw(); plot(); };
+    sl.addEventListener('input', both);
+    segBind('sg-cont', (v) => {
+      rep = v;
+      chips.innerHTML = reps[v].names.map((nm, k) => `<li><i style="background:var(${cols[k]})"></i>${nm}</li>`).join('') + '<li><i style="background:var(--bad)"></i>跳变</li>';
+      plot();
+    });
+  }
+
+  // ================= 8. Gram-Schmidt vs SVD =================
+  {
+    const sl = $('sl-gs'), rd = $('rd-gs');
+    let seed = 7;
+    const Rstar = rotAxis([0.3, -0.5, 0.8], 0.9);
+    const inv3 = (A) => { const c0 = cross(col(A, 1), col(A, 2)), c1 = cross(col(A, 2), col(A, 0)), c2 = cross(col(A, 0), col(A, 1)), d = dot(col(A, 0), c0); return [sc(c0, 1 / d), sc(c1, 1 / d), sc(c2, 1 / d)]; };
+    const jacobiEig = (S) => { // symmetric 3x3 -> {vals, vecs (columns)}
+      let A = S.map((r) => r.slice()), Vm = I3.map((r) => r.slice());
+      for (let sweep = 0; sweep < 30; sweep++) {
+        for (const [p, q] of [[0, 1], [0, 2], [1, 2]]) {
+          if (Math.abs(A[p][q]) < 1e-14) continue;
+          const th = 0.5 * atan2(2 * A[p][q], A[q][q] - A[p][p]), c = cos(th), s = sin(th);
+          const J = I3.map((r) => r.slice()); J[p][p] = c; J[q][q] = c; J[p][q] = s; J[q][p] = -s;
+          A = mm(tp(J), mm(A, J)); Vm = mm(Vm, J);
+        }
+      }
+      return { vals: [A[0][0], A[1][1], A[2][2]], vecs: Vm };
+    };
+    const svdProj = (M) => {
+      const { vals, vecs } = jacobiEig(mm(tp(M), M));
+      const idx = [0, 1, 2].sort((a, b) => vals[b] - vals[a]);
+      const Vs = fromCols(col(vecs, idx[0]), col(vecs, idx[1]), col(vecs, idx[2]));
+      const L = idx.map((i) => Math.max(vals[i], 1e-12));
+      const Q = mm(M, mm(Vs, mm([[1 / sqrt(L[0]), 0, 0], [0, 1 / sqrt(L[1]), 0], [0, 0, 1 / sqrt(L[2])]], tp(Vs)))); // U V^T
+      if (det3(M) >= 0) return Q;
+      const v3 = col(Vs, 2), H = I3.map((r, i) => r.map((x, j) => x - 2 * v3[i] * v3[j]));
+      return mm(Q, H);
+    };
+    const V = V4U.orbit3d($('cv-gs'), { height: 360, dist: 3.2, yaw: -1.0, pitch: 0.4 }, (ctx, P) => {
+      const sig = +sl.value; $('o-gs').textContent = f2(sig);
+      const g = gaussOf(rng(seed));
+      const M = Rstar.map((r) => r.map((x) => x + sig * g()));
+      const a1 = col(M, 0), a2 = col(M, 1), b1 = unit(a1), proj = sc(b1, dot(b1, a2)), b2 = unit(sub(a2, proj)), b3 = cross(b1, b2);
+      const Rgs = fromCols(b1, b2, b3), Rsvd = svdProj(M);
+      frame3(ctx, P, [0, 0, 0], Rstar, 1.0, 1);
+      ['x*', 'y*', 'z*'].forEach((s, k) => P.text(sc(col(Rstar, k), 1.06), s, C('--muted')));
+      arrow3(ctx, P, [0, 0, 0], a1, C('--c1'), 2, [5, 4]); arrow3(ctx, P, [0, 0, 0], a2, C('--c2'), 2, [5, 4]);
+      P.text(a1, 'a₁', C('--c1')); P.text(a2, 'a₂', C('--c2'));
+      arrow3(ctx, P, [0, 0, 0], proj, C('--c5'), 3);
+      dashed(ctx, () => P.line(proj, a2, C('--c5'), 1.5), [2, 3]);
+      arrow3(ctx, P, [0, 0, 0], b1, C('--c1'), 3.5); arrow3(ctx, P, [0, 0, 0], b2, C('--c2'), 3.5); arrow3(ctx, P, [0, 0, 0], b3, C('--c3'), 3.5);
+      P.text(b1, 'b₁', C('--c1')); P.text(b2, 'b₂', C('--c2')); P.text(b3, 'b₃', C('--c3'));
+      rd.innerHTML = `<span>‖a₁‖ = <b>${f2(nrm(a1))}</b>, ‖a₂‖ = <b>${f2(nrm(a2))}</b></span><span>b₁·b₂ = <b>${f2(dot(b1, b2), 3)}</b>, det = <b>${f2(det3(Rgs), 3)}</b></span><span>6D + Gram–Schmidt 误差 <b>${f2(geo(Rgs, Rstar) / D, 1)}°</b></span><span>9D + SVD 误差 <b>${f2(geo(Rsvd, Rstar) / D, 1)}°</b></span>`;
+    });
+    sl.addEventListener('input', V.redraw);
+    $('bt-gs').addEventListener('click', () => { seed += 1; V.redraw(); });
+  }
+
+  // ================= 9. frame chain (SE(2)) =================
+  {
+    const cv = $('cv-chain'), rd = $('rd-chain');
+    let show = 'AB';
+    const init = () => ({ A: { x: 0.9, y: 0.35, t: 25 * D }, B: { x: 1.75, y: 0.95, t: 70 * D }, p: { x: 1.2, y: 1.2 } });
+    let S = init();
+    let map = null, drag = null;
+    const T = (f) => [[cos(f.t), -sin(f.t), f.x], [sin(f.t), cos(f.t), f.y], [0, 0, 1]];
+    const inv = (M) => { const c = M[0][0], s = M[1][0], x = M[0][2], y = M[1][2]; return [[c, s, -(c * x + s * y)], [-s, c, -(-s * x + c * y)], [0, 0, 1]]; };
+    const pose = (M) => `(${f2(M[0][2])}, ${f2(M[1][2])}, ${f2(atan2(M[1][0], M[0][0]) / D, 0)}°)`;
+    const app = (M, p) => [M[0][0] * p[0] + M[0][1] * p[1] + M[0][2], M[1][0] * p[0] + M[1][1] * p[1] + M[1][2]];
+    const L = 0.42;
+    const redraw = V4U.canvas(cv, (w) => (w < 560 ? 330 : 360), (ctx, w, h) => {
+      const xr = [-0.25, 2.35], yr = [-0.2, 1.55];
+      const s = Math.min(w / (xr[1] - xr[0]), h / (yr[1] - yr[0]));
+      const ox = (w - s * (xr[1] - xr[0])) / 2 - s * xr[0], oy = h - ((h - s * (yr[1] - yr[0])) / 2 - s * yr[0]);
+      map = { s, ox, oy, X: (x) => ox + s * x, Y: (y) => oy - s * y, ix: (X) => (X - ox) / s, iy: (Y) => (oy - Y) / s };
+      const { X, Y } = map;
+      ctx.strokeStyle = C('--line'); ctx.lineWidth = 1;
+      for (let gx = 0; gx <= 2.2; gx += 0.2) { ctx.beginPath(); ctx.moveTo(X(gx), Y(yr[0])); ctx.lineTo(X(gx), Y(yr[1])); ctx.stroke(); }
+      for (let gy = 0; gy <= 1.5; gy += 0.2) { ctx.beginPath(); ctx.moveTo(X(xr[0]), Y(gy)); ctx.lineTo(X(xr[1]), Y(gy)); ctx.stroke(); }
+      const drawFrame = (M, name, big, handles) => {
+        const o = [M[0][2], M[1][2]], ex = [M[0][0], M[1][0]], ey = [M[0][1], M[1][1]];
+        arrow2(ctx, X(o[0]), Y(o[1]), X(o[0] + L * ex[0]), Y(o[1] + L * ex[1]), C('--bad'), big ? 3 : 2);
+        arrow2(ctx, X(o[0]), Y(o[1]), X(o[0] + L * ey[0]), Y(o[1] + L * ey[1]), C('--ok'), big ? 3 : 2);
+        ctx.fillStyle = C('--ink'); ctx.font = '700 13px ' + C('--f-body');
+        ctx.fillText(name, X(o[0]) - 16, Y(o[1]) + 16);
+        if (handles) {
+          ctx.strokeStyle = C('--ink-2'); ctx.fillStyle = C('--surface'); ctx.lineWidth = 1.5;
+          [[o[0], o[1]], [o[0] + L * ex[0], o[1] + L * ex[1]]].forEach(([x, y]) => { ctx.beginPath(); ctx.arc(X(x), Y(y), 7, 0, 2 * PI); ctx.fill(); ctx.stroke(); });
+        }
+      };
+      const WA = T(S.A), WB = T(S.B), AB = mm(inv(WA), WB), BW = inv(WB), WAinv = inv(WA);
+      const p = [S.p.x, S.p.y], pA = app(WAinv, p), pB = app(BW, p);
+      // decomposition path
+      const c4 = C('--c4');
+      if (show === 'AB') {
+        const o = [WA[0][2], WA[1][2]], ex = [WA[0][0], WA[1][0]], ey = [WA[0][1], WA[1][1]], t = [AB[0][2], AB[1][2]];
+        const m = [o[0] + t[0] * ex[0], o[1] + t[0] * ex[1]], e = [m[0] + t[1] * ey[0], m[1] + t[1] * ey[1]];
+        dashed(ctx, () => { ctx.strokeStyle = c4; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(X(o[0]), Y(o[1])); ctx.lineTo(X(m[0]), Y(m[1])); ctx.lineTo(X(e[0]), Y(e[1])); ctx.stroke(); });
+      } else {
+        const o = [WB[0][2], WB[1][2]], ex = [WB[0][0], WB[1][0]], ey = [WB[0][1], WB[1][1]];
+        const m = [o[0] + pB[0] * ex[0], o[1] + pB[0] * ex[1]];
+        dashed(ctx, () => { ctx.strokeStyle = c4; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(X(o[0]), Y(o[1])); ctx.lineTo(X(m[0]), Y(m[1])); ctx.lineTo(X(p[0]), Y(p[1])); ctx.stroke(); });
+      }
+      drawFrame([[1, 0, 0], [0, 1, 0], [0, 0, 1]], 'W', false, false);
+      drawFrame(WA, 'A', true, true);
+      drawFrame(WB, 'B', true, true);
+      ctx.fillStyle = C('--c3'); ctx.beginPath(); ctx.arc(X(p[0]), Y(p[1]), 7, 0, 2 * PI); ctx.fill();
+      ctx.fillStyle = C('--ink-2'); ctx.font = mono(12); ctx.fillText('p', X(p[0]) + 9, Y(p[1]) - 8);
+      const WB2 = mm(WA, AB);
+      rd.innerHTML = `<span>ᵂT_A = <b>${pose(WA)}</b></span><span>ᴬT_B = (ᵂT_A)⁻¹ ᵂT_B = <b>${pose(AB)}</b></span><span>ᵂT_A ᴬT_B = <b>${pose(WB2)}</b></span><span>ᵂp = <b>(${f2(p[0])}, ${f2(p[1])})</b></span><span>ᴬp = <b>(${f2(pA[0])}, ${f2(pA[1])})</b></span><span>ᴮp = <b>(${f2(pB[0])}, ${f2(pB[1])})</b></span>`;
+    });
+    V4U.drag(cv, (x, y, ph) => {
+      if (!map) return;
+      const wx = map.ix(x), wy = map.iy(y);
+      if (ph === 'down') {
+        const hit = (px, py) => hypot(map.X(px) - x, map.Y(py) - y) < 16;
+        drag = null;
+        for (const k of ['A', 'B']) {
+          const f = S[k];
+          if (hit(f.x + L * cos(f.t), f.y + L * sin(f.t))) drag = { k, rot: true };
+          else if (hit(f.x, f.y)) drag = { k, rot: false };
+          if (drag) break;
+        }
+        if (!drag && hit(S.p.x, S.p.y)) drag = { k: 'p' };
+      }
+      if (!drag || ph === 'up') { if (ph === 'up') drag = null; return; }
+      const cx = V4U.clamp(wx, -0.2, 2.3), cy = V4U.clamp(wy, -0.15, 1.5);
+      if (drag.k === 'p') { S.p.x = cx; S.p.y = cy; }
+      else if (drag.rot) { const f = S[drag.k]; f.t = atan2(wy - f.y, wx - f.x); }
+      else { S[drag.k].x = cx; S[drag.k].y = cy; }
+      redraw();
+    });
+    segBind('sg-chain', (v) => { show = v; redraw(); });
+    $('bt-chain').addEventListener('click', () => { S = init(); redraw(); });
+  }
+});
+</script>
+</body>
+</html>

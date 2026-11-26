@@ -1,0 +1,1129 @@
+<!doctype html>
+<html lang="zh-CN" data-sec="vision3d">
+<head>
+<!-- v4u:head -->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="icon" href="data:,">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700&family=Inter+Tight:wght@700&family=JetBrains+Mono:wght@400;700&family=Noto+Sans+SC:wght@400;700&display=swap">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<link rel="stylesheet" href="../../assets/v4u.css?v=4288b6c4">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
+<script src="../../assets/v4u.js?v=d6640e00"></script>
+<!-- /v4u:head -->
+<title>3D 基础模型 · Vis4Und</title>
+<meta name="description" content="前馈式 3D 重建（点图、DUSt3R、VGGT 一系）、单目深度与几何估计、SDS / 多视图扩散 / 大重建模型 / 原生 3D 潜扩散，以及在机器人里的用法。">
+<style>
+/* KaTeX's hidden MathML copy is position:absolute; give the scrolling math containers a containing block so it gets clipped */
+.katex,.tbl{position:relative}
+.viz-stage canvas{touch-action:pan-y}
+.viz-ctrl .chk{gap:6px}
+.viz-ctrl .chk input{margin:0}
+.tbl td small{color:var(--muted)}
+.tbl.wide table{min-width:880px}
+.tbl.mid table{min-width:720px}
+</style>
+</head>
+<body>
+<!-- v4u:nav -->
+<nav class="v4u-nav" aria-label="站点导航"><div class="v4u-nav-in"><span class="v4u-crumb"><a href="../../"><b>Vis4Und</b></a><span class="v4u-sep">/</span><a href="../../#vision3d">(2) 3D 视觉与图形学</a></span><span class="v4u-links"><a href="../3d-representations/">(i) 3D 表征</a><a href="../slam/">(ii) SLAM</a><a href="../3d-foundation-models/" aria-current="page">(iii) 3D 基础模型</a><button type="button" class="v4u-theme" aria-label="切换深浅色">深色</button></span></div></nav>
+<!-- /v4u:nav -->
+
+<header class="hero"><div class="wrap">
+  <p class="kicker">(2) 3D 视觉与图形学 · (iii)</p>
+  <h1>3D 基础模型</h1>
+  <p class="lede">一个前馈网络直接从图像吐出几何（相机、深度、点图），或从文字、图像直接生成 3D 物体和场景。本页按依赖顺序讲表示、损失和代表模型，近年进展截至 2026-11。</p>
+  <p class="asks-h">读完能回答</p>
+  <ul class="asks">
+    <li>点图（pointmap）是什么？怎样从它读出深度、焦距、相对位姿和像素匹配？</li>
+    <li>DUSt3R 的损失为什么先除以平均距离？置信度项实际在优化什么？</li>
+    <li>相对深度和度量深度差在哪？尺度-平移不变损失的闭式解怎么来？</li>
+    <li>SDS 梯度怎么推？为什么能扔掉 U-Net 的雅可比？</li>
+    <li>三平面、向量集、稀疏体素三种 3D 潜表示各有什么取舍？做 real2sim 和规划时选哪个模型？</li>
+  </ul>
+</div></header>
+
+<div class="wrap layout">
+<nav class="toc" id="toc" aria-label="本页目录"></nav>
+<main>
+
+<section id="why">
+  <h2 data-toc="为什么前馈">从 SfM 到前馈网络</h2>
+  <p class="def"><b>经典重建流水线</b>先用 SfM（Structure-from-Motion）从多张图恢复相机和稀疏点，再用 MVS（Multi-View Stereo）逐视角估稠密深度并融合。COLMAP 是标准实现。</p>
+  <p>SfM 的步骤：检测并匹配特征点 → RANSAC 估两视图几何 → 逐张注册新图（PnP）→ 三角化 → 光束法平差（BA，见 <a href="../slam/">SLAM</a> 一页）。每一步都是硬决策，匹配失败后面全部失败：视角少（2–3 张）、基线大、弱纹理、反光时常常注册不上，几百张图要跑几分钟到几小时。相机内参和投影见 <a href="../camera/">相机模型</a>。</p>
+  <p class="def"><b>前馈 3D 重建</b>把这条流水线换成一个网络 $f_\theta$：输入 $N$ 张图，一次前向直接输出每张图的相机、深度和三维点，几何先验从大规模 3D 数据里学。</p>
+  <div class="eq">$$f_\theta\big(\{I_n\}_{n=1}^{N}\big) \;\to\; \{K_n,\ T_n,\ D_n,\ X_n,\ C_n\}_{n=1}^{N}$$</div>
+  <p>$K_n$ 内参，$T_n$ 位姿，$D_n$ 深度图，$X_n$ 点图，$C_n$ 置信度。VGGT 在 H100 上处理 10 帧约 0.14 s，50 帧约 1 s；需要更高精度时，前馈结果可以再作为 BA 的初值。</p>
+  <div class="tbl mid"><table>
+    <thead><tr><th></th><th>SfM + MVS（COLMAP）</th><th>前馈网络（DUSt3R / VGGT 一系）</th></tr></thead>
+    <tbody>
+      <tr><td>输入要求</td><td>足够重叠、纹理；通常要几十张</td><td>1 张到上百张，重叠少也能出结果</td></tr>
+      <tr><td>内参</td><td>需要或在 BA 里自标定</td><td>网络自己预测（多数模型）</td></tr>
+      <tr><td>尺度</td><td>无（单目），只差一个全局尺度</td><td>多数无；MapAnything、MoGe-2 等输出米制</td></tr>
+      <tr><td>耗时</td><td>分钟到小时</td><td>亚秒到秒</td></tr>
+      <tr><td>精度上限</td><td>高（亚像素 BA）</td><td>受训练数据限制，可再接 BA</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="pointmap">
+  <h2>点图：把几何写成一张图</h2>
+  <p class="def"><b>点图（pointmap）</b>$X\in\mathbb{R}^{H\times W\times 3}$ 给每个像素存一个三维点：像素 $i$ 看到的表面点在某个相机坐标系里的坐标。它和图像逐像素对齐，所以可以用图像网络（ViT + DPT 头）直接回归。</p>
+  <table class="notation">
+    <caption>记号</caption>
+    <thead><tr><th>符号</th><th>含义</th><th>形状</th></tr></thead>
+    <tbody>
+      <tr><td>$I^n$</td><td>第 $n$ 张图</td><td>$H\times W\times 3$</td></tr>
+      <tr><td>$(u_i,v_i)$</td><td>像素 $i$ 的坐标；$u'_i=u_i-\tfrac W2,\ v'_i=v_i-\tfrac H2$ 为去中心坐标</td><td>像素</td></tr>
+      <tr><td>$D^n,\ K_n$</td><td>深度图、内参</td><td>$H\times W$，$3\times 3$</td></tr>
+      <tr><td>$T_{m\leftarrow n}$</td><td>相机 $n$ 坐标系到相机 $m$ 坐标系的刚体变换</td><td>$SE(3)$</td></tr>
+      <tr><td>$X^{n,m}$</td><td>第 $n$ 张图的点图，表达在相机 $m$ 坐标系</td><td>$H\times W\times 3$</td></tr>
+      <tr><td>$C^{n,m}$</td><td>逐像素置信度</td><td>$H\times W$</td></tr>
+    </tbody>
+  </table>
+  <div class="eq">$$X^{n,n}_i = D^n_i\,K_n^{-1}\begin{bmatrix}u_i\\ v_i\\ 1\end{bmatrix},\qquad X^{n,m} = T_{m\leftarrow n}\,X^{n,n}$$</div>
+  <p>DUSt3R 对一对图 $(I^1,I^2)$ 输出 $X^{1,1}$ 和 $X^{2,1}$：两张图的点都表达在<b>相机 1</b> 的坐标系里。相机位姿、内参、深度都不是输入，而是可以从这两个点图里读出来的量。</p>
+
+  <figure class="viz" id="viz-pm">
+    <div class="viz-h"><b>两张图 → 两个点图（都在相机 1 坐标系）→ 读出焦距、位姿、匹配</b><span>场景单位：米；焦距：像素</span></div>
+    <div class="viz-grid">
+      <div class="viz-stage"><canvas id="cv-pm3d" aria-label="相机 1 坐标系下的两组点和两个相机视锥，可拖动旋转"></canvas></div>
+      <div class="viz-stage"><canvas id="cv-pmimg" aria-label="两张按深度着色的图像以及点图最近邻得到的像素匹配"></canvas></div>
+    </div>
+    <div class="viz-ctrl">
+      <label for="sl-pm-base">两相机夹角 <input type="range" id="sl-pm-base" min="10" max="120" step="1" value="55"><output id="o-pm-base">55°</output></label>
+      <label for="sl-pm-f">焦距 f <input type="range" id="sl-pm-f" min="10" max="36" step="0.5" value="20"><output id="o-pm-f">20.0</output></label>
+      <label for="sl-pm-n">预测噪声 <input type="range" id="sl-pm-n" min="0" max="0.08" step="0.002" value="0.01"><output id="o-pm-n">0.010</output></label>
+    </div>
+    <div class="viz-read" id="rd-pm"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>$X^{1,1}$（图 1 的点）与相机 1</li><li><i style="background:var(--c2)"></i>$X^{2,1}$（图 2 的点）与相机 2 真值位姿</li><li><i style="background:var(--muted)"></i>从点图解出的相机 2</li><li><i style="background:var(--c3)"></i>正确匹配</li><li><i style="background:var(--bad)"></i>错误匹配</li></ul>
+    <figcaption>左图可拖动旋转。图像为 24×18 像素的玩具相机，颜色深浅表示各自相机系下的深度，灰格是没打到表面的像素（天空）。加大「预测噪声」模拟网络误差：焦距和位姿仍由最小二乘和 Procrustes 稳定解出，3D 最近邻匹配在夹角大时开始出错。</figcaption>
+  </figure>
+
+  <h3>从点图读出四样东西</h3>
+  <ol class="derive">
+    <li><p><b>深度</b>：点图的 $z$ 分量就是深度。</p>$$D^1_i = \big(X^{1,1}_i\big)_z$$</li>
+    <li><p><b>焦距</b>：针孔模型 $u'_i = f\,X_{i,x}/X_{i,z}$。记 $a_i=X_{i,x}/X_{i,z},\ b_i=X_{i,y}/X_{i,z}$，按置信度加权做最小二乘：</p>$$f^*=\arg\min_f\sum_i C_i\big\|(u'_i,v'_i)-f\,(a_i,b_i)\big\|^2$$</li>
+    <li><p>对 $f$ 求导置零，得闭式解（DUSt3R 原文用不平方的范数，用 Weiszfeld 迭代求解，更抗外点）：</p>$$f^*=\frac{\sum_i C_i\,(a_i u'_i + b_i v'_i)}{\sum_i C_i\,(a_i^2+b_i^2)}$$</li>
+    <li><p><b>相对位姿</b>：把输入顺序换成 $(I^2,I^1)$ 再跑一次得到 $X^{2,2}$。同一批像素在两个坐标系下的坐标满足相似变换：</p>$$X^{2,1}_i \approx \sigma R\,X^{2,2}_i + \mathbf t,\qquad (R,\mathbf t)=T_{1\leftarrow 2}$$</li>
+    <li><p>去中心后求加权互协方差并做 SVD（Umeyama / Procrustes 闭式解）：</p>$$H=\sum_i w_i\,(X^{2,2}_i-\bar{\mathbf p})(X^{2,1}_i-\bar{\mathbf q})^\top = U S V^\top$$</li>
+    <li><p>旋转、尺度、平移依次为（$E=\mathrm{diag}(1,1,\det VU^\top)$ 防止解出反射）：</p>$$R=V E U^\top,\quad \sigma=\frac{\operatorname{tr}(SE)}{\sum_i w_i\|X^{2,2}_i-\bar{\mathbf p}\|^2},\quad \mathbf t=\bar{\mathbf q}-\sigma R\,\bar{\mathbf p}$$</li>
+    <li><p><b>匹配</b>：两张图的点在同一坐标系里，像素 $i$（图 1）和 $j$（图 2）互为 3D 最近邻就算一对匹配：</p>$$j=\arg\min_{j'}\|X^{1,1}_i-X^{2,1}_{j'}\|,\qquad i=\arg\min_{i'}\|X^{1,1}_{i'}-X^{2,1}_{j}\|$$</li>
+  </ol>
+  <div class="note"><b>补充</b><p>Procrustes 对外点敏感，DUSt3R 原文建议实际使用时用 RANSAC + PnP（已知 $X^{2,1}$ 的 3D 点和图 2 的像素坐标）求位姿。上面的图里用的是 Procrustes，便于看清闭式解。</p></div>
+</section>
+
+<section id="dust3r">
+  <h2>DUSt3R 与 MASt3R：两张图回归两个点图</h2>
+  <p>DUSt3R（CVPR 2024）的结构：两张图过同一个 ViT-Large 编码器（CroCo v2 预训练初始化），两个 ViT-Base 解码器用交叉注意力互相交换信息，各接一个 DPT 头输出 $X^{n,1}$ 和 $C^{n,1}$。训练用 8 个数据集约 850 万对图，先 224×224，再长边 512 的多种长宽比。</p>
+  <table class="notation">
+    <caption>记号</caption>
+    <thead><tr><th>符号</th><th>含义</th><th>形状</th></tr></thead>
+    <tbody>
+      <tr><td>$\bar X^{n,1}$</td><td>真值点图（由真值深度和位姿算出）</td><td>$H\times W\times 3$</td></tr>
+      <tr><td>$\mathcal D^n$</td><td>第 $n$ 张图有真值的像素集合</td><td>集合</td></tr>
+      <tr><td>$z,\ \bar z$</td><td>预测、真值点图到原点的平均距离</td><td>标量</td></tr>
+      <tr><td>$\ell_{\text{regr}}(n,i)$</td><td>归一化后的逐像素 3D 误差</td><td>标量</td></tr>
+      <tr><td>$C^{n,1}_i=1+e^{\tilde C^{n,1}_i}$</td><td>置信度，网络输出 $\tilde C$ 经变换保证 $&gt;1$</td><td>标量</td></tr>
+      <tr><td>$\alpha$</td><td>置信度正则系数（MASt3R 取 0.2）</td><td>标量</td></tr>
+    </tbody>
+  </table>
+  <h3>推导：归一化回归 + 置信度</h3>
+  <ol class="derive">
+    <li><p>两张图（以及单张图）里，把整个场景放大 $k$ 倍、相机平移也放大 $k$ 倍，图像完全不变，所以绝对尺度不可观。预测和真值各自除以到原点的平均距离：</p>$$z=\operatorname{norm}(X^{1,1},X^{2,1})=\frac{1}{|\mathcal D^1|+|\mathcal D^2|}\sum_{n=1}^{2}\sum_{i\in\mathcal D^n}\big\|X^{n,1}_i\big\|$$</li>
+    <li><p>逐像素回归误差在归一化后的空间里算：</p>$$\ell_{\text{regr}}(n,i)=\Big\|\tfrac{1}{z}X^{n,1}_i-\tfrac{1}{\bar z}\bar X^{n,1}_i\Big\|$$</li>
+    <li><p>天空、玻璃、遮挡区域本来就预测不准，让网络同时输出置信度，按置信度加权并加一个防止 $C$ 塌到最小值的对数项：</p>$$\mathcal L_{\text{conf}}=\sum_{n=1}^{2}\sum_{i\in\mathcal D^n} C^{n,1}_i\,\ell_{\text{regr}}(n,i)-\alpha\log C^{n,1}_i$$</li>
+    <li><p>固定误差 $\ell$ 对 $C$ 求导置零，得最优置信度；只有 $\ell\le\alpha$ 时它满足 $C\ge 1$，否则取下限 1：</p>$$\frac{\partial}{\partial C}\big(C\ell-\alpha\log C\big)=\ell-\frac{\alpha}{C}=0\ \Rightarrow\ C^*=\max\!\big(1,\ \alpha/\ell\big)$$</li>
+    <li><p>代回得到「网络把置信度调到最优后」的有效损失，小误差段是对数：</p>$$\mathcal L^*(\ell)=\begin{cases}\alpha\big(1+\log(\ell/\alpha)\big), & \ell\le\alpha\\ \ell, & \ell&gt;\alpha\end{cases}$$</li>
+    <li><p>对误差的梯度恰好等于最优置信度：已经准的像素权重 $\alpha/\ell$ 大，继续被压精；预测不了的像素权重降到 1，不再主导训练。</p>$$\frac{d\mathcal L^*}{d\ell}=C^*=\max(1,\alpha/\ell)$$</li>
+  </ol>
+
+  <figure class="viz" id="viz-conf">
+    <div class="viz-h"><b>对每个 C，损失 Cℓ − α log C 是一条直线；最优 C 取它们的下包络</b><span>横轴：归一化误差 ℓ</span></div>
+    <div class="viz-stage"><canvas id="cv-conf" aria-label="不同置信度下的损失直线族与其下包络"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="sl-cf-a">α <input type="range" id="sl-cf-a" min="0.05" max="0.6" step="0.01" value="0.3"><output id="o-cf-a">0.30</output></label>
+      <label for="sl-cf-l">某像素误差 ℓ <input type="range" id="sl-cf-l" min="0.01" max="1" step="0.01" value="0.12"><output id="o-cf-l">0.12</output></label>
+    </div>
+    <div class="viz-read" id="rd-conf"></div>
+    <ul class="chips"><li><i style="background:var(--line-2)"></i>固定 $C=1,1.5,2,3,5,8$ 的直线</li><li><i style="background:var(--c1)"></i>$C=1$：不带置信度的 $\ell$</li><li><i style="background:var(--c2)"></i>下包络 $\mathcal L^*(\ell)$</li><li><i style="background:var(--c3)"></i>当前像素的最优直线（斜率 $C^*$）</li></ul>
+    <figcaption>拖动 ℓ：误差小于 α 时最优直线斜率是 α/ℓ（梯度权重大）；超过 α 后贴到 $C=1$ 那条直线。α 越大，进入「对数区」的像素越多。</figcaption>
+  </figure>
+
+  <h3>MASt3R：加一个匹配头</h3>
+  <p>MASt3R（ECCV 2024）在 DUSt3R 上加一个头，输出逐像素局部描述子 $D^1,D^2\in\mathbb{R}^{H\times W\times d}$（$d=24$），用对称的 InfoNCE 损失让真值对应 $(i,j)\in\hat{\mathcal M}$ 的描述子互相最相似：</p>
+  <div class="eq">$$\mathcal L_{\text{match}}=-\!\!\sum_{(i,j)\in\hat{\mathcal M}}\!\Big[\log\frac{s(i,j)}{\sum_{k}s(k,j)}+\log\frac{s(i,j)}{\sum_{k}s(i,k)}\Big],\quad s(i,j)=\exp\!\big(D^{1\top}_iD^2_j/\tau\big)$$</div>
+  <p>总损失 $\mathcal L_{\text{conf}}+\beta\mathcal L_{\text{match}}$（$\beta=1$，$\tau=0.07$）。两处改动：在有米制真值的数据上令 $z:=\bar z$，于是预测点图带米制尺度；用「快速互近邻」只从一小撮像素出发迭代找互为最近邻的对，避免 $HW\times HW$ 的全量比较，约 6 次迭代收敛。在 Map-free 重定位基准上 VCRE AUC 比之前最好方法高 30 个百分点。</p>
+</section>
+
+<section id="ga">
+  <h2>多于两张图：全局对齐</h2>
+  <p>DUSt3R 一次只看两张图。$N$ 张图时，先在图对上跑网络（全部图对或用检索挑出的图对），每对得到一组在「该对第一张图坐标系、各自归一化尺度」下的点图，再优化出一个所有图共享的世界坐标系。</p>
+  <table class="notation">
+    <caption>记号</caption>
+    <thead><tr><th>符号</th><th>含义</th><th>形状</th></tr></thead>
+    <tbody>
+      <tr><td>$\mathcal G=(\mathcal V,\mathcal E)$</td><td>视图图：顶点是图像，边 $e=(n,m)$ 是跑过网络的图对</td><td>$|\mathcal V|=N$</td></tr>
+      <tr><td>$X^{n,e},\ C^{n,e}$</td><td>边 $e$ 输出的第 $n$ 张图的点图和置信度（$n\in e$）</td><td>$H\times W\times 3$</td></tr>
+      <tr><td>$\chi^n$</td><td>第 $n$ 张图在世界坐标系的点图（待求）</td><td>$H\times W\times 3$</td></tr>
+      <tr><td>$P_e,\ \sigma_e$</td><td>边 $e$ 到世界系的刚体变换和尺度（待求）</td><td>$SE(3)$，标量</td></tr>
+    </tbody>
+  </table>
+  <div class="eq">$$\chi^*=\arg\min_{\chi,P,\sigma}\ \sum_{e\in\mathcal E}\sum_{n\in e}\sum_{i=1}^{HW} C^{n,e}_i\,\big\|\chi^n_i-\sigma_e P_e X^{n,e}_i\big\|\qquad \text{s.t.}\ \prod_{e}\sigma_e=1$$</div>
+  <h3>推导：交替最小化（平方误差版）</h3>
+  <ol class="derive">
+    <li><p>固定所有 $(P_e,\sigma_e)$，每个像素的 $\chi^n_i$ 独立；把范数换成平方后，最优解是所有含 $n$ 的边给出的位置的加权平均：</p>$$\chi^n_i=\frac{\sum_{e\ni n}C^{n,e}_i\,\sigma_eP_eX^{n,e}_i}{\sum_{e\ni n}C^{n,e}_i}$$</li>
+    <li><p>固定 $\chi$，各条边独立：把 $X^{n,e}$、$X^{m,e}$ 拼起来，用上一节的 Umeyama 闭式解求把它对齐到 $(\chi^n,\chi^m)$ 的相似变换：</p>$$(\sigma_e,P_e)=\arg\min_{\sigma,P}\sum_{n\in e}\sum_i C^{n,e}_i\,\big\|\chi^n_i-\sigma P X^{n,e}_i\big\|^2$$</li>
+    <li><p>所有 $\sigma_e$ 与 $\chi$ 同乘 $k$，目标也乘 $k$；不加约束会滑向 $k\to 0$ 的平凡解。每轮除以几何平均即可满足约束：</p>$$g=\Big(\prod_e\sigma_e\Big)^{1/|\mathcal E|},\qquad \sigma_e\leftarrow\sigma_e/g,\ \ \chi\leftarrow\chi/g$$</li>
+    <li><p>DUSt3R 实际把 $\chi$ 用每张图的深度、内参和位姿参数化，优化完直接得到相机；用最小生成树（按置信度）逐边拼接做初始化，再梯度下降几百步，GPU 上几秒：</p>$$\chi^n_i=P_n^{-1}\,h\!\Big(K_n^{-1}\big[u_iD^n_i,\ v_iD^n_i,\ D^n_i\big]^\top\Big)$$</li>
+  </ol>
+
+  <figure class="viz" id="viz-ga">
+    <div class="viz-h"><b>4 张图、6 条边：各边的点图从各自坐标系拼成一个世界</b><span>俯视图，二维玩具</span></div>
+    <div class="viz-stage"><canvas id="cv-ga" aria-label="六条边的点图在全局对齐过程中逐步重合"></canvas></div>
+    <div class="viz-ctrl">
+      <button type="button" class="btn" id="bt-ga-play">播放</button>
+      <button type="button" class="btn ghost" id="bt-ga-step">单步</button>
+      <button type="button" class="btn ghost" id="bt-ga-reset">重置</button>
+      <label for="sl-ga-n">图对预测误差 <input type="range" id="sl-ga-n" min="0" max="0.15" step="0.005" value="0.08"><output id="o-ga-n">0.080</output></label>
+    </div>
+    <div class="viz-read" id="rd-ga"></div>
+    <ul class="chips" id="ch-ga"></ul>
+    <figcaption>阶段 0 是网络原始输出：每条边的点在「该对第一台相机」的坐标系、各自归一化尺度下，互相对不上。阶段 1 沿生成树 1–2–3–4 逐边对齐，误差沿链累积，闭环边（1–3、1–4、2–4）出现重影。之后每轮先按公式 1 求 $\chi$，再按公式 2 对齐每条边，重影被摊平。灰线是真值场景，三角是真值相机。</figcaption>
+  </figure>
+  <div class="note pit"><b>易错</b><p>全局对齐要先跑 $O(N^2)$ 个图对（每对在 H100 上约 40 ms），100 张图就是 4950 对，所以 $N$ 大时要么用检索挑边，要么换下一节的多视图模型一次处理全部图。</p></div>
+</section>
+
+<section id="multiview">
+  <h2 data-toc="多视图与流式">多视图与流式模型</h2>
+  <p>下一步是让网络一次看 $N$ 张图，把全局对齐吸收到注意力里。区别主要在两件事：注意力怎么在帧之间连（决定复杂度和能否流式）、输出定义在哪个坐标系（决定是否依赖参考帧）。</p>
+  <ul>
+    <li><b>Fast3R</b>（CVPR 2025）：DUSt3R 的多视图版，所有图的 token 做全局注意力，一次前向处理上千张无序图。</li>
+    <li><b>VGGT</b>（CVPR 2025 最佳论文）：约 12 亿参数；DINO 切 patch，每帧加一个相机 token，24 组「帧内注意力 + 全局注意力」交替。输出每帧的相机 $g_n=[\mathbf q_n,\mathbf t_n,\mathrm{fov}_n]\in\mathbb R^9$、深度图、点图和用于跟踪的特征图；第一帧定义世界系，真值按点到原点的平均距离归一化。损失 $\mathcal L=\mathcal L_{\text{cam}}+\mathcal L_{\text{depth}}+\mathcal L_{\text{pmap}}+0.05\,\mathcal L_{\text{track}}$，深度和点图项都带与 DUSt3R 同形的不确定度加权与 $-\alpha\log\Sigma$ 正则。</li>
+    <li><b>π³</b>（ICLR 2026）：去掉所有与顺序有关的部件（帧序号嵌入、标记参考帧的相机 token），每帧输出<b>自己相机系</b>下的局部点图、位姿 $T_n$ 和置信度。网络对输入置换等变：$\phi(P_\pi S)=P_\pi\,\phi(S)$。监督只用相对位姿 $T_{i\leftarrow j}=T_i^{-1}T_j$ 和一个全序列共享的尺度 $s^*$，结果不再随「谁是第一帧」变化。2025-12 的 Pi3X 支持可选的位姿、内参、深度输入和近似米制尺度。</li>
+    <li><b>MapAnything</b>（3DV 2026）：因子化输出，每帧给射线方向 $R_n$、沿射线的无尺度深度 $\tilde D_n$、位姿 $(O_n,\tilde T_n)$，再加一个全局米制尺度 $m$，$X^{\text{metric}}_n=m\,\big(O_n(R_n\odot\tilde D_n)+\tilde T_n\big)$。内参、位姿、深度都可选地作为输入，一个模型覆盖 12 种以上任务（SfM、MVS、定位、深度补全…）。</li>
+    <li><b>Depth Anything 3</b>（ICLR 2026）：骨干就是普通 DINOv2，每帧输出深度 $D$ 和射线图（每像素射线原点 $\mathbf t$ 和方向 $\mathbf d$），点为 $P=\mathbf t+D\,\mathbf d$，相机从射线解出。作者报告相机位姿精度比 VGGT 平均高 35.7%、几何精度高 23.6%；单张图时退化为单目深度模型。</li>
+    <li><b>VGGT-Ω</b>（CVPR 2026 Oral）：最大 100 亿参数；每帧 16 个寄存器 token，用「寄存器注意力」替换 25% 的全局注意力层（跨帧只在寄存器之间交换），训练显存约为 VGGT 的 30%，监督数据量约 15 倍，并用无标注视频做自监督；支持动态场景，输出深度和相机。</li>
+    <li><b>D4RT</b>（CVPR 2026 最佳论文）：编码器把整段视频编码一次，轻量解码器回答「像素 $p$ 在时刻 $t$、从相机 $c$ 看的 3D 位置」这样的查询；深度、点跟踪、点云和相机都由查询得到，相机用闭式 Umeyama 对齐求出，面向动态场景。</li>
+  </ul>
+  <p><b>流式（在线）</b>一支：Spann3R（3DV 2025）在 DUSt3R 上加外部空间记忆，逐帧直接输出全局坐标系的点图；CUT3R（CVPR 2025）维护一个循环更新的持久状态，每来一帧先读状态再写状态；StreamVGGT（2025）把 VGGT 的全局注意力换成时间因果注意力，缓存历史帧的 key/value，从双向 VGGT 蒸馏而来，缓存随帧数增长是它的已知限制。</p>
+
+  <figure class="viz" id="viz-attn">
+    <div class="viz-h"><b>帧间怎么连：四种注意力掩码</b><span>行 = query token，列 = key token</span></div>
+    <div class="viz-stage"><canvas id="cv-attn" aria-label="N 帧 token 的注意力掩码矩阵"></canvas></div>
+    <div class="viz-ctrl">
+      <div class="seg" id="sg-attn"><button type="button" data-v="frame" aria-pressed="false">帧内</button><button type="button" data-v="global" aria-pressed="true">全局</button><button type="button" data-v="causal" aria-pressed="false">因果（流式）</button><button type="button" data-v="reg" aria-pressed="false">寄存器</button></div>
+      <label for="sl-attn-n">帧数 N <input type="range" id="sl-attn-n" min="2" max="6" step="1" value="4"><output id="o-attn-n">4</output></label>
+    </div>
+    <div class="viz-read" id="rd-attn"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>允许的 query–key 对</li><li><i style="background:var(--c4)"></i>每帧第一个 token：相机 / 寄存器 token</li><li><i style="background:var(--c2)"></i>点选的 query 行</li></ul>
+    <figcaption>示意图里每帧 4 个 token；点击矩阵选一个 query。VGGT 交替使用「帧内」和「全局」；StreamVGGT 用「因果」，新帧只看过去，所以能缓存；VGGT-Ω 的寄存器层只让寄存器跨帧交换。读数里的「实际规模」按 518×518 输入、patch 14（每帧 1369 个 token）、寄存器层每帧 16 个寄存器计算。</figcaption>
+  </figure>
+
+  <div class="tbl wide"><table>
+    <thead><tr><th>模型</th><th>发表</th><th>输入</th><th>输出</th><th>需要已知内参</th><th>米制尺度</th><th>多视图 / 流式</th></tr></thead>
+    <tbody>
+      <tr><td>DUSt3R</td><td>CVPR 2024</td><td>2 张图</td><td>两个点图（相机 1 系）+ 置信度</td><td>否</td><td>否</td><td>图对 + 全局对齐</td></tr>
+      <tr><td>MASt3R</td><td>ECCV 2024</td><td>2 张图</td><td>同上 + 局部描述子</td><td>否</td><td>是（米制数据上训练）</td><td>图对 + 匹配</td></tr>
+      <tr><td>Spann3R</td><td>3DV 2025</td><td>图像序列</td><td>全局系点图</td><td>否</td><td>否</td><td>流式，空间记忆</td></tr>
+      <tr><td>CUT3R</td><td>CVPR 2025</td><td>序列或无序集合</td><td>点图、相机</td><td>否</td><td>是（米制数据上训练）</td><td>流式，循环状态</td></tr>
+      <tr><td>Fast3R</td><td>CVPR 2025</td><td>N 张无序图</td><td>点图 + 置信度</td><td>否</td><td>否</td><td>全局注意力，一次前向</td></tr>
+      <tr><td>VGGT</td><td>CVPR 2025</td><td>1 到数百张</td><td>相机、深度、点图、跟踪特征</td><td>否</td><td>否</td><td>帧内 / 全局交替；第一帧为参考</td></tr>
+      <tr><td>StreamVGGT</td><td>arXiv 2025</td><td>视频流</td><td>同 VGGT</td><td>否</td><td>否</td><td>因果注意力 + KV 缓存</td></tr>
+      <tr><td>π³</td><td>ICLR 2026</td><td>N 张图</td><td>局部点图、位姿、置信度</td><td>否（Pi3X 可选输入）</td><td>否（Pi3X 近似米制）</td><td>无参考帧，置换等变</td></tr>
+      <tr><td>MapAnything</td><td>3DV 2026</td><td>N 张图 + 可选内参 / 位姿 / 深度</td><td>射线、射线深度、位姿、尺度 $m$</td><td>可选</td><td>是</td><td>交替注意力</td></tr>
+      <tr><td>Depth Anything 3</td><td>ICLR 2026</td><td>1 到 N 张，可选位姿</td><td>深度 + 射线图</td><td>可选</td><td>DA3-Metric 是</td><td>视角内 + 跨视角注意力</td></tr>
+      <tr><td>VGGT-Ω</td><td>CVPR 2026</td><td>N 帧，含动态</td><td>深度、相机</td><td>否</td><td>—</td><td>寄存器注意力替换部分全局层</td></tr>
+      <tr><td>D4RT</td><td>CVPR 2026</td><td>视频（动态）</td><td>按查询输出任意像素任意时刻的 3D 点</td><td>否</td><td>—</td><td>编码一次 + 查询解码</td></tr>
+    </tbody>
+  </table></div>
+  <p>「—」表示没有找到可核实的说法。动态场景、长序列和实时 SLAM 方向（VGGT-SLAM 等）见 <a href="../slam/">SLAM</a> 一页。</p>
+</section>
+
+<section id="mono">
+  <h2 data-toc="单目几何">单目几何：相对深度与度量深度</h2>
+  <p class="def"><b>相对深度（affine-invariant）</b>只保证形状对：预测 $d$ 与真值只差未知的尺度 $s$ 和平移 $t$，通常定义在视差（逆深度）空间 $d\propto 1/Z$。<b>度量深度（metric）</b>直接以米为单位。</p>
+  <p>单张图为什么难给出米制深度：针孔投影里物体像高 $h=fH/Z$。整个场景放大 $k$ 倍图像完全不变；焦距和距离同时乘 $k$，近处主体大小不变，只有远近物体的相对大小（透视）变了。所以度量深度需要知道焦距（或从透视线索估出焦距），再加上「门大约 2 米高」这类语义尺寸先验。</p>
+
+  <figure class="viz" id="viz-dolly">
+    <div class="viz-h"><b>焦距与距离的歧义：推拉变焦</b><span>侧视图（米，纵向放大） / 成像（像素）</span></div>
+    <div class="viz-grid">
+      <div class="viz-stage"><canvas id="cv-dz-side" aria-label="侧视图：相机、主体和背景"></canvas></div>
+      <div class="viz-stage"><canvas id="cv-dz-img" aria-label="相机成像"></canvas></div>
+    </div>
+    <div class="viz-ctrl">
+      <label for="sl-dz-f">焦距 f <input type="range" id="sl-dz-f" min="300" max="1500" step="10" value="600"><output id="o-dz-f">600</output></label>
+      <label class="chk" for="ck-dz"><input type="checkbox" id="ck-dz" checked>推拉变焦（主体像高固定 300 px）</label>
+      <label for="sl-dz-d">主体距离 <input type="range" id="sl-dz-d" min="1.5" max="9" step="0.1" value="3.4"><output id="o-dz-d">3.4</output></label>
+      <label for="sl-dz-k">整体缩放 k <input type="range" id="sl-dz-k" min="0.5" max="2" step="0.05" value="1"><output id="o-dz-k">1.00</output></label>
+    </div>
+    <div class="viz-read" id="rd-dz"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>主体（高 1.7 m）</li><li><i style="background:var(--c2)"></i>背景物体（同高，位于主体后 5 m）</li></ul>
+    <figcaption>勾选推拉变焦后拖焦距：主体像高不变、距离跟着变，只有背景像高在变，这是网络推断焦距唯一能用的几何线索。拖「整体缩放」：所有长度乘 k，成像一个像素都不变，这部分尺度只能靠语义先验或额外传感器。</figcaption>
+  </figure>
+
+  <p>Metric3D 的处理是<b>规范相机变换</b>：设训练时统一用规范焦距 $f_c$。物体像高 $h=fH/Z$ 不变时，换到规范相机对应的深度是 $Z_c=f_cH/h$，于是</p>
+  <div class="eq">$$Z_c = Z\cdot\frac{f_c}{f}\quad(\text{训练时缩放标签}),\qquad Z=Z_c\cdot\frac{f}{f_c}\quad(\text{推理时还原})$$</div>
+  <p>这要求推理时知道 $f$。Depth Pro、UniDepth、MoGe 这类模型则自己预测焦距或射线，不需要内参；DA3-Metric 用规范焦距 300 训练。</p>
+
+  <h3>尺度-平移不变损失</h3>
+  <table class="notation">
+    <caption>记号</caption>
+    <thead><tr><th>符号</th><th>含义</th><th>形状</th></tr></thead>
+    <tbody>
+      <tr><td>$d_i,\ d^*_i$</td><td>像素 $i$ 的预测视差、真值视差</td><td>标量</td></tr>
+      <tr><td>$M$</td><td>有效像素数</td><td>整数</td></tr>
+      <tr><td>$s,\ t$</td><td>对齐用的尺度和平移</td><td>标量</td></tr>
+      <tr><td>$\bar d,\ \bar d^*$</td><td>均值</td><td>标量</td></tr>
+    </tbody>
+  </table>
+  <ol class="derive">
+    <li><p>预测只在差一个仿射变换的意义下有效，先把它对齐到真值再算误差：</p>$$(s,t)=\arg\min_{s,t}\sum_{i=1}^{M}\big(s\,d_i+t-d^*_i\big)^2$$</li>
+    <li><p>对 $t$ 求导置零：</p>$$\sum_i\big(s\,d_i+t-d^*_i\big)=0\ \Rightarrow\ t=\bar d^*-s\,\bar d$$</li>
+    <li><p>代入后对 $s$ 求导置零，得到协方差除以方差：</p>$$s=\frac{\sum_i (d_i-\bar d)(d^*_i-\bar d^*)}{\sum_i (d_i-\bar d)^2}$$</li>
+    <li><p>损失是对齐后的残差（MiDaS 的 $\mathcal L_{\text{ssi}}$）：</p>$$\mathcal L_{\text{ssi}}=\frac{1}{2M}\sum_{i=1}^{M}\big(s\,d_i+t-d^*_i\big)^2$$</li>
+    <li><p>反传时 $s,t$ 也是 $d$ 的函数，但最优点处 $\partial\mathcal L/\partial s=\partial\mathcal L/\partial t=0$（包络定理），所以可以把 $s,t$ 当常数：</p>$$\frac{\partial\mathcal L_{\text{ssi}}}{\partial d_i}=\frac{s}{M}\big(s\,d_i+t-d^*_i\big)$$</li>
+    <li><p>平方误差怕外点。稳健版本用中位数和平均绝对偏差各自归一化预测和真值，再算 L1（Depth Anything 采用）：</p>$$t(d)=\operatorname{median}(d),\quad s(d)=\frac1M\sum_i|d_i-t(d)|,\quad \mathcal L=\frac1M\sum_i\Big|\tfrac{d_i-t(d)}{s(d)}-\tfrac{d^*_i-t(d^*)}{s(d^*)}\Big|$$</li>
+  </ol>
+
+  <figure class="viz" id="viz-ssi">
+    <div class="viz-h"><b>一条扫描线：原始预测 → 闭式对齐 → 只剩形状误差</b><span>纵轴：视差（逆深度）</span></div>
+    <div class="viz-stage"><canvas id="cv-ssi" aria-label="上：网络原始输出；下：真值与对齐后的预测"></canvas></div>
+    <div class="viz-ctrl">
+      <div class="seg" id="sg-ssi"><button type="button" data-v="ls" aria-pressed="true">最小二乘</button><button type="button" data-v="med" aria-pressed="false">中位数 + MAD</button></div>
+      <label for="sl-ssi-s">预测尺度 <input type="range" id="sl-ssi-s" min="0.3" max="3" step="0.05" value="1.8"><output id="o-ssi-s">1.80</output></label>
+      <label for="sl-ssi-t">预测偏移 <input type="range" id="sl-ssi-t" min="-0.6" max="0.6" step="0.02" value="0.3"><output id="o-ssi-t">0.30</output></label>
+      <label class="chk" for="ck-ssi"><input type="checkbox" id="ck-ssi">加入离群像素（反光区）</label>
+    </div>
+    <div class="viz-read" id="rd-ssi"></div>
+    <ul class="chips"><li><i style="background:var(--c2)"></i>网络原始输出 $d$（上，可拖动）</li><li><i style="background:var(--c1)"></i>真值 $d^*$</li><li><i style="background:var(--c3)"></i>对齐后 $s\,d+t$</li><li><i style="background:var(--bad)"></i>残差</li></ul>
+    <figcaption>在上半部分按住拖动，给预测加一个局部凸起（形状误差）。改「预测尺度」「预测偏移」时，下半部分对齐后的曲线和损失都不变：这两种误差被 $s,t$ 吸收了。打开离群像素后对比两种对齐：最小二乘被拉偏，中位数 + MAD 基本不受影响。</figcaption>
+  </figure>
+
+  <div class="note pit"><b>易错</b><p>仿射不变的是<b>视差</b>，不是深度。拿 Depth Anything V2 的相对输出直接取 $1/d$ 当深度，平移 $t$ 错了会让平面变成曲面（$Z=1/(s\,d+t)$ 对 $d$ 非线性）。要用作 3D，至少用两个已知深度的点（或深度相机）解出 $s,t$，或者直接用度量模型。</p></div>
+
+  <h3>代表模型</h3>
+  <div class="tbl wide"><table>
+    <thead><tr><th>模型</th><th>发表</th><th>输出</th><th>尺度</th><th>相机</th><th>要点</th></tr></thead>
+    <tbody>
+      <tr><td>MiDaS</td><td>TPAMI 2022</td><td>视差</td><td>仿射不变</td><td>不需要</td><td>提出尺度-平移不变损失，混合多数据集与 3D 电影训练</td></tr>
+      <tr><td>Depth Anything</td><td>CVPR 2024</td><td>视差</td><td>仿射不变</td><td>不需要</td><td>150 万有标注 + 6200 万无标注图（教师打伪标签）</td></tr>
+      <tr><td>Depth Anything V2</td><td>NeurIPS 2024</td><td>视差</td><td>仿射不变（另有度量微调版）</td><td>不需要</td><td>只用约 59.5 万张合成图训 DINOv2-G 教师，再给 6200 万真实图打伪标签；学生 2500 万到 13 亿参数</td></tr>
+      <tr><td>Marigold</td><td>CVPR 2024</td><td>深度</td><td>仿射不变</td><td>不需要</td><td>把 Stable Diffusion 微调成条件深度扩散模型</td></tr>
+      <tr><td>Metric3D v2</td><td>TPAMI 2024</td><td>深度 + 法向</td><td>米制</td><td>需要焦距</td><td>规范相机变换；1600 万以上图像、1 万以上种相机</td></tr>
+      <tr><td>UniDepth / V2</td><td>CVPR 2024 / arXiv 2025</td><td>3D 点（角度 + 深度）</td><td>米制</td><td>自己预测</td><td>自提示相机模块，伪球面输出把相机和深度分开</td></tr>
+      <tr><td>Depth Pro</td><td>ICLR 2025</td><td>深度 + 焦距</td><td>米制</td><td>自己预测焦距</td><td>V100 上 0.3 s 出 225 万像素深度图，边缘锐利</td></tr>
+      <tr><td>MoGe</td><td>CVPR 2025</td><td>点图</td><td>尺度 + $z$ 平移不变</td><td>从点图解出</td><td>ROE 求解器做截断 L1 对齐；焦距与平移用 LM 迭代约 10 步解出</td></tr>
+      <tr><td>MoGe-2</td><td>NeurIPS 2025</td><td>点图</td><td>米制</td><td>从点图解出</td><td>在 MoGe 上加米制尺度和细节</td></tr>
+      <tr><td>Depth Anything 3</td><td>ICLR 2026</td><td>深度 + 射线</td><td>相对；DA3-Metric 米制</td><td>可选输入</td><td>单图即单目模式，单目深度超过 V2</td></tr>
+    </tbody>
+  </table></div>
+  <p>MoGe 的点图只差全局尺度 $s$ 和沿光轴的平移 $t_z$（主点在图像中心、像素为方形时，$x,y$ 平移可去掉），推理时最小化重投影误差 $\sum_i\big(\tfrac{f x_i}{z_i+t'_z}-u'_i\big)^2+\big(\tfrac{f y_i}{z_i+t'_z}-v'_i\big)^2$ 同时得到焦距和平移，和上一节从点图读焦距是同一件事。</p>
+</section>
+
+<section id="sds">
+  <h2 data-toc="SDS">用 2D 扩散优化 3D：Score Distillation Sampling</h2>
+  <p>生成这条线先从「没有 3D 训练数据」开始。DreamFusion（ICLR 2023）把一个 NeRF 的参数 $\theta$ 当优化变量，从随机视角渲染，让一个冻结的文生图扩散模型（Imagen 64×64 基础模型）判断渲染图像不像文本描述的东西，梯度回传到 $\theta$。NeRF 和体渲染见 <a href="../3d-representations/">3D 表征</a>。</p>
+  <table class="notation">
+    <caption>记号</caption>
+    <thead><tr><th>符号</th><th>含义</th><th>形状</th></tr></thead>
+    <tbody>
+      <tr><td>$\theta$</td><td>3D 表示的参数（NeRF 权重）</td><td>向量</td></tr>
+      <tr><td>$x=g(\theta,c)$</td><td>相机 $c$ 下的可微渲染图</td><td>$H\times W\times 3$</td></tr>
+      <tr><td>$y$</td><td>文本条件</td><td>—</td></tr>
+      <tr><td>$z_t=\alpha_t x+\sigma_t\epsilon$</td><td>加噪图，$\epsilon\sim\mathcal N(0,I)$，$t\in(0,1)$</td><td>同 $x$</td></tr>
+      <tr><td>$\hat\epsilon_\phi(z_t;y,t)$</td><td>冻结 U-Net 预测的噪声</td><td>同 $x$</td></tr>
+      <tr><td>$\hat x_0$</td><td>一步去噪估计 $(z_t-\sigma_t\hat\epsilon_\phi)/\alpha_t$</td><td>同 $x$</td></tr>
+      <tr><td>$w(t),\ \omega$</td><td>时间权重、无分类器引导强度</td><td>标量</td></tr>
+    </tbody>
+  </table>
+  <ol class="derive">
+    <li><p>把渲染图 $x$ 当成数据，代入扩散模型的训练损失：</p>$$\mathcal L_{\text{Diff}}(\phi,x)=\mathbb E_{t,\epsilon}\Big[w(t)\,\big\|\hat\epsilon_\phi(\alpha_t x+\sigma_t\epsilon;\,y,t)-\epsilon\big\|_2^2\Big]$$</li>
+    <li><p>对 $\theta$ 求梯度，链式法则经过 U-Net（常数 $2\alpha_t$ 并进 $w$）：</p>$$\nabla_\theta\mathcal L_{\text{Diff}}=\mathbb E_{t,\epsilon}\Big[w(t)\,(\hat\epsilon_\phi-\epsilon)\,\underbrace{\frac{\partial\hat\epsilon_\phi(z_t;y,t)}{\partial z_t}}_{\text{U-Net 雅可比}}\,\frac{\partial x}{\partial\theta}\Big]$$</li>
+    <li><p>丢掉 U-Net 雅可比得到 SDS。原因：要对整个 U-Net 反传，贵；它近似边缘密度的（缩放）Hessian，小噪声时病态。DreamFusion 发现去掉它后剩下的仍是有效的更新方向：</p>$$\nabla_\theta\mathcal L_{\text{SDS}}=\mathbb E_{t,\epsilon}\Big[w(t)\,\big(\hat\epsilon_\phi(z_t;y,t)-\epsilon\big)\,\frac{\partial x}{\partial\theta}\Big]$$</li>
+    <li><p>这不是随意的近似：它恰好是一个加权 KL 的梯度（概率密度蒸馏）：</p>$$\nabla_\theta\mathcal L_{\text{SDS}}=\nabla_\theta\,\mathbb E_t\Big[\tfrac{\sigma_t}{\alpha_t}w(t)\,\mathrm{KL}\big(q(z_t\mid x=g(\theta);y,t)\,\big\|\,p_\phi(z_t;y,t)\big)\Big]$$</li>
+    <li><p>代入 $z_t=\alpha_t x+\sigma_t\epsilon$ 和 $\hat\epsilon=(z_t-\alpha_t\hat x_0)/\sigma_t$，噪声残差就是渲染图与去噪图之差：</p>$$\hat\epsilon_\phi-\epsilon=\frac{\alpha_t x+\sigma_t\epsilon-\alpha_t\hat x_0}{\sigma_t}-\epsilon=\frac{\alpha_t}{\sigma_t}\,(x-\hat x_0)$$</li>
+    <li><p>所以 SDS 每一步做的是：加噪 → 让扩散模型一步去噪 → 把渲染图往 $\hat x_0$ 拉，残差经 $\partial x/\partial\theta$ 传给 3D 参数。实际用的是无分类器引导后的噪声（DreamFusion 取 $\omega=100$，远大于出图常用的个位数）：</p>$$\hat\epsilon=\hat\epsilon_\phi(z_t;\varnothing,t)+\omega\big(\hat\epsilon_\phi(z_t;y,t)-\hat\epsilon_\phi(z_t;\varnothing,t)\big)$$</li>
+  </ol>
+
+  <figure class="viz" id="viz-sds">
+    <div class="viz-h"><b>SDS 玩具：一个参数化形状被「去噪图」一步步拉走</b><span>θ = (中心, 半轴, 旋转)，x = 24 个轮廓点</span></div>
+    <div class="viz-stage"><canvas id="cv-sds" aria-label="当前形状、两个数据模式、一步去噪估计"></canvas></div>
+    <div class="viz-ctrl">
+      <div class="seg" id="sg-sds"><button type="button" data-v="u" aria-pressed="true">无条件</button><button type="button" data-v="c" aria-pressed="false">提示词「A」+ CFG</button></div>
+      <label for="sl-sds-w">ω <input type="range" id="sl-sds-w" min="1" max="30" step="0.5" value="15"><output id="o-sds-w">15.0</output></label>
+      <button type="button" class="btn" id="bt-sds-play">播放</button>
+      <button type="button" class="btn ghost" id="bt-sds-step">单步</button>
+      <button type="button" class="btn ghost" id="bt-sds-reset">重新初始化</button>
+    </div>
+    <div class="viz-read" id="rd-sds"></div>
+    <ul class="chips"><li><i style="background:var(--c3)"></i>数据模式 A</li><li><i style="background:var(--c4)"></i>数据模式 B</li><li><i style="background:var(--c1)"></i>当前形状 $x=g(\theta)$ 与中心轨迹</li><li><i style="background:var(--c2)"></i>本步的 $\hat x_0$ 与拉力 $\hat x_0-x$</li></ul>
+    <figcaption>「扩散模型」的数据分布是 A、B 两个形状各占一半，去噪器用精确的后验均值 $\hat x_0=\sum_k w_k(z_t)\,x_k$，$w_k\propto\exp(-\|z_t-\alpha_t x_k\|^2/2\sigma_t^2)$。无条件时形状落到 A 或 B 之一（寻模，换随机种子可能落到另一个），不会停在两者平均。提示词 A 加大 ω 后，形状越过 A 继续往远离 B 的方向夸张：这是高引导强度下颜色过饱和、特征夸张的同一机制。</figcaption>
+  </figure>
+
+  <div class="note pit"><b>SDS 的三个老问题</b><p>① 高 $\omega$ 带来过饱和、过平滑；② 每个视角独立判断，「正面特征」在每个方向都被拉出来，出现多脸（Janus）问题；③ 逐例优化慢，DreamFusion 在 4 芯 TPUv4 上 15000 步约 1.5 小时。ProlificDreamer（NeurIPS 2023）的 VSD 把 $\theta$ 当成分布来优化，SDS 是它取单点 Dirac 分布的特例，缓解了①。②靠下一节的多视图扩散，③靠前馈模型。</p></div>
+</section>
+
+<section id="mvdiff">
+  <h2>多视图扩散</h2>
+  <p class="def"><b>多视图扩散</b>让 2D 扩散模型同时生成同一物体的多个视角，并以相机为条件，使生成结果本身近似 3D 一致，之后再重建或作为 SDS 先验。</p>
+  <ul>
+    <li><b>Zero-1-to-3</b>（ICCV 2023）：在 Objaverse 渲染图上微调 Stable Diffusion，学 $p(x_{\text{tgt}}\mid x_{\text{src}},R,T)$，即给一张图和相对相机变换，生成新视角。</li>
+    <li><b>MVDream</b>（ICLR 2024）：保留文生图模型结构，把自注意力扩到多个视角之间并加相机条件，联合生成 $p(x^{1:V}\mid y,c^{1:V})$；用作 SDS 先验时多脸问题明显减少。</li>
+    <li><b>CAT3D</b>（NeurIPS 2024）：给任意张观测图和目标相机，用多视图扩散生成大量一致的新视角，再交给 NeRF 式重建；整个场景最快约 1 分钟。</li>
+  </ul>
+  <p>多视图图像仍然只是图像：视角间的细微不一致会让后面的重建发糊。下一步是让网络直接输出 3D。</p>
+</section>
+
+<section id="lrm">
+  <h2 data-toc="LRM 与三平面">大重建模型（LRM）与三平面</h2>
+  <p class="def"><b>三平面（triplane）</b>用三张轴对齐的 2D 特征图 $F_{xy},F_{xz},F_{yz}\in\mathbb R^{N\times N\times C}$ 表示一个 3D 场：查询点投到三张平面上各做双线性插值，聚合后用小 MLP 解码成密度和颜色。EG3D（CVPR 2022）提出，三个特征求和。</p>
+  <div class="eq">$$\mathbf f(\mathbf p)=F_{xy}(p_x,p_y)+F_{xz}(p_x,p_z)+F_{yz}(p_y,p_z),\qquad (\sigma,\mathbf c)=\mathrm{MLP}\big(\mathbf f(\mathbf p)\big)$$</div>
+  <p>存储从稠密体素的 $N^3C$ 降到 $3N^2C$：$N=256,\ C=32$ 时是 630 万个数对 5.4 亿个数。代价是表达能力：求和加线性解码只能表示 $g(x,y)+h(x,z)+k(y,z)$ 形式的函数，非线性 MLP 和多通道把这个限制放宽。</p>
+
+  <figure class="viz" id="viz-tri">
+    <div class="viz-h"><b>三平面查询：一个点 → 三次双线性插值 → 求和 → 密度</b><span>平面分辨率 12×12，坐标范围 [−1, 1]</span></div>
+    <div class="viz-stage"><canvas id="cv-tri" aria-label="三张特征平面、查询点及其投影、被占据的体素"></canvas></div>
+    <div class="viz-ctrl">
+      <div class="seg" id="sg-tri"><button type="button" data-v="sphere" aria-pressed="true">球</button><button type="button" data-v="torus" aria-pressed="false">环面</button><button type="button" data-v="box" aria-pressed="false">圆角方块</button></div>
+      <label for="sl-tri-x">x <input type="range" id="sl-tri-x" min="-1" max="1" step="0.02" value="0.3"><output id="o-tri-x">0.30</output></label>
+      <label for="sl-tri-y">y <input type="range" id="sl-tri-y" min="-1" max="1" step="0.02" value="-0.2"><output id="o-tri-y">-0.20</output></label>
+      <label for="sl-tri-z">z <input type="range" id="sl-tri-z" min="-1" max="1" step="0.02" value="0.4"><output id="o-tri-z">0.40</output></label>
+    </div>
+    <div class="viz-read" id="rd-tri"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>$F_{xy}$（底面）</li><li><i style="background:var(--c2)"></i>$F_{xz}$（背面）</li><li><i style="background:var(--c3)"></i>$F_{yz}$（侧面）</li><li><i style="background:var(--c4)"></i>解码密度 $&gt;0.5$ 的采样点</li><li><i style="background:var(--ink)"></i>查询点</li></ul>
+    <figcaption>可拖动旋转。平面颜色越浓，该处特征值越小（越靠近形状内部）。三个形状都能写成 $g(x,y)+h(x,z)+k(y,z)$：球是 $\tfrac{x^2+y^2}{2}+\tfrac{x^2+z^2}{2}+\tfrac{y^2+z^2}{2}$，环面把 $(\sqrt{x^2+y^2}-R)^2$ 整个放进 $F_{xy}$。密度 $\sigma=\mathrm{sigmoid}\big(\kappa(\tau-\sum F)\big)$。</figcaption>
+  </figure>
+
+  <p><b>LRM</b>（ICLR 2024）把「单张图 → 三平面」做成一个 5 亿参数以上的 transformer：DINO ViT-B/16 编码 512×512 输入得到 1025 个 768 维 token；16 层解码器里三平面 token 交叉注意图像 token，相机参数（外参、焦距、主点共 20 维）经 MLP 后用 adaLN 调制每层；输出 3 张 64×64×80 的平面，10 层 MLP 解码，体渲染后在 4 个视角上用 MSE + LPIPS 监督。训练数据为 73 万个 Objaverse 资产渲染加 22 万段 MVImgNet 视频，A100 上每个物体约 5 s。</p>
+  <p>后续：把多视图扩散的输出喂给稀疏视角 LRM（Instant3D、InstantMesh），或把三平面换成逐像素 3D 高斯（LGM、GS-LRM；GS-LRM 从 2–4 张带位姿图在 A100 上 0.23 s 出高斯）。</p>
+</section>
+
+<section id="native">
+  <h2>原生 3D 潜扩散</h2>
+  <p class="def"><b>原生 3D 生成</b>照搬图像潜扩散：先训练 3D VAE 把形状压成潜变量，再在潜空间训练扩散 / 流匹配 transformer，条件是图像特征（多为 DINOv2）或文本，最后解码成 SDF / 占据场并提取网格。数据来自 Objaverse(-XL) 等几十万个资产。</p>
+  <p>潜变量有两种主流形状：</p>
+  <ul>
+    <li><b>向量集（VecSet）</b>：3DShape2VecSet（SIGGRAPH 2023）用交叉注意力把表面点云压成 $M$ 个无位置的潜向量，解码时查询点再交叉注意回去：
+      $$Z=\mathrm{CrossAttn}\big(Q_0,\ \mathrm{PE}(\mathcal P_{\text{surf}})\big)\in\mathbb R^{M\times C},\qquad o(\mathbf p)=\mathrm{MLP}\Big(\mathrm{CrossAttn}\big(\mathrm{PE}(\mathbf p),\ \mathrm{SelfAttn}^{L}(Z)\big)\Big)$$
+      CLAY（SIGGRAPH 2024，几何生成器 15 亿参数）、Hunyuan3D 2.0 / 2.1（ShapeVAE + 流匹配 DiT，2.1 加 PBR 材质）、TripoSG（2025，SDF + 大规模 rectified flow）都在这条线上。</li>
+    <li><b>稀疏体素结构化潜变量</b>：TRELLIS（CVPR 2025）的 SLAT 是 $\{(\mathbf z_i,\mathbf p_i)\}_{i=1}^{L}$，$\mathbf p_i$ 是 $64^3$ 网格中与表面相交的体素（平均约 2 万个），$\mathbf z_i\in\mathbb R^8$ 由多视角 DINOv2 特征投影聚合后编码。两阶段 rectified flow：先生成稀疏结构（占据网格压成 $16^3\times 8$ 的潜变量），再在结构上生成 SLAT；同一潜变量可解码成 3D 高斯、辐射场或网格。最大 20 亿参数、约 50 万资产。TRELLIS.2（2025-12）换成能编码几何与 PBR 外观的 O-Voxel，生成器 40 亿参数。</li>
+  </ul>
+  <p>流匹配目标（TRELLIS、TripoSG、Hunyuan3D 都用这一族）：$z_\tau=(1-\tau)z_0+\tau\epsilon$，训练 $v_\theta$ 拟合 $\epsilon-z_0$，即 $\mathcal L=\mathbb E\,\|v_\theta(z_\tau,\tau,c)-(\epsilon-z_0)\|^2$。纹理通常单独做：多视图扩散生成贴图视角再烘焙（Hunyuan3D-Paint、CLAY 的材质扩散）。</p>
+  <p><b>SAM 3D Objects</b>（Meta，2025-11）面向真实照片：从一张有遮挡的图里给定物体，预测几何、纹理和在场景中的位姿（layout），两阶段 DiT（先粗形状和位姿，再细节与纹理），人类偏好对比胜率至少 5:1。</p>
+
+  <h3>生成路线对照</h3>
+  <div class="tbl wide"><table>
+    <thead><tr><th>路线</th><th>代表（发表）</th><th>输入</th><th>3D 输出</th><th>速度量级</th><th>主要问题</th></tr></thead>
+    <tbody>
+      <tr><td>SDS 逐例优化</td><td>DreamFusion（ICLR 2023），ProlificDreamer（NeurIPS 2023）</td><td>文本</td><td>NeRF / 网格</td><td>小时级（DreamFusion 1.5 h）</td><td>过饱和、多脸、慢</td></tr>
+      <tr><td>多视图扩散 + 重建</td><td>Zero-1-to-3（ICCV 2023），MVDream（ICLR 2024），CAT3D（NeurIPS 2024）</td><td>图 / 文 / 多图</td><td>多视图 → NeRF / 3DGS</td><td>分钟级（CAT3D 约 1 min）</td><td>视图不一致导致发糊</td></tr>
+      <tr><td>前馈重建模型</td><td>LRM（ICLR 2024），GS-LRM（2024）</td><td>单图 / 稀疏视图</td><td>三平面 NeRF / 3D 高斯</td><td>秒级（LRM 5 s，GS-LRM 0.23 s）</td><td>不可见面靠回归平均，偏糊</td></tr>
+      <tr><td>原生 3D 潜扩散</td><td>CLAY（SIGGRAPH 2024），TRELLIS（CVPR 2025），Hunyuan3D 2.x，TripoSG，TRELLIS.2</td><td>图 / 文</td><td>SDF 网格 / 稀疏体素 → 网格、高斯，带 PBR</td><td>—</td><td>纹理与几何对齐、真实图遮挡</td></tr>
+      <tr><td>真实照片物体</td><td>SAM 3D Objects（2025）</td><td>单张真实图 + 物体掩码</td><td>带纹理形状 + 场景位姿</td><td>—</td><td>尺度、与场景的物理一致性</td></tr>
+      <tr><td>场景 / 世界</td><td>HunyuanWorld 1.0，Lyra（ICLR 2026），HY-World 2.0，Marble</td><td>文 / 图</td><td>分层网格、3D 高斯</td><td>—</td><td>几何精度、规模受视频模型限制</td></tr>
+      <tr><td>部件 / 可动</td><td>URDFormer（RSS 2024），Articulate-Anything（ICLR 2025），Particulate（CVPR 2026）</td><td>图 / 文 / 视频</td><td>部件网格 + 关节（URDF）</td><td>—</td><td>关节轴、限位常需检查</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="world">
+  <h2>场景与世界生成</h2>
+  <p>物体级模型以单个资产为中心；场景级要处理大范围、可漫游的空间。截至 2026-11 有两条主要路线：</p>
+  <ul>
+    <li><b>全景图作代理</b>：HunyuanWorld 1.0（2025-07）先用扩散模型生成 360° 全景，再按语义分层（天空、背景、前景物体）重建成分层网格。</li>
+    <li><b>相机可控视频 → 前馈重建</b>：Lyra（NVIDIA，ICLR 2026）以相机可控视频扩散模型 GEN3C 为教师，把它隐含的 3D 知识自蒸馏到一个输出 3D 高斯的解码器，不需要多视图训练数据；Lyra 2.0（2026-04）生成长程、可回访的漫游视频，用每帧的 3D 几何检索历史帧保持一致，再用微调过的前馈重建模型提升为 3D。HY-World 2.0（腾讯，2026-04）分四步：全景生成 → 轨迹规划 → 沿轨迹扩展世界 → 用 WorldMirror 2.0（前馈预测深度、法向、相机、点云和 3D 高斯）合成，输出 3D 高斯、网格和点云。</li>
+  </ul>
+  <p>商业产品 World Labs 的 Marble 于 2025-11-12 公开，可导出 3D 高斯（约 200 万个，或约 50 万个的轻量版）、碰撞用低面数网格和视频。DeepMind 的 Genie 3（2025-08）是实时交互的视频世界模型，不输出显式 3D。</p>
+</section>
+
+<section id="articulated">
+  <h2 data-toc="部件与可动结构">部件与可动结构</h2>
+  <p>机器人要的不只是一个外壳网格，还要能动的部件和关节（抽屉、柜门、旋钮）。</p>
+  <ul>
+    <li><b>URDFormer</b>（RSS 2024）：一张真实图 → 场景的 URDF；训练对用可控文生图模型从仿真场景合成。</li>
+    <li><b>Articulate-Anything</b>（ICLR 2025）：视觉语言模型作 actor 写代码描述物体与关节，作 critic 比较渲染结果与输入并给反馈，在 PartNet-Mobility 上成功率从此前约 8–12% 提到约 75%；生成的资产用来训练策略并迁移到真机。</li>
+    <li><b>PartCrafter</b>（NeurIPS 2025）：从一张图一次生成多个独立的部件网格，每个部件一组潜 token，层级注意力处理部件内外的信息流，不需要先分割。</li>
+    <li><b>Particulate</b>（CVPR 2026）：前馈 transformer 预测部件、运动学结构和运动参数；<b>URDF-Anything+</b>（2026-03）逐部件自回归预测连杆几何和关节参数，直接给出可仿真的 URDF。</li>
+  </ul>
+</section>
+
+<section id="robot">
+  <h2>在机器人里怎么用</h2>
+  <p>三类用法：给仿真造资产（real2sim）、给规划建场景几何、给策略喂深度或 3D 特征。</p>
+  <div class="tbl wide"><table>
+    <thead><tr><th>需求</th><th>可选模型</th><th>注意</th></tr></thead>
+    <tbody>
+      <tr><td>少量 RGB 帧 → 场景点云，用于碰撞检测和运动规划</td><td>VGGT、π³、Depth Anything 3、MapAnything</td><td>多数输出无尺度：选 MapAnything / DA3-Metric / Pi3X，或用深度相机、已知的机械臂位移把尺度对齐；按置信度过滤边缘飞点</td></tr>
+      <tr><td>边走边建图</td><td>CUT3R、StreamVGGT、VGGT-SLAM</td><td>流式模型有漂移，长程要回环（见 <a href="../slam/">SLAM</a>）</td></tr>
+      <tr><td>单相机度量深度</td><td>Depth Pro、MoGe-2、Metric3D v2、UniDepthV2</td><td>逐帧独立预测会闪烁；有 LiDAR 用 Prompt Depth Anything（CVPR 2025），有双目用 FoundationStereo（CVPR 2025）</td></tr>
+      <tr><td>物体资产 real2sim</td><td>SAM 3D Objects、TRELLIS / TRELLIS.2、Hunyuan3D 2.1</td><td>碰撞需凸分解；质量、摩擦另设；生成网格的尺度要和真实物体对齐</td></tr>
+      <tr><td>可动资产</td><td>Articulate-Anything、Particulate、URDF-Anything+</td><td>检查关节轴、限位和碰撞体</td></tr>
+      <tr><td>场景级仿真环境</td><td>HY-World 2.0、Lyra 2.0、Marble</td><td>3D 高斯只适合渲染；物理要用导出的网格，几何精度有限</td></tr>
+      <tr><td>VLA 的 3D 感知</td><td>SpatialVLA、Evo-0、VGGT-Ω 寄存器</td><td>见下</td></tr>
+    </tbody>
+  </table></div>
+  <p><b>数字孪生与数字表亲</b>：RialTo（2024）从少量真实数据现场搭数字孪生，在里面用 RL 加固模仿学习策略；ACDC（CoRL 2024）不追求复刻，而是从一张图自动生成几何语义相近的「数字表亲」场景，零样本 sim-to-real 成功率 90%，对比数字孪生训练的 25%。</p>
+  <p><b>给策略喂 3D</b>：SpatialVLA（RSS 2025）用 ZoeDepth 估深度，按内参反投影得到每个 patch 的 3D 坐标，经正弦编码和 MLP 加到视觉 token 上（Ego3D 位置编码，不需要相机–机器人外参）；Evo-0（2025）把 VGGT 最后一层 token 与 π0 的视觉嵌入融合，只训练融合器、LoRA 和动作专家；VGGT-Ω 把冻结的场景寄存器 token 作为 OpenVLA-OFT 的额外输入，LIBERO 平均成功率 97.1% → 98.5%，Long 子集 94.5% → 96.7%。</p>
+  <div class="note pit"><b>易错</b><p>① 坐标系：VGGT 一系以第一帧相机为世界系、OpenCV 约定（x 右 y 下 z 前），接到机器人基座系前要乘手眼标定外参（见 <a href="../camera/">相机模型</a>）。② 尺度：无尺度输出直接用于抓取会差一个未知倍数。③ 置信度：天空、玻璃、黑色物体的点要按置信度阈值丢掉，否则规划器会撞上「幽灵障碍」。</p></div>
+</section>
+
+<section id="quiz">
+  <h2>自测</h2>
+  <details class="q"><summary>DUSt3R 输入两张图时不知道相对位姿，$X^{2,1}$ 怎么能表达在相机 1 坐标系里？</summary><div><p>位姿不是输入而是隐含在输出里：网络直接回归图 2 每个像素在相机 1 系下的坐标，训练时用真值位姿把真值点变到相机 1 系做监督。推理后再用 Procrustes 或 PnP 从点图里把位姿读出来。</p></div></details>
+  <details class="q"><summary>DUSt3R 的回归损失如果不除以 $z,\bar z$ 会怎样？MASt3R 为什么在米制数据上令 $z:=\bar z$？</summary><div><p>两张图不能确定绝对尺度，不归一化就是逼网络猜尺度，不同数据集尺度约定不同，梯度互相冲突。MASt3R 让预测除以真值的 $\bar z$，相当于要求预测本身就带米制尺度，从米制数据里学尺度先验。</p></div></details>
+  <details class="q"><summary>置信度损失里 $\alpha$ 调大，训练行为怎么变？</summary><div><p>最优置信度 $C^*=\max(1,\alpha/\ell)$，$\alpha$ 大则更多像素落在 $\ell\le\alpha$ 的对数区，它们的梯度权重 $\alpha/\ell$ 也更大，训练更偏向把已经较准的像素压得更准；同时 $-\alpha\log C$ 惩罚更重，置信度整体被推高。</p></div></details>
+  <details class="q"><summary>把 VGGT 的输入顺序换一下（另一张图放第一），输出会变吗？π³ 呢？</summary><div><p>VGGT 的世界系就是第一帧相机，换顺序后所有位姿和点图都换到新第一帧的坐标系，且由于第一帧 token 特殊，几何本身也可能有差异。π³ 置换等变：输出只按同样方式重排，相对位姿和局部点图不变。</p></div></details>
+  <details class="q"><summary>Depth Anything V2 给出的视差 $d$，取 $Z=1/d$ 放进点云，桌面会怎样？怎么修？</summary><div><p>$d$ 与真值视差差未知的 $s,t$，$Z=1/(s\,d+t)$ 对 $t$ 非线性，平面会弯。用至少两个已知深度点最小二乘解 $s,t$，或改用 Depth Pro / MoGe-2 / Metric3D v2 这类度量模型。</p></div></details>
+  <details class="q"><summary>为什么说 SDS 是「把渲染图往一步去噪结果拉」？</summary><div><p>由 $z_t=\alpha_t x+\sigma_t\epsilon$ 和 $\hat\epsilon=(z_t-\alpha_t\hat x_0)/\sigma_t$ 得 $\hat\epsilon-\epsilon=\tfrac{\alpha_t}{\sigma_t}(x-\hat x_0)$，所以 SDS 梯度是 $w(t)\tfrac{\alpha_t}{\sigma_t}(x-\hat x_0)\,\partial x/\partial\theta$：图像空间的残差 $x-\hat x_0$ 经渲染器雅可比传给 3D 参数。</p></div></details>
+  <details class="q"><summary>「求和 + 线性解码」的三平面能精确表示 $f(x,y,z)=xyz$ 吗？</summary><div><p>不能。对 $g(x,y)+h(x,z)+k(y,z)$ 求混合偏导 $\partial^3/\partial x\partial y\partial z$ 恒为 0，而 $xyz$ 的是 1。所以三平面要靠非线性 MLP 和多通道特征来表示这类函数。</p></div></details>
+  <details class="q"><summary>只有一个腕部 RGB 相机，要在陌生厨房里规划避障，怎么用这些模型？</summary><div><p>移动手腕拍几帧，用 MapAnything 或 DA3 出点云（或 VGGT 出点云后用已知的末端位移对齐尺度），按置信度过滤后体素化做碰撞；结果从第一帧相机系经手眼标定和当前末端位姿变到基座系。</p></div></details>
+</section>
+
+<section id="refs">
+  <h2>延伸阅读</h2>
+  <ol class="refs">
+    <li><b>Schönberger, Frahm, Structure-from-Motion Revisited</b>, CVPR 2016. 代码 <a href="https://github.com/colmap/colmap">colmap/colmap</a></li>
+    <li><b>Wang, Leroy, Cabon, Chidlovskii, Revaud, DUSt3R: Geometric 3D Vision Made Easy</b>, CVPR 2024. <a href="https://arxiv.org/abs/2312.14132">arXiv:2312.14132</a></li>
+    <li><b>Leroy, Cabon, Revaud, Grounding Image Matching in 3D with MASt3R</b>, ECCV 2024. <a href="https://arxiv.org/abs/2406.09756">arXiv:2406.09756</a></li>
+    <li><b>Wang, Agapito, 3D Reconstruction with Spatial Memory (Spann3R)</b>, 3DV 2025. <a href="https://arxiv.org/abs/2408.16061">arXiv:2408.16061</a></li>
+    <li><b>Wang et al., Continuous 3D Perception Model with Persistent State (CUT3R)</b>, CVPR 2025. <a href="https://arxiv.org/abs/2501.12387">arXiv:2501.12387</a></li>
+    <li><b>Yang et al., Fast3R: Towards 3D Reconstruction of 1000+ Images in One Forward Pass</b>, CVPR 2025. <a href="https://arxiv.org/abs/2501.13928">arXiv:2501.13928</a></li>
+    <li><b>Wang et al., VGGT: Visual Geometry Grounded Transformer</b>, CVPR 2025（最佳论文）. <a href="https://arxiv.org/abs/2503.11651">arXiv:2503.11651</a>，代码 <a href="https://github.com/facebookresearch/vggt">facebookresearch/vggt</a></li>
+    <li><b>Zhuo et al., Streaming 4D Visual Geometry Transformer (StreamVGGT)</b>, 2025. <a href="https://arxiv.org/abs/2507.11539">arXiv:2507.11539</a></li>
+    <li><b>Wang et al., π³: Permutation-Equivariant Visual Geometry Learning</b>, ICLR 2026. <a href="https://arxiv.org/abs/2507.13347">arXiv:2507.13347</a>，代码 <a href="https://github.com/yyfz/Pi3">yyfz/Pi3</a></li>
+    <li><b>Keetha et al., MapAnything: Universal Feed-Forward Metric 3D Reconstruction</b>, 3DV 2026. <a href="https://arxiv.org/abs/2509.13414">arXiv:2509.13414</a></li>
+    <li><b>Lin et al., Depth Anything 3: Recovering the Visual Space from Any Views</b>, ICLR 2026. <a href="https://arxiv.org/abs/2511.10647">arXiv:2511.10647</a></li>
+    <li><b>Wang et al., VGGT-Ω</b>, CVPR 2026 (Oral). <a href="https://arxiv.org/abs/2605.15195">arXiv:2605.15195</a></li>
+    <li><b>Zhang et al., Efficiently Reconstructing Dynamic Scenes One D4RT at a Time</b>, CVPR 2026（最佳论文）. <a href="https://arxiv.org/abs/2512.08924">arXiv:2512.08924</a></li>
+    <li><b>Ranftl et al., Towards Robust Monocular Depth Estimation: Mixing Datasets for Zero-shot Cross-dataset Transfer (MiDaS)</b>, TPAMI 2022. <a href="https://arxiv.org/abs/1907.01341">arXiv:1907.01341</a></li>
+    <li><b>Yang et al., Depth Anything: Unleashing the Power of Large-Scale Unlabeled Data</b>, CVPR 2024. <a href="https://arxiv.org/abs/2401.10891">arXiv:2401.10891</a></li>
+    <li><b>Yang et al., Depth Anything V2</b>, NeurIPS 2024. <a href="https://arxiv.org/abs/2406.09414">arXiv:2406.09414</a></li>
+    <li><b>Ke et al., Repurposing Diffusion-Based Image Generators for Monocular Depth Estimation (Marigold)</b>, CVPR 2024. <a href="https://arxiv.org/abs/2312.02145">arXiv:2312.02145</a></li>
+    <li><b>Hu, Yin et al., Metric3D v2: A Versatile Monocular Geometric Foundation Model for Zero-shot Metric Depth and Surface Normal Estimation</b>, TPAMI 2024. <a href="https://arxiv.org/abs/2404.15506">arXiv:2404.15506</a></li>
+    <li><b>Piccinelli et al., UniDepth: Universal Monocular Metric Depth Estimation</b>, CVPR 2024. <a href="https://arxiv.org/abs/2403.18913">arXiv:2403.18913</a>；UniDepthV2 <a href="https://arxiv.org/abs/2502.20110">arXiv:2502.20110</a></li>
+    <li><b>Bochkovskii et al., Depth Pro: Sharp Monocular Metric Depth in Less Than a Second</b>, ICLR 2025. <a href="https://arxiv.org/abs/2410.02073">arXiv:2410.02073</a>，代码 <a href="https://github.com/apple/ml-depth-pro">apple/ml-depth-pro</a></li>
+    <li><b>Wang et al., MoGe: Unlocking Accurate Monocular Geometry Estimation for Open-Domain Images with Optimal Training Supervision</b>, CVPR 2025. <a href="https://arxiv.org/abs/2410.19115">arXiv:2410.19115</a>；MoGe-2, NeurIPS 2025, <a href="https://arxiv.org/abs/2507.02546">arXiv:2507.02546</a></li>
+    <li><b>Poole, Jain, Barron, Mildenhall, DreamFusion: Text-to-3D using 2D Diffusion</b>, ICLR 2023. <a href="https://arxiv.org/abs/2209.14988">arXiv:2209.14988</a></li>
+    <li><b>Wang et al., ProlificDreamer: High-Fidelity and Diverse Text-to-3D Generation with Variational Score Distillation</b>, NeurIPS 2023. <a href="https://arxiv.org/abs/2305.16213">arXiv:2305.16213</a></li>
+    <li><b>Liu et al., Zero-1-to-3: Zero-shot One Image to 3D Object</b>, ICCV 2023. <a href="https://arxiv.org/abs/2303.11328">arXiv:2303.11328</a></li>
+    <li><b>Shi et al., MVDream: Multi-view Diffusion for 3D Generation</b>, ICLR 2024. <a href="https://arxiv.org/abs/2308.16512">arXiv:2308.16512</a></li>
+    <li><b>Gao et al., CAT3D: Create Anything in 3D with Multi-View Diffusion Models</b>, NeurIPS 2024. <a href="https://arxiv.org/abs/2405.10314">arXiv:2405.10314</a></li>
+    <li><b>Chan et al., Efficient Geometry-aware 3D Generative Adversarial Networks (EG3D)</b>, CVPR 2022. <a href="https://arxiv.org/abs/2112.07945">arXiv:2112.07945</a></li>
+    <li><b>Hong et al., LRM: Large Reconstruction Model for Single Image to 3D</b>, ICLR 2024. <a href="https://arxiv.org/abs/2311.04400">arXiv:2311.04400</a></li>
+    <li><b>Zhang et al., GS-LRM: Large Reconstruction Model for 3D Gaussian Splatting</b>, 2024. <a href="https://arxiv.org/abs/2404.19702">arXiv:2404.19702</a></li>
+    <li><b>Zhang, Tang, Nießner, Wonka, 3DShape2VecSet: A 3D Shape Representation for Neural Fields and Generative Diffusion Models</b>, SIGGRAPH 2023. <a href="https://arxiv.org/abs/2301.11445">arXiv:2301.11445</a></li>
+    <li><b>Zhang et al., CLAY: A Controllable Large-scale Generative Model for Creating High-quality 3D Assets</b>, SIGGRAPH 2024. <a href="https://arxiv.org/abs/2406.13897">arXiv:2406.13897</a></li>
+    <li><b>Tencent Hunyuan3D Team, Hunyuan3D 2.0: Scaling Diffusion Models for High Resolution Textured 3D Assets Generation</b>, 2025. <a href="https://arxiv.org/abs/2501.12202">arXiv:2501.12202</a>；Hunyuan3D 2.1 <a href="https://arxiv.org/abs/2506.15442">arXiv:2506.15442</a>，代码 <a href="https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1">Tencent-Hunyuan/Hunyuan3D-2.1</a></li>
+    <li><b>Li et al., TripoSG: High-Fidelity 3D Shape Synthesis using Large-Scale Rectified Flow Models</b>, 2025. <a href="https://arxiv.org/abs/2502.06608">arXiv:2502.06608</a></li>
+    <li><b>Xiang et al., Structured 3D Latents for Scalable and Versatile 3D Generation (TRELLIS)</b>, CVPR 2025. <a href="https://arxiv.org/abs/2412.01506">arXiv:2412.01506</a>，代码 <a href="https://github.com/microsoft/TRELLIS">microsoft/TRELLIS</a>；TRELLIS.2: Native and Compact Structured Latents for 3D Generation <a href="https://arxiv.org/abs/2512.14692">arXiv:2512.14692</a></li>
+    <li><b>SAM 3D Team (Meta), SAM 3D: 3Dfy Anything in Images</b>, 2025. <a href="https://arxiv.org/abs/2511.16624">arXiv:2511.16624</a>，代码 <a href="https://github.com/facebookresearch/sam-3d-objects">facebookresearch/sam-3d-objects</a></li>
+    <li><b>Tencent Hunyuan, HunyuanWorld 1.0: Generating Immersive, Explorable, and Interactive 3D Worlds from Words or Pixels</b>, 2025. <a href="https://arxiv.org/abs/2507.21809">arXiv:2507.21809</a>；HY-World 2.0 <a href="https://arxiv.org/abs/2604.14268">arXiv:2604.14268</a></li>
+    <li><b>Bahmani et al., Lyra: Generative 3D Scene Reconstruction via Video Diffusion Model Self-Distillation</b>, ICLR 2026. <a href="https://arxiv.org/abs/2509.19296">arXiv:2509.19296</a>；Lyra 2.0 <a href="https://arxiv.org/abs/2604.13036">arXiv:2604.13036</a></li>
+    <li><b>Chen et al., URDFormer: A Pipeline for Constructing Articulated Simulation Environments from Real-World Images</b>, RSS 2024. <a href="https://arxiv.org/abs/2405.11656">arXiv:2405.11656</a></li>
+    <li><b>Le et al., Articulate-Anything: Automatic Modeling of Articulated Objects via a Vision-Language Foundation Model</b>, ICLR 2025. <a href="https://arxiv.org/abs/2410.13882">arXiv:2410.13882</a></li>
+    <li><b>Lin et al., PartCrafter: Structured 3D Mesh Generation via Compositional Latent Diffusion Transformers</b>, NeurIPS 2025. <a href="https://arxiv.org/abs/2506.05573">arXiv:2506.05573</a></li>
+    <li><b>Li et al., Particulate: Feed-Forward 3D Object Articulation</b>, CVPR 2026. <a href="https://arxiv.org/abs/2512.11798">arXiv:2512.11798</a>；URDF-Anything+ <a href="https://arxiv.org/abs/2603.14010">arXiv:2603.14010</a></li>
+    <li><b>Torne et al., Reconciling Reality through Simulation: A Real-to-Sim-to-Real Approach for Robust Manipulation (RialTo)</b>, 2024. <a href="https://arxiv.org/abs/2403.03949">arXiv:2403.03949</a></li>
+    <li><b>Dai et al., Automated Creation of Digital Cousins for Robust Policy Learning (ACDC)</b>, CoRL 2024. <a href="https://arxiv.org/abs/2410.07408">arXiv:2410.07408</a></li>
+    <li><b>Qu et al., SpatialVLA: Exploring Spatial Representations for Visual-Language-Action Model</b>, RSS 2025. <a href="https://arxiv.org/abs/2501.15830">arXiv:2501.15830</a></li>
+    <li><b>Lin et al., Evo-0: Vision-Language-Action Model with Implicit Spatial Understanding</b>, 2025. <a href="https://arxiv.org/abs/2507.00416">arXiv:2507.00416</a></li>
+    <li><b>Wen et al., FoundationStereo: Zero-Shot Stereo Matching</b>, CVPR 2025. <a href="https://arxiv.org/abs/2501.09898">arXiv:2501.09898</a>；<b>Lin et al., Prompting Depth Anything for 4K Resolution Accurate Metric Depth Estimation</b>, CVPR 2025. <a href="https://arxiv.org/abs/2412.14015">arXiv:2412.14015</a></li>
+  </ol>
+</section>
+
+</main>
+</div>
+
+<!-- v4u:foot -->
+<footer class="v4u-foot"><div class="v4u-foot-in"><a class="pv" href="../slam/"><span>上一篇</span>SLAM</a><a class="nx" href="../llm-rl-basics/"><span>下一篇</span>LLM 强化学习基础</a></div></footer>
+<!-- /v4u:foot -->
+
+<script>
+/* ---------- shared helpers (colours always from tokens) ---------- */
+const $ = (id) => document.getElementById(id);
+const TOK = (n) => V4U.css(n);
+const hexRgb = (h) => { h = (h || '').trim().replace('#', ''); if (h.length === 3) h = h.split('').map((c) => c + c).join(''); const n = parseInt(h.slice(0, 6), 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; };
+const mixTok = (a, b, t) => { const A = hexRgb(TOK(a)), B = hexRgb(TOK(b)); return 'rgb(' + A.map((v, i) => Math.round(v + (B[i] - v) * t)).join(',') + ')'; };
+const alphaTok = (a, t) => 'rgba(' + hexRgb(TOK(a)).join(',') + ',' + t + ')';
+const monoFont = (px) => (px || 12) + 'px ' + TOK('--f-mono');
+const mulberry = (seed) => () => { seed |= 0; seed = (seed + 0x6D2B79F5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+const gaussFrom = (r) => () => { const u = r() || 1e-9, v = r(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
+const v3 = {
+  add: (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]], sub: (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]],
+  mul: (a, s) => [a[0] * s, a[1] * s, a[2] * s], dot: (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2],
+  cross: (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]],
+  norm: (a) => Math.hypot(a[0], a[1], a[2]), unit: (a) => { const n = Math.hypot(a[0], a[1], a[2]) || 1; return [a[0] / n, a[1] / n, a[2] / n]; },
+};
+const matVec = (R, p) => [R[0][0] * p[0] + R[0][1] * p[1] + R[0][2] * p[2], R[1][0] * p[0] + R[1][1] * p[1] + R[1][2] * p[2], R[2][0] * p[0] + R[2][1] * p[1] + R[2][2] * p[2]];
+const rotAngle = (R) => Math.acos(V4U.clamp((R[0][0] + R[1][1] + R[2][2] - 1) / 2, -1, 1));
+function jacobi4(A) {
+  const a = A.map((r) => r.slice()), V = [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]];
+  for (let sw = 0; sw < 60; sw++) {
+    let off = 0; for (let p = 0; p < 4; p++) for (let q = p + 1; q < 4; q++) off += a[p][q] * a[p][q];
+    if (off < 1e-22) break;
+    for (let p = 0; p < 4; p++) for (let q = p + 1; q < 4; q++) {
+      if (Math.abs(a[p][q]) < 1e-18) continue;
+      const th = (a[q][q] - a[p][p]) / (2 * a[p][q]);
+      const t = (th >= 0 ? 1 : -1) / (Math.abs(th) + Math.sqrt(th * th + 1)), c = 1 / Math.sqrt(t * t + 1), s = t * c;
+      for (let k = 0; k < 4; k++) { const x = a[k][p], y = a[k][q]; a[k][p] = c * x - s * y; a[k][q] = s * x + c * y; }
+      for (let k = 0; k < 4; k++) { const x = a[p][k], y = a[q][k]; a[p][k] = c * x - s * y; a[q][k] = s * x + c * y; }
+      for (let k = 0; k < 4; k++) { const x = V[k][p], y = V[k][q]; V[k][p] = c * x - s * y; V[k][q] = s * x + c * y; }
+    }
+  }
+  return { vals: [0, 1, 2, 3].map((i) => a[i][i]), V };
+}
+/* Similarity A -> B (Horn / Umeyama): returns {R, s, t} minimising sum |B - (s R A + t)|^2 */
+function simil3(A, B) {
+  const N = A.length, ma = [0, 0, 0], mb = [0, 0, 0];
+  for (let i = 0; i < N; i++) for (let k = 0; k < 3; k++) { ma[k] += A[i][k] / N; mb[k] += B[i][k] / N; }
+  const S = [[0, 0, 0], [0, 0, 0], [0, 0, 0]]; let va = 0;
+  for (let i = 0; i < N; i++) { const a = v3.sub(A[i], ma), b = v3.sub(B[i], mb); va += v3.dot(a, a); for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) S[r][c] += a[r] * b[c]; }
+  const [[xx, xy, xz], [yx, yy, yz], [zx, zy, zz]] = S;
+  const M = [[xx + yy + zz, yz - zy, zx - xz, xy - yx], [yz - zy, xx - yy - zz, xy + yx, zx + xz], [zx - xz, xy + yx, -xx + yy - zz, yz + zy], [xy - yx, zx + xz, yz + zy, -xx - yy + zz]];
+  const { vals, V } = jacobi4(M); let bi = 0; for (let i = 1; i < 4; i++) if (vals[i] > vals[bi]) bi = i;
+  const [w, x, y, z] = [V[0][bi], V[1][bi], V[2][bi], V[3][bi]];
+  const R = [[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)], [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)], [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]];
+  let num = 0; for (let i = 0; i < N; i++) num += v3.dot(matVec(R, v3.sub(A[i], ma)), v3.sub(B[i], mb));
+  const s = num / (va || 1);
+  return { R, s, t: v3.sub(mb, v3.mul(matVec(R, ma), s)) };
+}
+/* 2D similarity A -> B */
+function simil2(A, B, W) {
+  let ma = [0, 0], mb = [0, 0], sw = 0; const N = A.length;
+  for (let i = 0; i < N; i++) { const w = W ? W[i] : 1; sw += w; ma[0] += w * A[i][0]; ma[1] += w * A[i][1]; mb[0] += w * B[i][0]; mb[1] += w * B[i][1]; }
+  ma = [ma[0] / sw, ma[1] / sw]; mb = [mb[0] / sw, mb[1] / sw];
+  let a = 0, b = 0, va = 0;
+  for (let i = 0; i < N; i++) { const w = W ? W[i] : 1; const x = [A[i][0] - ma[0], A[i][1] - ma[1]], y = [B[i][0] - mb[0], B[i][1] - mb[1]]; a += w * (x[0] * y[0] + x[1] * y[1]); b += w * (x[0] * y[1] - x[1] * y[0]); va += w * (x[0] * x[0] + x[1] * x[1]); }
+  const th = Math.atan2(b, a), s = Math.hypot(a, b) / (va || 1), c = Math.cos(th), sn = Math.sin(th);
+  return { th, s, t: [mb[0] - s * (c * ma[0] - sn * ma[1]), mb[1] - s * (sn * ma[0] + c * ma[1])] };
+}
+const tf2 = (T, p) => { const c = Math.cos(T.th), s = Math.sin(T.th); return [T.s * (c * p[0] - s * p[1]) + T.t[0], T.s * (s * p[0] + c * p[1]) + T.t[1]]; };
+</script>
+
+<script>
+/* ---------- 1. pointmap: two views -> two pointmaps in camera 1 ---------- */
+V4U.ready(() => {
+  const slB = $('sl-pm-base'), slF = $('sl-pm-f'), slN = $('sl-pm-n'), rd = $('rd-pm');
+  const W = 24, H = 18, TGT = [0, 0, 0.25];
+  const sph = { c: [0.5, -0.35, 0.33], r: 0.33 };
+  const box = { lo: [-0.85, -0.15, 0], hi: [-0.25, 0.45, 0.6] };
+  const DISK = 1.6;
+  const gR = gaussFrom(mulberry(17));
+  const NZ = [0, 1, 2].map(() => Array.from({ length: W * H }, () => [gR(), gR(), gR()]));
+  function hit(o, d) {
+    let best = Infinity;
+    const oc = v3.sub(o, sph.c), b = v3.dot(oc, d), c = v3.dot(oc, oc) - sph.r * sph.r, disc = b * b - c;
+    if (disc > 0) { const s = -b - Math.sqrt(disc); if (s > 1e-4 && s < best) best = s; }
+    let tmin = -Infinity, tmax = Infinity, ok = true;
+    for (let k = 0; k < 3; k++) {
+      if (Math.abs(d[k]) < 1e-9) { if (o[k] < box.lo[k] || o[k] > box.hi[k]) ok = false; continue; }
+      let t1 = (box.lo[k] - o[k]) / d[k], t2 = (box.hi[k] - o[k]) / d[k]; if (t1 > t2) [t1, t2] = [t2, t1];
+      tmin = Math.max(tmin, t1); tmax = Math.min(tmax, t2);
+    }
+    if (ok && tmax >= tmin && tmin > 1e-4 && tmin < best) best = tmin;
+    if (d[2] < -1e-6) { const s = -o[2] / d[2]; const p = v3.add(o, v3.mul(d, s)); if (s > 1e-4 && s < best && Math.hypot(p[0], p[1]) < DISK) best = s; }
+    return best < Infinity ? v3.add(o, v3.mul(d, best)) : null;
+  }
+  function camAt(az) {
+    const el = 0.5, dist = 2.7;
+    const pos = v3.add(TGT, [dist * Math.cos(el) * Math.cos(az), dist * Math.cos(el) * Math.sin(az), dist * Math.sin(el)]);
+    const f = v3.unit(v3.sub(TGT, pos)), r = v3.unit(v3.cross(f, [0, 0, 1])), dn = v3.cross(f, r);
+    return { pos, ax: [r, dn, f] };
+  }
+  const toCam = (cam, p) => { const q = v3.sub(p, cam.pos); return [v3.dot(q, cam.ax[0]), v3.dot(q, cam.ax[1]), v3.dot(q, cam.ax[2])]; };
+  const fromCam = (cam, p) => v3.add(cam.pos, v3.add(v3.add(v3.mul(cam.ax[0], p[0]), v3.mul(cam.ax[1], p[1])), v3.mul(cam.ax[2], p[2])));
+  let S = null;
+  function compute() {
+    const f = +slF.value, base = (+slB.value) * Math.PI / 180, sig = +slN.value;
+    const az1 = -2.05, c1 = camAt(az1), c2 = camAt(az1 + base);
+    const cx = W / 2, cy = H / 2;
+    const render = (cam) => { const out = []; for (let v = 0; v < H; v++) for (let u = 0; u < W; u++) { const dc = [(u + 0.5 - cx) / f, (v + 0.5 - cy) / f, 1]; const dw = v3.unit(v3.add(v3.add(v3.mul(cam.ax[0], dc[0]), v3.mul(cam.ax[1], dc[1])), cam.ax[2])); out.push(hit(cam.pos, dw)); } return out; };
+    const P1 = render(c1), P2 = render(c2);
+    const noisy = (p, k, i) => { const n = v3.norm(p); return v3.add(p, v3.mul(NZ[k][i], sig * n)); };
+    const X11 = P1.map((p, i) => p ? noisy(toCam(c1, p), 0, i) : null);
+    const X21 = P2.map((p, i) => p ? noisy(toCam(c1, p), 1, i) : null);
+    const X22 = P2.map((p, i) => p ? noisy(toCam(c2, p), 2, i) : null);
+    // focal from X11
+    let num = 0, den = 0;
+    X11.forEach((X, i) => { if (!X || X[2] < 1e-3) return; const u = (i % W) + 0.5 - cx, v = Math.floor(i / W) + 0.5 - cy; const a = X[0] / X[2], b = X[1] / X[2]; num += a * u + b * v; den += a * a + b * b; });
+    const fHat = num / den;
+    // relative pose: X22 -> X21
+    const A = [], B = []; X22.forEach((p, i) => { if (p && X21[i]) { A.push(p); B.push(X21[i]); } });
+    const sim = simil3(A, B);
+    const Rtrue = [0, 1, 2].map((r) => [0, 1, 2].map((c) => v3.dot(c1.ax[r], c2.ax[c])));
+    const tTrue = toCam(c1, c2.pos);
+    const Rerr = [0, 1, 2].map((r) => [0, 1, 2].map((c) => sim.R[r][0] * Rtrue[c][0] + sim.R[r][1] * Rtrue[c][1] + sim.R[r][2] * Rtrue[c][2]));
+    const tdir = Math.acos(V4U.clamp(v3.dot(v3.unit(sim.t), v3.unit(tTrue)), -1, 1));
+    // mutual nearest neighbours in 3D
+    const idx1 = [], idx2 = []; X11.forEach((p, i) => p && idx1.push(i)); X21.forEach((p, i) => p && idx2.push(i));
+    const nn = (P, Q, from, to) => from.map((i) => { let bj = -1, bd = Infinity; for (const j of to) { const d = (P[i][0] - Q[j][0]) ** 2 + (P[i][1] - Q[j][1]) ** 2 + (P[i][2] - Q[j][2]) ** 2; if (d < bd) { bd = d; bj = j; } } return bj; });
+    const f12 = nn(X11, X21, idx1, idx2), f21 = nn(X21, X11, idx2, idx1);
+    const back = new Map(idx2.map((j, k) => [j, f21[k]]));
+    const matches = [];
+    idx1.forEach((i, k) => { const j = f12[k]; if (j >= 0 && back.get(j) === i) matches.push([i, j, v3.norm(v3.sub(P1[i], P2[j])) < 0.09]); });
+    const good = matches.filter((m) => m[2]).length;
+    S = { f, fHat, c1, c2, X11, X21, X22, P1, P2, sim, Rtrue, tTrue, rotT: rotAngle(Rtrue), rotH: rotAngle(sim.R), rotE: rotAngle(Rerr), tdir, matches, good, sig, cx, cy };
+    $('o-pm-base').textContent = slB.value + '°'; $('o-pm-f').textContent = V4U.fmt(f, 1); $('o-pm-n').textContent = V4U.fmt(sig, 3);
+    rd.innerHTML = `<span>焦距 f = <b>${V4U.fmt(f, 1)}</b> → f̂ = <b>${V4U.fmt(fHat, 1)}</b></span>` +
+      `<span>相对旋转 <b>${V4U.fmt(S.rotT * 180 / Math.PI, 1)}°</b>，解出误差 <b>${V4U.fmt(S.rotE * 180 / Math.PI, 2)}°</b></span>` +
+      `<span>平移方向误差 <b>${V4U.fmt(tdir * 180 / Math.PI, 2)}°</b>，σ = <b>${V4U.fmt(sim.s, 3)}</b></span>` +
+      `<span>互为最近邻 <b>${matches.length}</b> 对，正确 <b>${matches.length ? Math.round(100 * good / matches.length) : 0}%</b></span>`;
+  }
+  compute();
+  const D = (p) => [p[0], p[2], -p[1]];
+  const frustum = (P, toC1, col, f, width, dashed) => {
+    const s = 0.32, cs = [[-S.cx, -S.cy], [S.cx, -S.cy], [S.cx, S.cy], [-S.cx, S.cy]].map(([u, v]) => D(toC1([u / f * s, v / f * s, s])));
+    const o = D(toC1([0, 0, 0]));
+    const ctx = P.ctx; if (dashed) ctx.setLineDash([4, 3]);
+    cs.forEach((c, k) => { P.line(o, c, col, width); P.line(c, cs[(k + 1) % 4], col, width); });
+    ctx.setLineDash([]);
+  };
+  let orbit = null;
+  orbit = V4U.orbit3d($('cv-pm3d'), { height: 320, yaw: -2.15, pitch: 0.42, dist: 6.4, target: [0.6, 1.9, -0.2], fov: 40 }, (ctx, P, w, h) => {
+    const want = w / h < 1.25 ? 8.2 : 6.4;
+    if (orbit && Math.abs(orbit.view.dist - want) > 1e-3) { orbit.view.dist = want; requestAnimationFrame(orbit.redraw); }
+    P.ctx = ctx;
+    const pts = [];
+    S.X11.forEach((p) => p && pts.push([D(p), 0])); S.X21.forEach((p) => p && pts.push([D(p), 1]));
+    pts.sort((a, b) => P.depth(b[0]) - P.depth(a[0]));
+    const col = [TOK('--c1'), TOK('--c2')];
+    pts.forEach(([p, k]) => P.point(p, 1.8, col[k]));
+    frustum(P, (q) => q, TOK('--c1'), S.f, 2);
+    const T2 = (q) => v3.add(matVec(S.Rtrue, q), S.tTrue);
+    frustum(P, T2, TOK('--c2'), S.f, 2);
+    const T2h = (q) => v3.add(matVec(S.sim.R, q), S.sim.t);
+    frustum(P, T2h, TOK('--muted'), S.fHat, 1.2, true);
+    P.frame([0, 0, 0], [[1, 0, 0], [0, 0, 1], [0, -1, 0]], 0.35, 2);
+    P.text(D([0, 0, 0]), 'C1', TOK('--c1'), monoFont(12));
+    P.text(D(S.tTrue), 'C2', TOK('--c2'), monoFont(12));
+  });
+  const imgs = V4U.canvas($('cv-pmimg'), (w) => Math.round(((w - 18) / 2) * 0.75 + 28), (ctx, w, h) => {
+    const gap = 18, iw = (w - gap) / 2, ih = iw * 0.75, top = 22, cs = iw / W;
+    let zmin = Infinity, zmax = -Infinity;
+    const z1 = S.P1.map((p) => p ? toCam(S.c1, p)[2] : null), z2 = S.P2.map((p) => p ? toCam(S.c2, p)[2] : null);
+    [...z1, ...z2].forEach((z) => { if (z != null) { zmin = Math.min(zmin, z); zmax = Math.max(zmax, z); } });
+    const draw = (Z, x0, near, far, label) => {
+      for (let i = 0; i < W * H; i++) {
+        const u = i % W, v = Math.floor(i / W);
+        ctx.fillStyle = Z[i] == null ? TOK('--surface-2') : mixTok(near, far, (Z[i] - zmin) / (zmax - zmin + 1e-9));
+        ctx.fillRect(x0 + u * cs, top + v * cs, Math.ceil(cs), Math.ceil(cs));
+      }
+      ctx.strokeStyle = TOK('--line-2'); ctx.lineWidth = 1; ctx.strokeRect(x0 + 0.5, top + 0.5, iw - 1, ih - 1);
+      ctx.fillStyle = TOK('--ink-2'); ctx.font = monoFont(12); ctx.fillText(label, x0, 14);
+    };
+    draw(z1, 0, '--c1', '--c1s', 'I¹ 深度');
+    draw(z2, iw + gap, '--c2', '--c2s', 'I² 深度');
+    const ms = S.matches, step = Math.max(1, Math.floor(ms.length / 16));
+    for (let k = 0; k < ms.length; k += step) {
+      const [i, j, ok] = ms[k];
+      const p = [((i % W) + 0.5) * cs, top + (Math.floor(i / W) + 0.5) * cs], q = [iw + gap + ((j % W) + 0.5) * cs, top + (Math.floor(j / W) + 0.5) * cs];
+      const col = ok ? TOK('--c3') : TOK('--bad');
+      ctx.strokeStyle = col; ctx.lineWidth = 1.3; ctx.beginPath(); ctx.moveTo(p[0], p[1]); ctx.lineTo(q[0], q[1]); ctx.stroke();
+      ctx.fillStyle = col; [p, q].forEach((r) => { ctx.beginPath(); ctx.arc(r[0], r[1], 2.6, 0, 2 * Math.PI); ctx.fill(); });
+    }
+  });
+  const upd = () => { compute(); orbit.redraw(); imgs(); };
+  [slB, slF, slN].forEach((s) => s.addEventListener('input', upd));
+});
+</script>
+
+<script>
+/* ---------- 2. confidence-weighted loss: lower envelope ---------- */
+V4U.ready(() => {
+  const slA = $('sl-cf-a'), slL = $('sl-cf-l'), rd = $('rd-conf');
+  const redraw = V4U.canvas($('cv-conf'), (w) => Math.min(300, Math.max(220, w * 0.42)), (ctx, w, h) => {
+    const a = +slA.value, l0 = +slL.value;
+    const L = 46, R = 14, T = 12, B = 30, x0 = 0, x1 = 1, y0 = -0.7, y1 = 1.2;
+    const X = (x) => L + (x - x0) / (x1 - x0) * (w - L - R), Y = (y) => T + (y1 - y) / (y1 - y0) * (h - T - B);
+    ctx.strokeStyle = TOK('--line'); ctx.lineWidth = 1; ctx.font = monoFont(11); ctx.fillStyle = TOK('--muted');
+    for (let y = -0.5; y <= 1.01; y += 0.5) { ctx.beginPath(); ctx.moveTo(L, Y(y)); ctx.lineTo(w - R, Y(y)); ctx.stroke(); ctx.fillText(V4U.fmt(y, 1), 8, Y(y) + 4); }
+    for (let x = 0; x <= 1.001; x += 0.25) ctx.fillText(V4U.fmt(x, 2), X(x) - 12, h - 10);
+    ctx.save(); ctx.beginPath(); ctx.rect(L, T, w - L - R, h - T - B); ctx.clip();
+    const line = (C, col, lw) => { ctx.strokeStyle = col; ctx.lineWidth = lw; ctx.beginPath(); ctx.moveTo(X(0), Y(-a * Math.log(C))); ctx.lineTo(X(1), Y(C - a * Math.log(C))); ctx.stroke(); };
+    [1.5, 2, 3, 5, 8].forEach((C) => line(C, TOK('--line-2'), 1));
+    line(1, TOK('--c1'), 2);
+    const env = (l) => (l <= a ? a * (1 + Math.log(l / a)) : l);
+    ctx.strokeStyle = TOK('--c2'); ctx.lineWidth = 3; ctx.beginPath();
+    for (let k = 1; k <= 200; k++) { const l = k / 200; const p = [X(l), Y(env(l))]; k === 1 ? ctx.moveTo(...p) : ctx.lineTo(...p); }
+    ctx.stroke();
+    const Cs = Math.max(1, a / l0);
+    ctx.setLineDash([5, 4]); line(Cs, TOK('--c3'), 2); ctx.setLineDash([]);
+    ctx.fillStyle = TOK('--c3'); ctx.beginPath(); ctx.arc(X(l0), Y(env(l0)), 5, 0, 2 * Math.PI); ctx.fill();
+    ctx.strokeStyle = TOK('--muted'); ctx.setLineDash([2, 3]); ctx.beginPath(); ctx.moveTo(X(a), T); ctx.lineTo(X(a), h - B); ctx.stroke(); ctx.setLineDash([]);
+    ctx.restore();
+    ctx.fillStyle = TOK('--ink-2'); ctx.font = monoFont(11); ctx.fillText('ℓ = α', X(a) + 4, T + 12);
+    $('o-cf-a').textContent = V4U.fmt(a); $('o-cf-l').textContent = V4U.fmt(l0);
+    rd.innerHTML = `<span>最优置信度 C* = <b>${V4U.fmt(Cs)}</b></span><span>有效损失 L*(ℓ) = <b>${V4U.fmt(env(l0), 3)}</b></span><span>对 ℓ 的梯度权重 = <b>${V4U.fmt(Cs)}</b></span><span>${l0 <= a ? '对数区' : '线性区（C 贴下限 1）'}</span>`;
+  });
+  [slA, slL].forEach((s) => s.addEventListener('input', redraw));
+});
+</script>
+
+<script>
+/* ---------- 3. global alignment (2D toy) ---------- */
+V4U.ready(() => {
+  const cv = $('cv-ga'), sl = $('sl-ga-n'), rd = $('rd-ga');
+  const segs = [[[-2, -1.5], [2, -1.5]], [[2, -1.5], [2, 1.5]], [[2, 1.5], [-2, 1.5]], [[-2, 1.5], [-2, -1.5]],
+    [[-0.7, -0.35], [0.25, -0.35]], [[0.25, -0.35], [0.25, 0.45]], [[0.25, 0.45], [-0.7, 0.45]], [[-0.7, 0.45], [-0.7, -0.35]], [[1.1, 0.5], [1.5, 0.9]]];
+  const NV = 4, W = 36, FOV = 1.45;
+  const cams = []; for (let k = 0; k < NV; k++) { const a = k * 2 * Math.PI / NV + 0.45; const c = [1.45 * Math.cos(a), 1.12 * Math.sin(a)]; cams.push({ c, th: Math.atan2(-c[1], -c[0]) }); }
+  function cast(o, d) { let best = 1e9, hp = null; for (const [p, q] of segs) { const e = [q[0] - p[0], q[1] - p[1]]; const den = -d[0] * e[1] + d[1] * e[0]; if (Math.abs(den) < 1e-9) continue; const r = [p[0] - o[0], p[1] - o[1]]; const t = (-r[0] * e[1] + r[1] * e[0]) / den; const u = (d[0] * r[1] - d[1] * r[0]) / den; if (t > 1e-6 && u >= 0 && u <= 1 && t < best) { best = t; hp = [o[0] + t * d[0], o[1] + t * d[1]]; } } return hp; }
+  const toCam = (cam, p) => { const dx = p[0] - cam.c[0], dy = p[1] - cam.c[1], c = Math.cos(cam.th), s = Math.sin(cam.th); return [c * dx + s * dy, -s * dx + c * dy]; };
+  const views = cams.map((cam) => { const pts = []; for (let i = 0; i < W; i++) { const a = cam.th + (-FOV / 2 + FOV * (i + 0.5) / W); pts.push(cast(cam.c, [Math.cos(a), Math.sin(a)])); } return pts; });
+  const edges = []; for (let a = 0; a < NV; a++) for (let b = a + 1; b < NV; b++) edges.push([a, b]);
+  const eid = (a, b) => edges.findIndex(([x, y]) => x === a && y === b);
+  const ecol = ['--c1', '--c2', '--c3', '--c4', '--c5', '--c6'];
+  $('ch-ga').innerHTML = edges.map(([a, b], k) => `<li><i style="background:var(${ecol[k]})"></i>边 ${a + 1}–${b + 1}</li>`).join('') + '<li><i style="background:var(--line-2)"></i>真值场景</li>';
+  let outs, states, cur = 0, target = 0, playing = false, loop = null;
+  const ID = () => ({ th: 0, s: 1, t: [0, 0] });
+  function chiOf(P) { const chi = []; for (let v = 0; v < NV; v++) { const acc = Array.from({ length: W }, () => [0, 0]); let c = 0; outs.forEach((o, e) => { const k = o.n === v ? 0 : o.m === v ? 1 : -1; if (k < 0) return; c++; o.X[k].forEach((p, i) => { const q = tf2(P[e], p); acc[i][0] += q[0]; acc[i][1] += q[1]; }); }); chi.push(acc.map((a) => [a[0] / c, a[1] / c])); } return chi; }
+  function objective(P) { const chi = chiOf(P); let L = 0; outs.forEach((o, e) => [o.n, o.m].forEach((v, k) => o.X[k].forEach((p, i) => { const q = tf2(P[e], p); L += (q[0] - chi[v][i][0]) ** 2 + (q[1] - chi[v][i][1]) ** 2; }))); return L; }
+  function gtErr(P) { const A = [], B = []; outs.forEach((o, e) => [o.n, o.m].forEach((v, k) => o.X[k].forEach((p, i) => { A.push(tf2(P[e], p)); B.push(views[v][i]); }))); const T = simil2(A, B); let s = 0; A.forEach((p, i) => { const q = tf2(T, p); s += Math.hypot(q[0] - B[i][0], q[1] - B[i][1]); }); return { err: s / A.length, T }; }
+  function build() {
+    const g = gaussFrom(mulberry(23)), bias = +sl.value, noise = 0.25 * bias;
+    outs = edges.map(([n, m]) => {
+      const cn = cams[n];
+      const err = { th: bias * 1.4 * g(), s: 1 + bias * g(), t: [bias * g(), bias * g()] };
+      const Xn = views[n].map((p) => toCam(cn, p).map((v) => v + noise * g()));
+      const Xm = views[m].map((p) => tf2(err, toCam(cn, p)).map((v) => v + noise * g()));
+      let z = 0; [...Xn, ...Xm].forEach((p) => (z += Math.hypot(p[0], p[1]))); z /= 2 * W;
+      return { n, m, X: [Xn.map((p) => [p[0] / z, p[1] / z]), Xm.map((p) => [p[0] / z, p[1] / z])] };
+    });
+    states = [];
+    let P = edges.map(ID); states.push({ P: P.map((p) => ({ ...p, t: [...p.t] })), name: '0 · 网络原始输出' });
+    // spanning-tree init along 1-2-3-4
+    P = edges.map(ID); const chi = Array(NV).fill(null); const e01 = eid(0, 1); chi[0] = outs[e01].X[0]; chi[1] = outs[e01].X[1];
+    for (const [a, b] of [[1, 2], [2, 3]]) { const e = eid(a, b); P[e] = simil2(outs[e].X[0], chi[a]); chi[b] = outs[e].X[1].map((p) => tf2(P[e], p)); }
+    const tree = [eid(0, 1), eid(1, 2), eid(2, 3)];
+    outs.forEach((o, e) => { if (!tree.includes(e)) P[e] = simil2([...o.X[0], ...o.X[1]], [...chi[o.n], ...chi[o.m]]); });
+    states.push({ P: P.map((p) => ({ ...p, t: [...p.t] })), name: '1 · 生成树初始化' });
+    for (let it = 1; it <= 8; it++) {
+      const ch = chiOf(P);
+      P = outs.map((o) => simil2([...o.X[0], ...o.X[1]], [...ch[o.n], ...ch[o.m]]));
+      const gm = Math.exp(P.reduce((a, p) => a + Math.log(p.s), 0) / P.length); P.forEach((p) => { p.s /= gm; p.t = [p.t[0] / gm, p.t[1] / gm]; });
+      states.push({ P: P.map((p) => ({ ...p, t: [...p.t] })), name: `${it + 1} · 迭代 ${it}` });
+    }
+    states.forEach((s) => { s.J = objective(s.P); const r = gtErr(s.P); s.err = r.err; s.T = r.T; });
+    cur = 0; target = 0;
+  }
+  const lerpAng = (a, b, t) => { let d = b - a; while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI; return a + d * t; };
+  const lerpT = (A, B, t) => ({ th: lerpAng(A.th, B.th, t), s: Math.exp(V4U.lerp(Math.log(A.s), Math.log(B.s), t)), t: [V4U.lerp(A.t[0], B.t[0], t), V4U.lerp(A.t[1], B.t[1], t)] });
+  build();
+  const redraw = V4U.canvas(cv, (w) => Math.round(Math.min(400, Math.max(260, w * 0.6))), (ctx, w, h) => {
+    const k0 = Math.floor(cur), k1 = Math.min(states.length - 1, k0 + 1), t = cur - k0;
+    const P = states[k0].P.map((p, e) => lerpT(p, states[k1].P[e], t));
+    const Td = lerpT(states[k0].T, states[k1].T, t);
+    const sc = Math.min((w - 24) / 4.8, (h - 24) / 3.6), ox = w / 2, oy = h / 2;
+    const S = (p) => [ox + sc * p[0], oy - sc * p[1]];
+    ctx.strokeStyle = TOK('--line-2'); ctx.lineWidth = 2;
+    segs.forEach(([a, b]) => { const A = S(a), B = S(b); ctx.beginPath(); ctx.moveTo(...A); ctx.lineTo(...B); ctx.stroke(); });
+    ctx.fillStyle = TOK('--muted');
+    cams.forEach((cam) => { const c = S(cam.c), a = -cam.th; ctx.beginPath(); ctx.moveTo(c[0] + 9 * Math.cos(a), c[1] + 9 * Math.sin(a)); ctx.lineTo(c[0] + 6 * Math.cos(a + 2.4), c[1] + 6 * Math.sin(a + 2.4)); ctx.lineTo(c[0] + 6 * Math.cos(a - 2.4), c[1] + 6 * Math.sin(a - 2.4)); ctx.closePath(); ctx.fill(); });
+    ctx.font = monoFont(11);
+    cams.forEach((cam, k) => { const c = S(cam.c); ctx.fillText(String(k + 1), c[0] + (cam.c[0] > 0 ? 8 : -16), c[1] + (cam.c[1] > 0 ? -8 : 16)); });
+    outs.forEach((o, e) => {
+      ctx.fillStyle = TOK(ecol[e]);
+      o.X.forEach((Xk) => Xk.forEach((p) => { const q = S(tf2(Td, tf2(P[e], p))); ctx.beginPath(); ctx.arc(q[0], q[1], 2.2, 0, 2 * Math.PI); ctx.fill(); }));
+    });
+    const st = states[Math.round(cur)];
+    rd.innerHTML = `<span>阶段 <b>${st.name}</b></span><span>目标函数（平方和） <b>${V4U.fmt(V4U.lerp(states[k0].J, states[k1].J, t), 3)}</b></span><span>与真值平均偏差 <b>${V4U.fmt(V4U.lerp(states[k0].err, states[k1].err, t), 3)}</b> m</span>`;
+  });
+  const halt = () => { if (loop) { loop.stop(); loop = null; } };
+  const go = () => {
+    if (loop) return;
+    loop = V4U.loop(cv, (tt, dt) => {
+      if (dt === 0 && tt === 0) { cur = target = playing ? states.length - 1 : target; playing = false; $('bt-ga-play').textContent = '播放'; redraw(); return; }
+      const d = target - cur;
+      if (Math.abs(d) < 1e-3) {
+        cur = target;
+        if (playing && target < states.length - 1) target += 1;
+        else { if (playing) { playing = false; $('bt-ga-play').textContent = '播放'; } redraw(); halt(); return; }
+      } else cur += Math.sign(d) * Math.min(Math.abs(d), dt * 1.4);
+      redraw();
+    });
+  };
+  $('bt-ga-play').addEventListener('click', (e) => { if (playing) { playing = false; target = Math.round(cur); e.target.textContent = '播放'; return; } if (cur >= states.length - 1) { cur = 0; target = 0; } playing = true; target = Math.min(states.length - 1, Math.floor(cur) + 1); e.target.textContent = '暂停'; go(); });
+  $('bt-ga-step').addEventListener('click', () => { target = Math.min(states.length - 1, Math.round(cur) + 1); go(); });
+  $('bt-ga-reset').addEventListener('click', () => { playing = false; halt(); $('bt-ga-play').textContent = '播放'; cur = 0; target = 0; redraw(); });
+  sl.addEventListener('input', () => { $('o-ga-n').textContent = V4U.fmt(+sl.value, 3); const keep = Math.round(cur); build(); cur = target = Math.min(keep, states.length - 1); redraw(); });
+});
+</script>
+
+<script>
+/* ---------- 4. attention masks ---------- */
+V4U.ready(() => {
+  const cv = $('cv-attn'), sl = $('sl-attn-n'), rd = $('rd-attn');
+  const K = 4; let mode = 'global', sel = 5;
+  const allowed = (qi, ki) => {
+    const fq = Math.floor(qi / K), fk = Math.floor(ki / K), rq = qi % K === 0, rk = ki % K === 0;
+    if (mode === 'frame') return fq === fk;
+    if (mode === 'global') return true;
+    if (mode === 'causal') return fk <= fq;
+    return rq && rk;
+  };
+  const sci = (x) => { const e = Math.floor(Math.log10(x)); return `${V4U.fmt(x / 10 ** e, 1)}×10^${e}`; };
+  let geo = null;
+  const redraw = V4U.canvas(cv, (w) => Math.round(Math.min(380, Math.max(250, w * 0.55))), (ctx, w, h) => {
+    const N = +sl.value, T = N * K, pad = 26, side = Math.min(h - pad - 8, w - pad - 8), cs = side / T, x0 = pad + Math.max(0, (w - pad - side) / 2 - 40), y0 = pad;
+    geo = { x0, y0, cs, T };
+    if (sel >= T) sel = T - 1;
+    const fq = Math.floor(sel / K);
+    for (let q = 0; q < T; q++) for (let k = 0; k < T; k++) {
+      const ok = allowed(q, k);
+      let col = ok ? (k % K === 0 || q % K === 0 ? mixTok('--c1', '--c4', 0.55) : TOK('--c1')) : TOK('--surface-2');
+      if (ok && q === sel) col = TOK('--c2');
+      ctx.fillStyle = col; ctx.fillRect(x0 + k * cs + 0.5, y0 + q * cs + 0.5, cs - 1, cs - 1);
+    }
+    ctx.strokeStyle = TOK('--line-2'); ctx.lineWidth = 1.5;
+    for (let f = 0; f <= N; f++) { ctx.beginPath(); ctx.moveTo(x0 + f * K * cs, y0); ctx.lineTo(x0 + f * K * cs, y0 + side); ctx.stroke(); ctx.beginPath(); ctx.moveTo(x0, y0 + f * K * cs); ctx.lineTo(x0 + side, y0 + f * K * cs); ctx.stroke(); }
+    ctx.strokeStyle = TOK('--c2'); ctx.lineWidth = 2; ctx.strokeRect(x0 - 1, y0 + sel * cs - 1, side + 2, cs + 2);
+    ctx.fillStyle = TOK('--ink-2'); ctx.font = monoFont(11);
+    for (let f = 0; f < N; f++) { ctx.fillText('帧' + (f + 1), x0 + (f * K + K / 2) * cs - 12, y0 - 8); ctx.save(); ctx.translate(x0 - 8, y0 + (f * K + K / 2) * cs + 12); ctx.rotate(-Math.PI / 2); ctx.fillText('帧' + (f + 1), 0, 0); ctx.restore(); }
+    let cnt = 0; for (let q = 0; q < T; q++) for (let k = 0; k < T; k++) if (allowed(q, k)) cnt++;
+    const Kr = 1369, Nr = 100, r = 16;
+    const real = { frame: Nr * Kr * Kr, global: (Nr * Kr) ** 2, causal: Kr * Kr * Nr * (Nr + 1) / 2, reg: (Nr * r) ** 2 }[mode];
+    const formula = { frame: 'N·K²', global: '(N·K)²', causal: 'K²·N(N+1)/2', reg: '(N·r)²' }[mode];
+    let seen = 0; for (let k = 0; k < T; k++) if (allowed(sel, k)) seen++;
+    $('o-attn-n').textContent = N;
+    rd.innerHTML = `<span>示意：允许 <b>${cnt}</b> / ${T * T} 对（${formula}）</span><span>选中：帧 ${fq + 1} 第 ${sel % K + 1} 个 token，可看 <b>${seen}</b> 个 key</span><span>实际规模 N=100 帧：<b>${sci(real)}</b> 对 / 层</span>`;
+  });
+  V4U.seg($('sg-attn'), (v) => { mode = v; if (v === 'reg' && sel % K !== 0) sel = Math.floor(sel / K) * K; redraw(); });
+  sl.addEventListener('input', redraw);
+  V4U.drag(cv, (x, y) => { if (!geo) return; const q = Math.floor((y - geo.y0) / geo.cs); if (q >= 0 && q < geo.T) { sel = q; redraw(); } });
+});
+</script>
+
+<script>
+/* ---------- 5. focal / distance ambiguity (dolly zoom) ---------- */
+V4U.ready(() => {
+  const slF = $('sl-dz-f'), ck = $('ck-dz'), slD = $('sl-dz-d'), slK = $('sl-dz-k'), rd = $('rd-dz');
+  const Hs = 1.7, BG = 5, H0 = 300, SW = 1000, SH = 750;
+  const state = () => { const f = +slF.value, k = +slK.value; const d = ck.checked ? f * Hs / H0 : +slD.value; return { f, k, d: d * k, H: Hs * k, bgD: (d + BG) * k }; };
+  const side = V4U.canvas($('cv-dz-side'), (w) => Math.round(Math.min(260, Math.max(200, w * 0.5))), (ctx, w, h) => {
+    const s = state(), xmax = Math.max(15, Math.ceil(s.bgD * 1.12 / 5) * 5), cx = 24, cy = h - 34, sc = (w - cx - 14) / xmax, sy = Math.min(sc * 3, (h - 70) / (Math.max(s.H, 0.8 * s.k) * 1.15));
+    ctx.strokeStyle = TOK('--line'); ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(w - 8, cy); ctx.stroke();
+    ctx.fillStyle = TOK('--muted'); ctx.font = monoFont(10);
+    const stepM = xmax > 20 ? 10 : 5;
+    for (let m = 0; m <= xmax; m += stepM) { ctx.fillText(m + 'm', cx + m * sc - 6, cy + 14); }
+    const bar = (x, H, col) => { ctx.strokeStyle = col; ctx.lineWidth = 4; ctx.beginPath(); ctx.moveTo(cx + x * sc, cy); ctx.lineTo(cx + x * sc, cy - H * sy); ctx.stroke(); };
+    const ray = (x, H, col) => { ctx.strokeStyle = col; ctx.lineWidth = 1; ctx.setLineDash([4, 3]); ctx.beginPath(); ctx.moveTo(cx, cy - 0.8 * s.k * sy); ctx.lineTo(cx + x * sc, cy - H * sy); ctx.stroke(); ctx.setLineDash([]); };
+    if (s.bgD <= xmax) { bar(s.bgD, s.H, TOK('--c2')); ray(s.bgD, s.H, TOK('--c2')); }
+    bar(s.d, s.H, TOK('--c1')); ray(s.d, s.H, TOK('--c1'));
+    ctx.fillStyle = TOK('--ink'); ctx.beginPath(); ctx.arc(cx, cy - 0.8 * s.k * sy, 5, 0, 2 * Math.PI); ctx.fill();
+    const fl = 4 + 22 * (s.f - 300) / 1200;
+    ctx.strokeStyle = TOK('--ink-2'); ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(cx - fl * 0.4, cy - 0.8 * s.k * sy - 14); ctx.lineTo(cx - fl * 0.4, cy - 0.8 * s.k * sy + 14); ctx.stroke();
+    ctx.fillStyle = TOK('--ink-2'); ctx.font = monoFont(11); ctx.fillText(`d = ${V4U.fmt(s.d, 1)} m`, cx + s.d * sc - 30, cy - s.H * sy - 8);
+  });
+  const img = V4U.canvas($('cv-dz-img'), (w) => Math.round(Math.min(260, Math.max(200, w * 0.5))), (ctx, w, h) => {
+    const s = state(), m = 10, sc = Math.min((w - 2 * m) / SW, (h - 2 * m) / SH), iw = SW * sc, ih = SH * sc, x0 = (w - iw) / 2, y0 = (h - ih) / 2;
+    ctx.fillStyle = TOK('--surface-2'); ctx.fillRect(x0, y0, iw, ih); ctx.strokeStyle = TOK('--line-2'); ctx.strokeRect(x0 + 0.5, y0 + 0.5, iw - 1, ih - 1);
+    const hs = s.f * s.H / s.d, hb = s.f * s.H / s.bgD, horizon = y0 + ih * 0.5, camH = 0.8 * s.k;
+    const footS = horizon + s.f * camH / s.d * sc, footB = horizon + s.f * camH / s.bgD * sc;
+    ctx.save(); ctx.beginPath(); ctx.rect(x0, y0, iw, ih); ctx.clip();
+    ctx.fillStyle = TOK('--c2'); ctx.fillRect(x0 + iw * 0.66 - 9, footB - hb * sc, 18, hb * sc);
+    ctx.fillStyle = TOK('--c1'); ctx.fillRect(x0 + iw * 0.36 - 16, footS - hs * sc, 32, hs * sc);
+    ctx.restore();
+    ctx.fillStyle = TOK('--ink-2'); ctx.font = monoFont(11);
+    ctx.fillText(`${Math.round(hs)} px`, x0 + iw * 0.36 + 20, Math.max(y0 + 14, footS - hs * sc + 12));
+    ctx.fillText(`${Math.round(hb)} px`, x0 + iw * 0.66 + 13, Math.max(y0 + 14, footB - hb * sc + 12));
+    rd.innerHTML = `<span>主体像高 <b>${Math.round(hs)}</b> px</span><span>背景像高 <b>${Math.round(hb)}</b> px</span><span>背景/主体 <b>${V4U.fmt(hb / hs, 3)}</b></span><span>主体距离 <b>${V4U.fmt(s.d, 2)}</b> m</span>`;
+  });
+  const upd = () => {
+    slD.disabled = ck.checked; if (ck.checked) slD.value = V4U.fmt(+slF.value * Hs / H0, 1);
+    $('o-dz-f').textContent = slF.value; $('o-dz-d').textContent = V4U.fmt(ck.checked ? +slF.value * Hs / H0 : +slD.value, 1); $('o-dz-k').textContent = V4U.fmt(+slK.value);
+    side(); img();
+  };
+  [slF, slD, slK, ck].forEach((el) => el.addEventListener('input', upd));
+  upd();
+});
+</script>
+
+<script>
+/* ---------- 6. scale-and-shift-invariant alignment ---------- */
+V4U.ready(() => {
+  const cv = $('cv-ssi'), slS = $('sl-ssi-s'), slT = $('sl-ssi-t'), ck = $('ck-ssi'), rd = $('rd-ssi');
+  const N = 90; let mode = 'ls';
+  const xs = Array.from({ length: N }, (_, i) => i / (N - 1));
+  const gt = xs.map((x) => x < 0.22 ? 0.18 + 0.02 * Math.sin(20 * x) : x < 0.42 ? 0.72 - 0.15 * (x - 0.22) : 0.3 + 0.75 * (x - 0.42) ** 1.15);
+  let bump = { c: 0.32, a: -0.12 };
+  const raw = () => {
+    const s0 = +slS.value, t0 = +slT.value;
+    return xs.map((x, i) => { let d = gt[i] + bump.a * Math.exp(-((x - bump.c) ** 2) / (2 * 0.05 ** 2)); if (ck.checked && x > 0.62 && x < 0.72) d = 1.05; return s0 * d + t0; });
+  };
+  const median = (a) => { const b = [...a].sort((p, q) => p - q), m = b.length >> 1; return b.length % 2 ? b[m] : (b[m - 1] + b[m]) / 2; };
+  function align(d) {
+    if (mode === 'ls') {
+      const md = d.reduce((a, v) => a + v, 0) / N, mg = gt.reduce((a, v) => a + v, 0) / N;
+      let c = 0, v = 0; d.forEach((x, i) => { c += (x - md) * (gt[i] - mg); v += (x - md) ** 2; });
+      const s = c / v, t = mg - s * md; const al = d.map((x) => s * x + t);
+      const L = al.reduce((a, x, i) => a + (x - gt[i]) ** 2, 0) / (2 * N);
+      return { s, t, al, L, lname: 'L_ssi' };
+    }
+    const td = median(d), tg = median(gt);
+    const sd = d.reduce((a, x) => a + Math.abs(x - td), 0) / N, sg = gt.reduce((a, x) => a + Math.abs(x - tg), 0) / N;
+    const s = sg / sd, t = tg - s * td; const al = d.map((x) => s * x + t);
+    const L = d.reduce((a, x, i) => a + Math.abs((x - td) / sd - (gt[i] - tg) / sg), 0) / N;
+    return { s, t, al, L, lname: 'L1（归一化）' };
+  }
+  let geo = null;
+  const redraw = V4U.canvas(cv, (w) => Math.round(Math.min(420, Math.max(320, w * 0.62))), (ctx, w, h) => {
+    const d = raw(), A = align(d), L = 40, R = 12, gap = 26, ph = (h - 20 - gap - 20) / 2;
+    const top = { y: 14, h: ph }, bot = { y: 14 + ph + gap, h: ph };
+    const X = (x) => L + x * (w - L - R);
+    const panel = (P, lo, hi, label) => {
+      const Y = (y) => P.y + (hi - y) / (hi - lo) * P.h;
+      ctx.strokeStyle = TOK('--line'); ctx.lineWidth = 1; ctx.strokeRect(L + 0.5, P.y + 0.5, w - L - R - 1, P.h - 1);
+      ctx.fillStyle = TOK('--muted'); ctx.font = monoFont(10); ctx.fillText(V4U.fmt(hi, 1), 6, P.y + 10); ctx.fillText(V4U.fmt(lo, 1), 6, P.y + P.h);
+      ctx.fillStyle = TOK('--ink-2'); ctx.font = monoFont(11); ctx.fillText(label, L + 6, P.y + 14);
+      return Y;
+    };
+    const curve = (Y, arr, col, lw, dash) => { ctx.strokeStyle = col; ctx.lineWidth = lw; if (dash) ctx.setLineDash(dash); ctx.beginPath(); arr.forEach((v, i) => { const p = [X(xs[i]), Y(v)]; i ? ctx.lineTo(...p) : ctx.moveTo(...p); }); ctx.stroke(); ctx.setLineDash([]); };
+    const rlo = Math.min(...d) - 0.1, rhi = Math.max(...d) + 0.1;
+    const Yt = panel(top, Math.min(rlo, -0.2), Math.max(rhi, 1.2), '网络原始输出 d');
+    ctx.save(); ctx.beginPath(); ctx.rect(L, top.y, w - L - R, top.h); ctx.clip(); curve(Yt, d, TOK('--c2'), 2.2); ctx.restore();
+    const Yb = panel(bot, -0.05, 1.25, '真值 d* 与对齐后 s·d + t');
+    ctx.save(); ctx.beginPath(); ctx.rect(L, bot.y, w - L - R, bot.h); ctx.clip();
+    ctx.fillStyle = alphaTok('--bad', 0.22);
+    for (let i = 0; i < N - 1; i++) { ctx.beginPath(); ctx.moveTo(X(xs[i]), Yb(gt[i])); ctx.lineTo(X(xs[i + 1]), Yb(gt[i + 1])); ctx.lineTo(X(xs[i + 1]), Yb(A.al[i + 1])); ctx.lineTo(X(xs[i]), Yb(A.al[i])); ctx.closePath(); ctx.fill(); }
+    curve(Yb, gt, TOK('--c1'), 2.5); curve(Yb, A.al, TOK('--c3'), 2, [6, 4]);
+    ctx.restore();
+    geo = { top, X, Yt, lo: Math.min(rlo, -0.2), hi: Math.max(rhi, 1.2), L, R, w };
+    const rawL = d.reduce((a, x, i) => a + (x - gt[i]) ** 2, 0) / (2 * N);
+    $('o-ssi-s').textContent = V4U.fmt(+slS.value); $('o-ssi-t').textContent = V4U.fmt(+slT.value);
+    rd.innerHTML = `<span>ŝ = <b>${V4U.fmt(A.s, 3)}</b></span><span>t̂ = <b>${V4U.fmt(A.t, 3)}</b></span><span>对齐后 ${A.lname} = <b>${V4U.fmt(A.L, 4)}</b></span><span>不对齐的 MSE/2 = <b>${V4U.fmt(rawL, 4)}</b></span>`;
+  });
+  V4U.seg($('sg-ssi'), (v) => { mode = v; redraw(); });
+  [slS, slT, ck].forEach((el) => el.addEventListener('input', redraw));
+  V4U.drag(cv, (x, y, ph) => {
+    if (!geo || y > geo.top.y + geo.top.h + 6) return;
+    const xn = V4U.clamp((x - geo.L) / (geo.w - geo.L - geo.R), 0.04, 0.96);
+    const s0 = +slS.value, t0 = +slT.value, yv = geo.hi - (y - geo.top.y) / geo.top.h * (geo.hi - geo.lo);
+    const i = Math.round(xn * (N - 1)); const base = s0 * gt[i] + t0;
+    bump = { c: xn, a: V4U.clamp((yv - base) / s0, -0.4, 0.4) };
+    redraw();
+  });
+});
+</script>
+
+<script>
+/* ---------- 7. SDS toy ---------- */
+V4U.ready(() => {
+  const cv = $('cv-sds'), slW = $('sl-sds-w'), rd = $('rd-sds');
+  const K = 24;
+  const shape = (th) => { const [cx, cy, a, b, ph] = th, c = Math.cos(ph), s = Math.sin(ph), x = []; for (let k = 0; k < K; k++) { const tau = 2 * Math.PI * k / K, u = a * Math.cos(tau), v = b * Math.sin(tau); x.push(cx + c * u - s * v, cy + s * u + c * v); } return x; };
+  const jac = (th) => { const [, , a, b, ph] = th, c = Math.cos(ph), s = Math.sin(ph), J = []; for (let k = 0; k < K; k++) { const tau = 2 * Math.PI * k / K, u = a * Math.cos(tau), v = b * Math.sin(tau); J.push([1, 0, c * Math.cos(tau), -s * Math.sin(tau), -s * u - c * v]); J.push([0, 1, s * Math.cos(tau), c * Math.sin(tau), c * u - s * v]); } return J; };
+  const A = shape([-1.0, 0.3, 0.85, 0.42, 0.2]), B = shape([1.0, -0.15, 0.38, 0.78, -0.3]);
+  let cond = false, th, rnd, g, step, trail, last, playing = false, loop = null;
+  const dist = (x, y) => Math.sqrt(x.reduce((acc, v, i) => acc + (v - y[i]) ** 2, 0) / K);
+  function reset(seed) {
+    rnd = mulberry(seed); g = gaussFrom(rnd);
+    th = [0.15 * (rnd() - 0.5), 0.15 * (rnd() - 0.5), 0.55, 0.55, 0];
+    step = 0; trail = [[th[0], th[1]]]; last = null; doStep(true);
+  }
+  function doStep(dry) {
+    const t = 0.02 + 0.96 * rnd(), al = Math.cos(Math.PI * t / 2), sg = Math.sin(Math.PI * t / 2);
+    const x = shape(th), eps = x.map(() => g()), z = x.map((v, i) => al * v + sg * eps[i]);
+    const ll = [A, B].map((m) => { let d = 0; for (let i = 0; i < z.length; i++) d += (z[i] - al * m[i]) ** 2; return -d / (2 * sg * sg); });
+    const mx = Math.max(...ll), wv = ll.map((l) => Math.exp(l - mx)), S = wv[0] + wv[1]; wv[0] /= S; wv[1] /= S;
+    const om = +slW.value;
+    let xh = A.map((v, i) => wv[0] * v + wv[1] * B[i]);
+    if (cond) xh = xh.map((v, i) => v + om * (A[i] - v));
+    last = { t, al, sg, x, xh, w: wv };
+    if (dry) return;
+    const gx = x.map((v, i) => al * sg * (v - xh[i])), J = jac(th), gr = [0, 0, 0, 0, 0];
+    for (let i = 0; i < gx.length; i++) for (let j = 0; j < 5; j++) gr[j] += gx[i] * J[i][j];
+    const lr = 0.025 / (cond ? Math.max(1, om / 3) : 1);
+    for (let j = 0; j < 5; j++) th[j] -= lr * gr[j];
+    th[2] = Math.max(0.08, th[2]); th[3] = Math.max(0.08, th[3]);
+    step++; trail.push([th[0], th[1]]); if (trail.length > 400) trail.shift();
+  }
+  reset(5);
+  for (let i = 0; i < 90; i++) doStep();
+  const redraw = V4U.canvas(cv, (w) => Math.round(Math.min(380, Math.max(250, w * 0.56))), (ctx, w, h) => {
+    const sc = Math.min(w / 5.2, h / 3.4), ox = w / 2, oy = h / 2, S = (p) => [ox + sc * p[0], oy - sc * p[1]];
+    const poly = (x, fill, stroke, lw, dash) => { ctx.beginPath(); for (let k = 0; k < K; k++) { const p = S([x[2 * k], x[2 * k + 1]]); k ? ctx.lineTo(...p) : ctx.moveTo(...p); } ctx.closePath(); if (fill) { ctx.fillStyle = fill; ctx.fill(); } if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = lw; if (dash) ctx.setLineDash(dash); ctx.stroke(); ctx.setLineDash([]); } };
+    poly(A, alphaTok('--c3', 0.18), TOK('--c3'), 1.5, [5, 4]); poly(B, alphaTok('--c4', 0.18), TOK('--c4'), 1.5, [5, 4]);
+    ctx.fillStyle = TOK('--c3'); ctx.font = monoFont(13); ctx.fillText('A', S([-1.0, 0.3])[0] - 4, S([-1.0, 0.3])[1] + 5);
+    ctx.fillStyle = TOK('--c4'); ctx.fillText('B', S([1.0, -0.15])[0] - 4, S([1.0, -0.15])[1] + 5);
+    ctx.strokeStyle = alphaTok('--c1', 0.5); ctx.lineWidth = 1.5; ctx.beginPath(); trail.forEach((p, i) => { const q = S(p); i ? ctx.lineTo(...q) : ctx.moveTo(...q); }); ctx.stroke();
+    const x = shape(th);
+    if (last) {
+      const xs = last.x; ctx.strokeStyle = alphaTok('--c2', 0.8); ctx.lineWidth = 1;
+      for (let k = 0; k < K; k++) { const p = S([xs[2 * k], xs[2 * k + 1]]), q = S([last.xh[2 * k], last.xh[2 * k + 1]]); ctx.beginPath(); ctx.moveTo(...p); ctx.lineTo(...q); ctx.stroke(); }
+      poly(last.xh, null, TOK('--c2'), 1.5, [3, 3]);
+    }
+    poly(x, alphaTok('--c1', 0.12), TOK('--c1'), 2.5);
+    const dA = dist(x, A), dB = dist(x, B);
+    rd.innerHTML = `<span>步数 <b>${step}</b></span><span>本步 t = <b>${V4U.fmt(last.t)}</b>，α/σ = <b>${V4U.fmt(last.al / last.sg)}</b></span><span>后验 w_A / w_B = <b>${V4U.fmt(last.w[0])}</b> / <b>${V4U.fmt(last.w[1])}</b></span><span>到 A 距离 <b>${V4U.fmt(dA, 3)}</b>，到 B <b>${V4U.fmt(dB, 3)}</b></span>`;
+  });
+  const stop = () => { playing = false; $('bt-sds-play').textContent = '播放'; if (loop) { loop.stop(); loop = null; } };
+  $('bt-sds-play').addEventListener('click', () => {
+    if (playing) { stop(); return; }
+    playing = true; $('bt-sds-play').textContent = '暂停';
+    let acc = 0;
+    loop = V4U.loop(cv, (tt, dt) => { if (dt === 0 && tt === 0) { for (let i = 0; i < 300; i++) doStep(); redraw(); stop(); return; } acc += dt * 40; while (acc >= 1) { doStep(); acc -= 1; } redraw(); if (step >= 900) stop(); });
+  });
+  $('bt-sds-step').addEventListener('click', () => { doStep(); redraw(); });
+  $('bt-sds-reset').addEventListener('click', () => { stop(); reset(1 + Math.floor(Math.random() * 1e6)); redraw(); });
+  V4U.seg($('sg-sds'), (v) => { cond = v === 'c'; slW.disabled = !cond; redraw(); });
+  slW.addEventListener('input', () => { $('o-sds-w').textContent = V4U.fmt(+slW.value, 1); });
+});
+</script>
+
+<script>
+/* ---------- 8. triplane lookup ---------- */
+V4U.ready(() => {
+  const sx = $('sl-tri-x'), sy = $('sl-tri-y'), sz = $('sl-tri-z'), rd = $('rd-tri');
+  const NG = 13, OFF = 1.2, R0 = 0.62;
+  let shape = 'sphere', planes = null, tau = 0, kappa = 1;
+  const defs = {
+    sphere: { xy: (a, b) => (a * a + b * b) / 2, xz: (a, b) => (a * a + b * b) / 2, yz: (a, b) => (a * a + b * b) / 2, tau: 0.75 ** 2, k: 18 },
+    torus: { xy: (a, b) => (Math.hypot(a, b) - R0) ** 2, xz: (a, b) => b * b / 2, yz: (a, b) => b * b / 2, tau: 0.3 ** 2, k: 70 },
+    box: { xy: (a, b) => (a ** 4 + b ** 4) / 2, xz: (a, b) => (a ** 4 + b ** 4) / 2, yz: (a, b) => (a ** 4 + b ** 4) / 2, tau: 0.78 ** 4, k: 22 },
+  };
+  const g2c = (k) => -1 + 2 * k / (NG - 1);
+  function build() { const d = defs[shape]; planes = {}; ['xy', 'xz', 'yz'].forEach((n) => { planes[n] = Array.from({ length: NG }, (_, i) => Array.from({ length: NG }, (_, j) => d[n](g2c(i), g2c(j)))); }); tau = d.tau; kappa = d.k; }
+  const bil = (G, a, b) => { const fa = V4U.clamp((a + 1) / 2 * (NG - 1), 0, NG - 1.0001), fb = V4U.clamp((b + 1) / 2 * (NG - 1), 0, NG - 1.0001); const i = Math.floor(fa), j = Math.floor(fb), u = fa - i, v = fb - j; return (1 - u) * (1 - v) * G[i][j] + u * (1 - v) * G[i + 1][j] + (1 - u) * v * G[i][j + 1] + u * v * G[i + 1][j + 1]; };
+  const feats = (p) => [bil(planes.xy, p[0], p[1]), bil(planes.xz, p[0], p[2]), bil(planes.yz, p[1], p[2])];
+  const dens = (s) => 1 / (1 + Math.exp(-kappa * (tau - s)));
+  build();
+  let occ = [];
+  const sample = () => { occ = []; const n = 15; for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) for (let k = 0; k < n; k++) { const p = [-1 + 2 * (i + 0.5) / n, -1 + 2 * (j + 0.5) / n, -1 + 2 * (k + 0.5) / n]; const f = feats(p); if (dens(f[0] + f[1] + f[2]) > 0.5) occ.push(p); } };
+  sample();
+  const orbit = V4U.orbit3d($('cv-tri'), { height: 360, yaw: 0.75, pitch: 0.5, dist: 6.2, target: [-0.1, 0.1, -0.1], fov: 40 }, (ctx, P, w, h) => {
+    const p = [+sx.value, +sy.value, +sz.value];
+    const cols = { xy: '--c1', xz: '--c2', yz: '--c3' };
+    const place = { xy: (a, b) => [a, b, -OFF], xz: (a, b) => [a, OFF, b], yz: (a, b) => [-OFF, a, b] };
+    ['xy', 'xz', 'yz'].forEach((n) => {
+      const G = planes[n]; let mx = 0; G.forEach((r) => r.forEach((v) => (mx = Math.max(mx, v))));
+      const cells = NG - 1;
+      for (let i = 0; i < cells; i++) for (let j = 0; j < cells; j++) {
+        const v = (G[i][j] + G[i + 1][j] + G[i][j + 1] + G[i + 1][j + 1]) / 4, t = Math.pow(1 - V4U.clamp(v / mx, 0, 1), 2.2);
+        const a0 = g2c(i), a1 = g2c(i + 1), b0 = g2c(j), b1 = g2c(j + 1);
+        P.poly([place[n](a0, b0), place[n](a1, b0), place[n](a1, b1), place[n](a0, b1)], mixTok('--surface', cols[n], 0.08 + 0.85 * t), TOK('--surface'), 0.6);
+      }
+    });
+    const sorted = occ.slice().sort((a, b) => P.depth(b) - P.depth(a));
+    sorted.forEach((q) => P.point(q, 2.4, alphaTok('--c4', 0.75)));
+    const proj = { xy: [p[0], p[1], -OFF], xz: [p[0], OFF, p[2]], yz: [-OFF, p[1], p[2]] };
+    ctx.setLineDash([4, 3]);
+    ['xy', 'xz', 'yz'].forEach((n) => P.line(p, proj[n], TOK(cols[n]), 1.5));
+    ctx.setLineDash([]);
+    ['xy', 'xz', 'yz'].forEach((n) => P.point(proj[n], 4.5, TOK(cols[n])));
+    P.point(p, 6, TOK('--ink'));
+    P.text([1.05, -1.2, -1.2], 'x', TOK('--bad'), monoFont(12)); P.text([-1.2, 1.05, -1.2], 'y', TOK('--ok'), monoFont(12)); P.text([-1.2, -1.2, 1.05], 'z', TOK('--c1'), monoFont(12));
+    P.line([-OFF, -OFF, -OFF], [1.1, -OFF, -OFF], TOK('--bad'), 2); P.line([-OFF, -OFF, -OFF], [-OFF, 1.1, -OFF], TOK('--ok'), 2); P.line([-OFF, -OFF, -OFF], [-OFF, -OFF, 1.1], TOK('--c1'), 2);
+    const f = feats(p), s = f[0] + f[1] + f[2];
+    rd.innerHTML = `<span>F<sub>xy</sub> = <b>${V4U.fmt(f[0], 3)}</b></span><span>F<sub>xz</sub> = <b>${V4U.fmt(f[1], 3)}</b></span><span>F<sub>yz</sub> = <b>${V4U.fmt(f[2], 3)}</b></span><span>Σ = <b>${V4U.fmt(s, 3)}</b>（阈值 τ = ${V4U.fmt(tau, 3)}）</span><span>σ(p) = <b>${V4U.fmt(dens(s), 3)}</b></span>`;
+    $('o-tri-x').textContent = V4U.fmt(p[0]); $('o-tri-y').textContent = V4U.fmt(p[1]); $('o-tri-z').textContent = V4U.fmt(p[2]);
+  });
+  [sx, sy, sz].forEach((s) => s.addEventListener('input', orbit.redraw));
+  V4U.seg($('sg-tri'), (v) => { shape = v; build(); sample(); orbit.redraw(); });
+});
+</script>
+</body>
+</html>

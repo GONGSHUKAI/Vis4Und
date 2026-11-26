@@ -1,0 +1,111 @@
+{
+  "site_url": "https://gongshukai.github.io/Vis4Und/",
+  "sections": [
+    {
+      "id": "robotics",
+      "no": "1",
+      "title": "机器人学",
+      "en": "Robotics",
+      "summary": "动作用什么坐标表示，关节空间和末端空间怎么换算，相机怎样把三维世界投到像素上。"
+    },
+    {
+      "id": "vision3d",
+      "no": "2",
+      "title": "3D 视觉与图形学",
+      "en": "3D Vision & Graphics",
+      "summary": "三维场景用什么数据结构表示，怎样边走边建图和定位，以及前馈式的 3D 重建与生成模型。"
+    },
+    {
+      "id": "agentic-rl",
+      "no": "3",
+      "title": "Agentic RL",
+      "en": "Agentic RL",
+      "summary": "用强化学习训练多轮行动的智能体：先讲 LLM 上的策略梯度，再看 coding agent 和直接操控机器人的 robot-use agent。"
+    }
+  ],
+  "pages": [
+    {
+      "slug": "rotations",
+      "section": "robotics",
+      "no": "0",
+      "extra": true,
+      "title": "旋转与位姿表示",
+      "short": "旋转与位姿",
+      "en": "Rotations & Poses",
+      "summary": "旋转矩阵、欧拉角、轴角、四元数、6D 表示和齐次变换：定义、互相换算、插值，以及网络该输出哪一种。"
+    },
+    {
+      "slug": "action-space",
+      "section": "robotics",
+      "no": "i",
+      "title": "机器人的运动空间",
+      "short": "运动空间",
+      "en": "Action Spaces, FK & IK",
+      "summary": "关节空间与末端空间、绝对动作与增量动作、正运动学、雅可比与逆运动学；VLA 的动作到底在哪个空间里。"
+    },
+    {
+      "slug": "camera",
+      "section": "robotics",
+      "no": "ii",
+      "title": "相机模型与标定",
+      "short": "相机",
+      "en": "Camera Models & Calibration",
+      "summary": "针孔模型、内参与畸变、外参、各家坐标系约定、张正友标定、手眼标定和深度反投影。"
+    },
+    {
+      "slug": "3d-representations",
+      "section": "vision3d",
+      "no": "i",
+      "title": "3D 表征",
+      "short": "3D 表征",
+      "en": "3D Representations",
+      "summary": "深度图、点云、体素、网格、SDF、NeRF 和 3D 高斯：各自存什么、怎么互相转换、什么任务该用哪种。"
+    },
+    {
+      "slug": "slam",
+      "section": "vision3d",
+      "no": "ii",
+      "title": "SLAM",
+      "short": "SLAM",
+      "en": "Simultaneous Localization and Mapping",
+      "summary": "边走边定位边建图：前端里程计、后端因子图与光束法平差、回环检测，以及学习式和高斯式 SLAM 的近年进展。"
+    },
+    {
+      "slug": "3d-foundation-models",
+      "section": "vision3d",
+      "no": "iii",
+      "title": "3D 基础模型",
+      "short": "3D 基础模型",
+      "en": "3D Foundation Models",
+      "summary": "前馈式重建（DUSt3R、VGGT 一系）、单目几何估计，以及 3D 物体与场景生成。"
+    },
+    {
+      "slug": "llm-rl-basics",
+      "section": "agentic-rl",
+      "no": "0",
+      "extra": true,
+      "title": "LLM 强化学习基础",
+      "short": "RL 基础",
+      "en": "Policy Gradients for LLMs",
+      "summary": "从策略梯度到 PPO、GRPO 及其变体：把一次生成看成一条轨迹，奖励怎么变成每个 token 的梯度。"
+    },
+    {
+      "slug": "coding-agent",
+      "section": "agentic-rl",
+      "no": "i",
+      "title": "Coding Agent 的训练",
+      "short": "Coding Agent",
+      "en": "Training Coding Agents",
+      "summary": "多轮工具调用的轨迹、可执行环境与测试奖励、SFT 冷启动加多轮 RL，以及几套经典开源实现。"
+    },
+    {
+      "slug": "robot-use-agent",
+      "section": "agentic-rl",
+      "no": "ii",
+      "title": "Robot-Use Agent 的训练",
+      "short": "Robot-Use Agent",
+      "en": "Training Robot-Use Agents",
+      "summary": "让推理模型像操作电脑一样直接操作机器人：动作接口、仿真里只用成功信号的 RL（PEAR），和把动作写成语义步骤的 SFT（nanoAstra）。"
+    }
+  ]
+}

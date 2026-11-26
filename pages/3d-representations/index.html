@@ -1,0 +1,1211 @@
+<!doctype html>
+<html lang="zh-CN" data-sec="vision3d">
+<head>
+<!-- v4u:head -->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="icon" href="data:,">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700&family=Inter+Tight:wght@700&family=JetBrains+Mono:wght@400;700&family=Noto+Sans+SC:wght@400;700&display=swap">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<link rel="stylesheet" href="../../assets/v4u.css?v=4288b6c4">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
+<script src="../../assets/v4u.js?v=d6640e00"></script>
+<!-- /v4u:head -->
+<title>3D 表征 · Vis4Und</title>
+<meta name="description" content="深度图、点云、体素、网格、SDF、NeRF 和 3D 高斯：各自存什么、怎么互相转换、机器人任务里该用哪种。">
+<style>
+.sw{display:inline-block;width:14px;height:14px;border-radius:3px;vertical-align:-2px;border:1px solid var(--line-2);margin:0 2px}
+.viz-ctrl .seg button{padding:7px 10px}
+#cv-rep,#cv-lift{cursor:grab}
+/* KaTeX's absolutely positioned MathML escapes the scroll box unless the box is positioned */
+.tbl{position:relative}
+#choose table{min-width:720px}
+#choose td:first-child{white-space:normal;min-width:6.5em}
+</style>
+</head>
+<body>
+<!-- v4u:nav -->
+<nav class="v4u-nav" aria-label="站点导航"><div class="v4u-nav-in"><span class="v4u-crumb"><a href="../../"><b>Vis4Und</b></a><span class="v4u-sep">/</span><a href="../../#vision3d">(2) 3D 视觉与图形学</a></span><span class="v4u-links"><a href="../3d-representations/" aria-current="page">(i) 3D 表征</a><a href="../slam/">(ii) SLAM</a><a href="../3d-foundation-models/">(iii) 3D 基础模型</a><button type="button" class="v4u-theme" aria-label="切换深浅色">深色</button></span></div></nav>
+<!-- /v4u:nav -->
+
+<header class="hero"><div class="wrap">
+  <p class="kicker">(2) 3D 视觉与图形学 · (i)</p>
+  <h1>3D 表征</h1>
+  <p class="lede">同一个物体可以存成深度图、点云、体素、网格、隐式场、NeRF 或一堆 3D 高斯。它们的内存、能回答的查询、需要的下游算法都不同；做策略输入、碰撞检测、仿真资产还是新视角渲染，选的表征不一样。</p>
+  <p class="asks-h">读完能回答</p>
+  <ul class="asks">
+    <li>点云网络为什么必须对点的顺序不敏感？DP3 的输入具体是什么？</li>
+    <li>体素分辨率翻倍，内存涨几倍？TSDF 融合在算什么？</li>
+    <li>物理引擎要什么样的 mesh？为什么要做凸分解？</li>
+    <li>NeRF 的离散体渲染公式怎么从透射率推出来？3DGS 的 $\Sigma'=JW\Sigma W^\top J^\top$ 从哪来？</li>
+    <li>策略输入、运动规划、仿真、渲染、建图各该用哪种表征？</li>
+  </ul>
+</div></header>
+
+<div class="wrap layout">
+<nav class="toc" id="toc" aria-label="本页目录"></nav>
+<main>
+
+<section id="overview">
+  <h2 data-toc="七种存法">一个杯子，七种存法</h2>
+  <p class="def"><b>3D 表征</b>是把物体或场景的几何（有时连同外观）存进计算机的数据结构。<b>显式</b>表征直接存表面上的东西（点、三角形、格子）；<b>隐式</b>表征存一个函数 $f(\mathbf{x})$，表面是它的某条等值面。</p>
+
+  <figure class="viz" id="viz-rep">
+    <div class="viz-h"><b>同一个带把手的杯子，切换表征和分辨率</b><span>拖动旋转 · 单位：m</span></div>
+    <div class="viz-stage"><canvas id="cv-rep" aria-label="杯子在七种表征下的三维视图"></canvas></div>
+    <div class="viz-ctrl">
+      <div class="seg" id="sg-rep">
+        <button type="button" data-v="depth">深度图</button><button type="button" data-v="pts">点云</button><button type="button" data-v="vox">体素</button><button type="button" data-v="mesh" aria-pressed="true">网格</button><button type="button" data-v="sdf">SDF</button><button type="button" data-v="nerf">NeRF</button><button type="button" data-v="gs">3DGS</button>
+      </div>
+      <label for="sl-res">分辨率 <input type="range" id="sl-res" min="0" max="4" step="1" value="2"><output id="o-res">3/5</output></label>
+      <div class="seg" id="sg-samp" hidden><button type="button" data-v="area" aria-pressed="true">按面积采样</button><button type="button" data-v="tri">每个三角形等概率</button></div>
+    </div>
+    <div class="viz-read" id="rd-rep"></div>
+    <figcaption>深度图：一个虚拟相机看到的那一面（每个像素一个距离），所以只有 2.5D。点云：从网格表面采样的无序点。体素：$N^3$ 格子里被占据的那些（低分辨率时 6 cm 厚的杯壁会断开或变粗）。网格：顶点 + 三角面。SDF：过把手的竖直切面上的有符号距离，粗黑线是零等值面。NeRF：连续密度场在格点上的不透明度。3DGS：贴在表面上的扁平高斯，按深度排序后半透明叠加。</figcaption>
+  </figure>
+
+  <div class="tbl"><table>
+    <thead><tr><th>表征</th><th>存什么</th><th>内存随分辨率 $N$</th><th>表面 / 拓扑</th><th>直接能做</th></tr></thead>
+    <tbody>
+      <tr><td>深度图</td><td>每像素沿光轴的距离 $D(u,v)$</td><td class="num">$O(N^2)$</td><td>只有朝相机的一面</td><td>传感器原始输出</td></tr>
+      <tr><td>点云</td><td>无序点集，可带颜色、法向</td><td class="num">$O(N^2)$</td><td>没有连接关系</td><td>策略输入、配准、抓取检测</td></tr>
+      <tr><td>体素</td><td>规则格子上的占据 / 距离 / 特征</td><td class="num">稠密 $O(N^3)$，稀疏 $O(N^2)$</td><td>隐含在格子邻接里</td><td>常数时间查询、3D 卷积</td></tr>
+      <tr><td>网格</td><td>顶点坐标 + 三角面下标</td><td class="num">$O(N^2)$</td><td>显式，可水密</td><td>光栅化渲染、物理仿真</td></tr>
+      <tr><td>隐式场</td><td>占据 $o(\mathbf{x})$ 或 SDF $s(\mathbf{x})$，存成网络或格点</td><td class="num">网络参数固定</td><td>等值面，任意拓扑</td><td>形状先验、距离查询</td></tr>
+      <tr><td>NeRF</td><td>密度 $\sigma(\mathbf{x})$ + 颜色 $\mathbf{c}(\mathbf{x},\mathbf{d})$</td><td class="num">网络 / 哈希网格</td><td>没有显式表面</td><td>新视角合成</td></tr>
+      <tr><td>3DGS</td><td>$10^5$–$10^6$ 个带颜色的各向异性高斯</td><td class="num">$O(\text{高斯数})$</td><td>没有显式表面</td><td>实时新视角合成</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="points">
+  <h2>深度图与点云</h2>
+  <p class="def"><b>深度图</b> $D(u,v)$ 给每个像素存一个距离；和彩色图逐像素对齐就是 <b>RGB-D</b>。结构光、ToF、双目相机都输出它。</p>
+  <p>有了内参 $K$（焦距 $f_x,f_y$、主点 $c_x,c_y$，见 <a href="../camera/">相机模型与标定</a>），每个像素沿自己的射线推到深度 $D$ 处，就得到相机系下的点，再用相机位姿 $(R,\mathbf{t})$（见 <a href="../rotations/">旋转与位姿</a>）变到世界系：</p>
+  <div class="eq">$$\mathbf{X}_c = D(u,v)\,K^{-1}\begin{bmatrix}u\\ v\\ 1\end{bmatrix} = \begin{bmatrix}(u-c_x)\,D/f_x\\ (v-c_y)\,D/f_y\\ D\end{bmatrix},\qquad \mathbf{X}_w = R\,\mathbf{X}_c + \mathbf{t}$$</div>
+
+  <figure class="viz" id="viz-lift">
+    <div class="viz-h"><b>深度图 → 点云：每个像素沿射线走到自己的深度</b><span>48×36 像素 · 拖动旋转</span></div>
+    <div class="viz-stage"><canvas id="cv-lift" aria-label="相机视锥、像平面上的深度图和反投影得到的点云"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="sl-lift">反投影进度 s <input type="range" id="sl-lift" min="0" max="1" step="0.01" value="1"><output id="o-lift">1.00</output></label>
+      <button type="button" class="btn ghost" id="bt-lift">播放</button>
+      <div class="seg" id="sg-fly"><button type="button" data-v="ideal">理想深度</button><button type="button" data-v="fly" aria-pressed="true">带飞点</button><button type="button" data-v="filt">剔除飞点</button></div>
+    </div>
+    <div class="viz-read" id="rd-lift"></div>
+    <ul class="chips"><li><i style="background:var(--c5)"></i>近</li><li><i style="background:var(--c1)"></i>远</li><li><i style="background:var(--bad)"></i>飞点（深度落在前景和背景之间）</li><li><i style="background:var(--ink)"></i>读数里那个像素</li></ul>
+    <figcaption>$s=0$ 时所有点都在像平面上（就是那张深度图），$s=1$ 时到达各自的 $D$。杯子放在桌面上；一个像素跨过杯沿时，传感器把前景和背景的深度混在一起，产生悬在半空的「飞点」。常用的剔除法：邻域深度差超过阈值（这里 4%）就丢掉。</figcaption>
+  </figure>
+
+  <div class="note pit"><b>易错</b><p>$D$ 有两种定义：沿光轴的 $z$ 深度（RealSense、Kinect 等 RGB-D 相机输出的就是它），或沿射线的距离 $\rho=\|\mathbf{X}_c\|$（激光雷达、部分渲染器）。把 $\rho$ 当 $z$ 代进上式，平面会被反投影成向外弯的曲面，越靠图像边缘错得越多：$z=\rho\,/\sqrt{1+x_n^2+y_n^2}$，$x_n=(u-c_x)/f_x$。</p></div>
+
+  <h3>点云是无序集合</h3>
+  <p class="def"><b>点云</b> $P=\{\mathbf{p}_i\}_{i=1}^{n}$，$\mathbf{p}_i\in\mathbb{R}^3$（可再拼颜色、法向）。它是集合，不是序列：同一组点换个存储顺序还是同一个形状，所以处理它的网络必须满足<b>置换不变</b>：对任意排列 $\pi$，$f(\mathbf{p}_{\pi(1)},\dots,\mathbf{p}_{\pi(n)})=f(\mathbf{p}_1,\dots,\mathbf{p}_n)$。</p>
+  <p><b>PointNet</b>（Qi et al., CVPR 2017）的做法：每个点过同一个 MLP $h$，再用逐维 max 这种对称函数聚合，最后接 MLP $\gamma$：</p>
+  <div class="eq">$$f(P)=\gamma\Big(\max_{i=1..n} h(\mathbf{p}_i)\Big),\qquad h:\mathbb{R}^3\to\mathbb{R}^K$$</div>
+  <p>max 的每一维只由一个点决定；对输出有贡献的点叫<b>关键点</b>（critical points），其余点在一定范围内移动不改变输出。sum、mean 也是对称函数，PointNet 论文里 max 效果最好。PointNet++ 再在局部邻域里分层套用这个结构。</p>
+
+  <figure class="viz" id="viz-pn">
+    <div class="viz-h"><b>打乱顺序：max 聚合不变，拼接后过线性层会变</b><span>2D 点，$K=6$ 维特征</span></div>
+    <div class="viz-stage"><canvas id="cv-pn" aria-label="左边是点集，右边是每个点的特征矩阵和聚合结果"></canvas></div>
+    <div class="viz-ctrl">
+      <button type="button" class="btn" id="bt-shuf">打乱点的顺序</button>
+      <span style="font-size:13px;color:var(--ink-2)">也可以拖动左边的点</span>
+    </div>
+    <div class="viz-read" id="rd-pn"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>每个点的特征 $h(\mathbf{p}_i)$（行顺序 = 存储顺序）</li><li><i style="background:var(--c2)"></i>max 聚合与关键点</li><li><i style="background:var(--c4)"></i>按顺序拼接 → 线性层的输出</li></ul>
+    <figcaption>右边每行是一个点的 6 维特征，颜色深浅表示数值。打乱后行的顺序变了，逐列取 max 的结果完全不变；把各行按顺序拼起来再乘一个矩阵，输出就变了。拖动没被圈出的点，max 不变；拖动关键点，max 跟着变。</figcaption>
+  </figure>
+
+  <p><b>最远点采样</b>（FPS）：先随机取一点，之后每次取离已选集合最远的点，复杂度 $O(nk)$。比随机下采样覆盖更均匀，几乎所有点云策略都用它把几万点降到几百到几千点。</p>
+  <p><b>Chamfer 距离</b>是比较两个点云最常用的度量 / 损失：$d_{\mathrm{CD}}(P,Q)=\frac{1}{|P|}\sum_{\mathbf{p}\in P}\min_{\mathbf{q}\in Q}\|\mathbf{p}-\mathbf{q}\|^2+\frac{1}{|Q|}\sum_{\mathbf{q}\in Q}\min_{\mathbf{p}\in P}\|\mathbf{p}-\mathbf{q}\|^2$。</p>
+
+  <div class="note"><b>例子：DP3 的输入</b><p>3D Diffusion Policy（Ze et al., RSS 2024）用单个相机的 84×84 深度图反投影成点云，用包围盒裁掉桌面和地面，FPS 降到 512 或 1024 个点，<b>不用颜色</b>（为了对外观变化更鲁棒）。编码器是 3 层 MLP（3→64→128→256，层间 LayerNorm）+ max-pool + 投影到 64 维，比原版 PointNet 少了 T-Net 和 BatchNorm。论文里 6 个任务的平均成功率：点云 78.3，RGB 图 40.7，RGB-D 34.7，体素 32.3，深度图 32.0；原版 PointNet 编码器只有 15.7，去掉 T-Net 和 BatchNorm 后升到 72.3。</p></div>
+</section>
+
+<section id="mesh">
+  <h2>三角网格</h2>
+  <p class="def"><b>三角网格</b> $\mathcal{M}=(V,F)$：顶点坐标 $V\in\mathbb{R}^{n_v\times 3}$，面 $F\in\mathbb{Z}^{n_f\times 3}$ 存每个三角形的三个顶点下标。可以再附顶点法向、UV 坐标和纹理。</p>
+  <ul>
+    <li><b>面法向</b> $\mathbf{n}_f=\dfrac{(\mathbf{v}_1-\mathbf{v}_0)\times(\mathbf{v}_2-\mathbf{v}_0)}{\|(\mathbf{v}_1-\mathbf{v}_0)\times(\mathbf{v}_2-\mathbf{v}_0)\|}$，顶点顺序（从外面看逆时针）决定它朝外还是朝内。叉积的长度是面积的 2 倍，所以把相邻面的未归一化叉积直接相加再归一化，就是按面积加权的<b>顶点法向</b>。</li>
+    <li><b>流形</b>（manifold）：每条边被 1 个（边界）或 2 个面共享，每个顶点周围的面连成一个扇形。</li>
+    <li><b>水密</b>（watertight）：闭合流形，没有边界边。只有水密网格才有良定义的「内部」，才能算 SDF、体积、质量和转动惯量。闭合可定向曲面满足欧拉公式 $n_v-n_e+n_f=2-2g$，$g$ 是亏格：杯子有一个把手孔，$g=1$，所以 $n_v-n_e+n_f=0$。</li>
+  </ul>
+  <div class="tbl"><table>
+    <thead><tr><th>下游</th><th>要什么</th><th>为什么</th></tr></thead>
+    <tbody>
+      <tr><td>光栅化渲染器</td><td>三角形 + 顶点法向 + UV + 纹理 / 材质；不要求水密</td><td>GPU 只会画三角形；法向用于光照</td></tr>
+      <tr><td>MuJoCo</td><td>mesh geom 的碰撞自动换成它的<b>凸包</b></td><td>接触检测（GJK / EPA 一类）假设凸体</td></tr>
+      <tr><td>Isaac Sim（PhysX）</td><td>动态刚体用凸包、凸分解或 SDF 碰撞；原始三角网格碰撞只给静态物体</td><td>同上；三角网格对三角网格的接触又慢又不稳</td></tr>
+      <tr><td>质量、惯量</td><td>水密网格</td><td>要对内部体积积分</td></tr>
+    </tbody>
+  </table></div>
+  <p>所以一个仿真资产（URDF / MJCF / USD）一般有两份几何：<b>visual mesh</b>（高面数、带贴图）和 <b>collision mesh</b>（凸包，或用 V-HACD、CoACD 把物体切成若干凸块的<b>凸分解</b>）。</p>
+  <div class="note pit"><b>易错</b><p>直接用凸包当杯子的碰撞体，杯口和把手孔会被「封上」：东西放不进杯子，夹爪也勾不住把手。CoACD（Wei et al., SIGGRAPH 2022）专门按碰撞效果衡量凹度，能保住把手这类细节。</p></div>
+</section>
+
+<section id="implicit">
+  <h2>隐式场：占据与 SDF</h2>
+  <p class="def"><b>占据场</b> $o(\mathbf{x})\in[0,1]$ 给出点 $\mathbf{x}$ 在物体内部的概率，表面是 $o=0.5$ 的等值面。</p>
+  <p class="def"><b>有符号距离场</b>（SDF）$s(\mathbf{x})$ 是 $\mathbf{x}$ 到表面的最近距离，在内部取负（本页约定）。表面是零等值面 $\{s=0\}$。</p>
+  <table class="notation">
+    <caption>记号</caption>
+    <thead><tr><th>符号</th><th>含义</th><th>形状</th></tr></thead>
+    <tbody>
+      <tr><td>$\Omega,\ \partial\Omega$</td><td>物体占据的区域、它的表面</td><td>$\subset\mathbb{R}^3$</td></tr>
+      <tr><td>$s(\mathbf{x})$</td><td>有符号距离，外正内负</td><td>标量，m</td></tr>
+      <tr><td>$\mathbf{z}$</td><td>一个形状的潜编码</td><td>$\mathbb{R}^{256}$（DeepSDF）</td></tr>
+      <tr><td>$f_\theta$</td><td>拟合 SDF 的网络</td><td>$\mathbb{R}^{256}\times\mathbb{R}^3\to\mathbb{R}$</td></tr>
+    </tbody>
+  </table>
+  <ul>
+    <li><b>Eikonal 性质</b>：几乎处处 $\|\nabla s(\mathbf{x})\|=1$。在表面上 $\nabla s$ 就是外法向；$\mathbf{x}-s(\mathbf{x})\nabla s(\mathbf{x})$ 是最近的表面点。学 SDF 的网络常加正则项 $\lambda(\|\nabla_{\mathbf{x}} f_\theta\|-1)^2$（IGR，Gropp et al., ICML 2020）。</li>
+    <li><b>碰撞查询</b>：球心 $\mathbf{c}$、半径 $r$ 的球与物体相交当且仅当 $s(\mathbf{c})\lt r$，梯度 $\nabla s$ 直接给出推开的方向。所以规划器喜欢把机器人近似成一串球、把环境存成 SDF。</li>
+    <li><b>DeepSDF</b>（Park et al., CVPR 2019）：一个网络 $f_\theta(\mathbf{z},\mathbf{x})\approx s(\mathbf{x})$ 表示一整类形状，每个形状一个 $\mathbf{z}$；没有编码器，$\mathbf{z}$ 和 $\theta$ 一起优化（auto-decoder）。损失只在表面附近计较：$\big|\mathrm{clamp}(f_\theta(\mathbf{z},\mathbf{x}),\delta)-\mathrm{clamp}(s(\mathbf{x}),\delta)\big|$，$\delta=0.1$。</li>
+    <li><b>Occupancy Networks</b>（Mescheder et al., CVPR 2019）：网络输出 $o_\theta(\mathbf{x},\mathbf{z})$，用二分类交叉熵训练。</li>
+  </ul>
+  <p>两者训练时都要对空间采样点算真值内外，所以训练数据得是水密网格；要拿到网格，再用 <a href="#convert">Marching Cubes</a> 抽零等值面。上面杯子图的「SDF」档就是这个场在一个切面上的样子。</p>
+</section>
+
+<section id="voxel">
+  <h2>体素、八叉树与 TSDF</h2>
+  <p class="def"><b>体素栅格</b>把空间切成 $N^3$ 个小立方体，每格存一个值：占据位、占据概率、截断距离（TSDF）、颜色或学到的特征。查询是 $O(1)$ 的数组索引，代价是内存 $O(N^3)$。</p>
+
+  <figure class="viz" id="viz-mem">
+    <div class="viz-h"><b>内存随分辨率增长</b><span>双对数坐标，按比例画</span></div>
+    <div class="viz-stage"><canvas id="cv-mem" aria-label="不同表征的内存随每边分辨率 N 变化的对数曲线"></canvas></div>
+    <div class="viz-ctrl"><label for="sl-mem">每边分辨率 N <input type="range" id="sl-mem" min="5" max="11" step="0.5" value="9"><output id="o-mem">512</output></label></div>
+    <div class="viz-read" id="rd-mem"></div>
+    <ul class="chips"><li><i style="background:var(--c2)"></i>稠密 TSDF（4 B 距离 + 4 B 权重）</li><li><i style="background:var(--c5)"></i>稠密占据（1 bit / 格）</li><li><i style="background:var(--c4)"></i>稀疏 TSDF（只存表面 ±4 格）</li><li><i style="background:var(--c3)"></i>三角网格</li><li><i style="background:var(--c1)"></i>点云（每个表面格一个点）</li></ul>
+    <figcaption>估算对象：直径占满网格的球。表面大约穿过 $\pi N^2$ 个格子；Marching Cubes 网格约 $2\pi N^2$ 个面、$\pi N^2$ 个顶点（各 12 B）。虚线是 32 GB 显存。稠密存储每翻一倍 ×8，只存表面的表征 ×4。</figcaption>
+  </figure>
+
+  <h3>只存表面附近</h3>
+  <ul>
+    <li><b>八叉树</b>：有东西的格子递归切成 8 个子格，空的大区域停在粗层。<b>OctoMap</b>（Hornung et al., 2013）每个节点存占据概率的对数几率 $L=\log\frac{p}{1-p}$，每次观测 $z_t$ 做加法更新 $L(n\mid z_{1:t})=L(n\mid z_{1:t-1})+L(n\mid z_t)$ 并截断到上下限；射线经过的格子记「空」，端点记「占据」。MoveIt 默认用它表示感知到的障碍。</li>
+    <li><b>体素哈希</b>（Nießner et al., 2013）：只在表面附近分配 $8^3$ 的体素块，用哈希表从块坐标找到内存。Voxblox、nvblox 都这样存 TSDF。</li>
+  </ul>
+
+  <h3>TSDF 融合</h3>
+  <p class="def"><b>TSDF</b>（truncated SDF）在体素上存截断到 $[-1,1]$ 的有符号距离，只在表面前后 $\mu$ 的带里更新。多帧带位姿的深度图按体素做加权平均，噪声被平均掉，零交叉就是表面（Curless &amp; Levoy 1996；KinectFusion 2011 把它搬上 GPU 实时跑）。</p>
+  <table class="notation">
+    <caption>记号</caption>
+    <thead><tr><th>符号</th><th>含义</th><th>形状 / 单位</th></tr></thead>
+    <tbody>
+      <tr><td>$\mathbf{x}$</td><td>体素中心（世界系）</td><td>$\mathbb{R}^3$，m</td></tr>
+      <tr><td>$D_k,\ \pi_k$</td><td>第 $k$ 帧深度图、把点投到该帧像素的投影</td><td>$H\times W$；$\mathbb{R}^3\to\mathbb{R}^2$</td></tr>
+      <tr><td>$z_k(\mathbf{x})$</td><td>$\mathbf{x}$ 在第 $k$ 帧相机系下的深度</td><td>m</td></tr>
+      <tr><td>$\mu$</td><td>截断距离</td><td>m，常取 3–4 个体素</td></tr>
+      <tr><td>$\psi_k,\ w_k$</td><td>第 $k$ 帧给这个体素的截断距离观测和权重</td><td>$[-1,1]$；标量</td></tr>
+      <tr><td>$F_k,\ W_k$</td><td>融合 $k$ 帧后体素存的 TSDF 值和累计权重</td><td>$[-1,1]$；标量</td></tr>
+    </tbody>
+  </table>
+  <ol class="derive">
+    <li><p>体素投到第 $k$ 帧，用「测到的深度减体素自己的深度」近似它到表面的有符号距离（沿射线，所以叫 projective）：</p>$$\eta_k(\mathbf{x}) = D_k\big(\pi_k(\mathbf{x})\big) - z_k(\mathbf{x})$$</li>
+    <li><p>在表面后面超过 $\mu$ 的体素被遮挡、没被观测，不更新；其余截断归一化：</p>$$\psi_k=\min\!\Big(1,\ \frac{\eta_k}{\mu}\Big)\quad\text{仅当 } \eta_k\ge-\mu$$</li>
+    <li><p>想要一个值 $F$ 最好地解释所有观测，最小化加权平方误差：</p>$$F^\star=\arg\min_F \sum_{j=1}^{k} w_j\,(F-\psi_j)^2$$</li>
+    <li><p>对 $F$ 求导令其为零，得到加权平均：</p>$$\sum_j w_j (F^\star-\psi_j)=0\ \Rightarrow\ F^\star=\frac{\sum_j w_j\psi_j}{\sum_j w_j}$$</li>
+    <li><p>写成递推，每来一帧只要存 $F$ 和 $W$ 两个数：</p>$$F_k=\frac{W_{k-1}F_{k-1}+w_k\psi_k}{W_{k-1}+w_k},\qquad W_k=\min(W_{k-1}+w_k,\ W_{\max})$$</li>
+    <li><p>$W_{\max}$ 让旧观测的影响有上限，场景变了还能被新观测改写。等权时 $k$ 帧独立噪声的标准差降到 $1/\sqrt{k}$。</p></li>
+  </ol>
+
+  <figure class="viz" id="viz-tsdf">
+    <div class="viz-h"><b>TSDF 融合：杯子过把手的竖直截面，相机绕着拍</b><span>单位：m · 格子 3.1 cm</span></div>
+    <div class="viz-stage"><canvas id="cv-tsdf" aria-label="二维 TSDF 栅格、相机位置和提取出的零交叉轮廓"></canvas></div>
+    <div class="viz-ctrl">
+      <button type="button" class="btn" id="bt-fuse">融合下一帧</button>
+      <button type="button" class="btn ghost" id="bt-freset">重置</button>
+      <label for="sl-noise">深度噪声 σ <input type="range" id="sl-noise" min="0" max="0.04" step="0.002" value="0.012"><output id="o-noise">0.012</output></label>
+      <label for="sl-mu">截断 μ <input type="range" id="sl-mu" min="0.04" max="0.3" step="0.01" value="0.1"><output id="o-mu">0.10</output></label>
+    </div>
+    <div class="viz-read" id="rd-tsdf"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>$F\gt 0$（表面前方）</li><li><i style="background:var(--c2)"></i>$F\lt 0$（表面后方）</li><li><i style="background:var(--ink)"></i>零交叉（提取的表面）</li><li><i style="background:var(--muted)"></i>真实轮廓</li><li><i style="background:var(--c5)"></i>最新一帧的射线</li></ul>
+    <figcaption>每帧 80 条射线，深度加高斯噪声。只有表面前后 $\mu$ 内的格子被更新；没被任何相机看到的地方（比如杯子内底的背面）一直是空的，提取出的轮廓在那里断开。$\mu$ 太小，噪声会让零交叉破碎；太大，薄壁两侧的观测互相干扰。把指针移到格子上看 $F$、$W$ 和真实 SDF：斜着看到的格子 $F$ 偏大，这就是 projective 距离的误差。</figcaption>
+  </figure>
+
+  <p class="def"><b>ESDF</b>（Euclidean SDF）：整个空间（不止表面带）存到最近障碍的真实欧氏距离，从 TSDF 或占据栅格用波前传播算出来（Voxblox, IROS 2017；nvblox 在 GPU 上算）。TSDF 的 $\eta$ 是沿射线的距离，斜着看表面时偏大，适合抽表面，不适合当碰撞距离；规划要用 ESDF。</p>
+</section>
+
+<section id="nerf">
+  <h2>NeRF 与体渲染</h2>
+  <p class="def"><b>NeRF</b>（Mildenhall et al., ECCV 2020）用 MLP 表示一个场景：$F_\Theta(\mathbf{x},\mathbf{d})\mapsto(\mathbf{c},\sigma)$，位置 $\mathbf{x}$ 决定体密度 $\sigma$，位置加观察方向 $\mathbf{d}$ 决定颜色 $\mathbf{c}$。每个像素沿射线积分出颜色，和带位姿的照片比 L2 损失来训练。</p>
+  <table class="notation">
+    <caption>记号</caption>
+    <thead><tr><th>符号</th><th>含义</th><th>形状 / 单位</th></tr></thead>
+    <tbody>
+      <tr><td>$\mathbf{r}(t)=\mathbf{o}+t\mathbf{d}$</td><td>从相机中心 $\mathbf{o}$ 出发、方向 $\mathbf{d}$ 的射线</td><td>$\mathbb{R}^3$</td></tr>
+      <tr><td>$t_n,\ t_f$</td><td>积分的近、远边界</td><td>m</td></tr>
+      <tr><td>$\sigma(t)$</td><td>射线上 $t$ 处的体密度：单位长度被吸收的概率</td><td>1/m</td></tr>
+      <tr><td>$\mathbf{c}(t)$</td><td>$t$ 处朝 $-\mathbf{d}$ 发出的颜色</td><td>$[0,1]^3$</td></tr>
+      <tr><td>$T(t)$</td><td>透射率：光从 $t_n$ 走到 $t$ 没被吸收的概率</td><td>$[0,1]$</td></tr>
+      <tr><td>$t_i,\ \delta_i$</td><td>第 $i$ 个采样点、它到下一个采样点的间距</td><td>m</td></tr>
+      <tr><td>$\alpha_i,\ w_i$</td><td>第 $i$ 段的不透明度、它对像素颜色的权重</td><td>$[0,1]$</td></tr>
+    </tbody>
+  </table>
+  <ol class="derive">
+    <li><p>光走过 $[t,t+dt]$ 被吸收的概率是 $\sigma(t)\,dt$，所以：</p>$$T(t+dt)=T(t)\,\big(1-\sigma(t)\,dt\big)$$</li>
+    <li><p>写成微分方程，初值 $T(t_n)=1$，解出透射率：</p>$$\frac{dT}{dt}=-\sigma(t)\,T(t)\ \Rightarrow\ T(t)=\exp\!\Big(-\int_{t_n}^{t}\sigma(s)\,ds\Big)$$</li>
+    <li><p>光线在 $t$ 处第一次被「挡住」的概率密度是 $T(t)\sigma(t)$；像素颜色取被挡住处颜色的期望：</p>$$C(\mathbf{r})=\int_{t_n}^{t_f}T(t)\,\sigma(t)\,\mathbf{c}(t)\,dt$$</li>
+    <li><p>把射线切成小段，假设每段 $[t_i,t_i+\delta_i]$ 内 $\sigma,\mathbf{c}$ 为常数 $\sigma_i,\mathbf{c}_i$。段内 $T(t)=T_i e^{-\sigma_i(t-t_i)}$，积分这一段：</p>$$\int_{t_i}^{t_i+\delta_i}T_i e^{-\sigma_i(t-t_i)}\sigma_i\mathbf{c}_i\,dt=T_i\big(1-e^{-\sigma_i\delta_i}\big)\mathbf{c}_i$$</li>
+    <li><p>记 $\alpha_i=1-e^{-\sigma_i\delta_i}$。段首的透射率是前面各段透射的连乘：</p>$$T_i=\exp\!\Big(-\sum_{j\lt i}\sigma_j\delta_j\Big)=\prod_{j\lt i}(1-\alpha_j)$$</li>
+    <li><p>求和得到离散体渲染公式，它就是从前往后的 alpha 合成：</p>$$\hat C(\mathbf{r})=\sum_{i=1}^{N}w_i\,\mathbf{c}_i,\qquad w_i=T_i\,\alpha_i,\qquad \sum_i w_i=1-T_{N+1}\le 1$$</li>
+    <li><p>同样的权重给出深度估计 $\hat D=\sum_i w_i t_i$；$1-\sum_i w_i$ 是光穿过整条射线的概率，用来混背景色。</p></li>
+  </ol>
+
+  <figure class="viz" id="viz-ray">
+    <div class="viz-h"><b>一条射线上的体渲染：半透明的薄雾 + 不透明的表面</b><span>$t$ 单位：m</span></div>
+    <div class="viz-stage"><canvas id="cv-ray" aria-label="沿射线的密度、透射率和权重曲线"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="sl-ns">采样数 N <input type="range" id="sl-ns" min="3" max="96" step="1" value="12"><output id="o-ns">12</output></label>
+      <label for="sl-sa">薄雾密度 <input type="range" id="sl-sa" min="0" max="6" step="0.1" value="2.0"><output id="o-sa">2.0</output></label>
+      <label for="sl-tb">表面位置 <input type="range" id="sl-tb" min="3.6" max="5.2" step="0.01" value="4.3"><output id="o-tb">4.30</output></label>
+      <div class="seg" id="sg-strat"><button type="button" data-v="u">均匀</button><button type="button" data-v="s" aria-pressed="true">分层随机</button></div>
+      <button type="button" class="btn ghost" id="bt-resamp">重新采样</button>
+    </div>
+    <div class="viz-read" id="rd-ray"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>薄雾的颜色</li><li><i style="background:var(--c2)"></i>表面的颜色</li><li><i style="background:var(--ink-2)"></i>连续的 $T(t)$；点是采样处的 $T_i$</li></ul>
+    <figcaption>上：密度 $\sigma(t)$ 和采样点。中：透射率，穿过薄雾降一截，碰到表面降到接近 0。下：每个采样点的权重 $w_i=T_i\alpha_i$，颜色是该点的 $\mathbf{c}_i$。采样太稀时（试 N = 4、均匀采样）薄雾可能整个被跳过，颜色就错了；NeRF 训练用分层随机采样，让每个位置都有机会被采到。</figcaption>
+  </figure>
+  <p>原版 NeRF：8 层、每层 256 宽的 MLP；输入先做位置编码 $\gamma(p)=(\sin 2^0\pi p,\cos 2^0\pi p,\dots,\sin 2^{L-1}\pi p,\cos 2^{L-1}\pi p)$，位置 $L=10$、方向 $L=4$；粗采样 64 点、按粗网络的 $w_i$ 再细采样 128 点；一个场景在一张 V100 上训练 1–2 天。Instant-NGP（Müller et al., SIGGRAPH 2022）把大 MLP 换成多分辨率哈希网格 + 小 MLP，训练降到秒到分钟级。</p>
+  <div class="note"><b>几何从哪来</b><p>NeRF 的密度场没有约束成一个干净的表面，直接取 $\sigma$ 的等值面很毛糙。NeuS、VolSDF 一类方法改学 SDF，再把 SDF 变换成密度做体渲染，表面才好抽。</p></div>
+</section>
+
+<section id="gs">
+  <h2 data-toc="3DGS">3D 高斯泼溅（3DGS）</h2>
+  <p class="def"><b>3DGS</b>（Kerbl et al., SIGGRAPH 2023）把场景表示成一组带颜色和不透明度的 3D 高斯。渲染时把每个高斯投影成屏幕上的 2D 椭圆，按深度排序后做 alpha 合成；整个过程可微，用照片直接优化所有参数，不需要神经网络。</p>
+  <div class="tbl"><table>
+    <thead><tr><th>每个高斯的参数</th><th>个数</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>均值 $\boldsymbol\mu$</td><td class="num">3</td><td>位置</td></tr>
+      <tr><td>尺度 $\mathbf{s}$</td><td class="num">3</td><td>三个主轴的标准差，存 $\log s$</td></tr>
+      <tr><td>旋转 $\mathbf{q}$</td><td class="num">4</td><td>四元数；$\Sigma=RSS^\top R^\top$，$S=\mathrm{diag}(\mathbf{s})$，保证半正定</td></tr>
+      <tr><td>不透明度 $o$</td><td class="num">1</td><td>存 sigmoid 之前的值</td></tr>
+      <tr><td>颜色（球谐系数）</td><td class="num">48</td><td>3 阶球谐 16 个系数 × RGB，颜色随视角变</td></tr>
+      <tr><td>合计</td><td class="num">59</td><td>float32 下 236 B；PLY 文件里还多存 3 个不用的法向，62 个 float</td></tr>
+    </tbody>
+  </table></div>
+
+  <table class="notation">
+    <caption>记号</caption>
+    <thead><tr><th>符号</th><th>含义</th><th>形状</th></tr></thead>
+    <tbody>
+      <tr><td>$\Sigma$</td><td>高斯在世界系下的协方差</td><td>$3\times3$</td></tr>
+      <tr><td>$W,\ \mathbf{b}$</td><td>世界系到相机系的旋转、平移：$\mathbf{t}=W\mathbf{x}+\mathbf{b}$</td><td>$3\times3$；$\mathbb{R}^3$</td></tr>
+      <tr><td>$\boldsymbol\pi(\mathbf{t})$</td><td>透视投影：相机系点到像素</td><td>$\mathbb{R}^3\to\mathbb{R}^2$</td></tr>
+      <tr><td>$J$</td><td>$\boldsymbol\pi$ 在高斯中心处的雅可比</td><td>$2\times3$</td></tr>
+      <tr><td>$\Sigma'$</td><td>投影到屏幕的 2D 协方差</td><td>$2\times2$，px²</td></tr>
+      <tr><td>$o_k,\ \mathbf{c}_k,\ \alpha_k$</td><td>第 $k$ 个高斯的不透明度、颜色、在某像素的 alpha</td><td>标量；$\mathbb{R}^3$；标量</td></tr>
+    </tbody>
+  </table>
+  <ol class="derive">
+    <li><p>刚体变换是线性的，协方差跟着旋转：</p>$$\Sigma_{\text{cam}}=W\,\Sigma\,W^\top$$</li>
+    <li><p>透视投影 $\boldsymbol\pi(\mathbf{t})=\big(f_x t_x/t_z+c_x,\ f_y t_y/t_z+c_y\big)$ 是非线性的，高斯投影后不再是高斯。在高斯中心 $\mathbf{t}_k$ 做一阶泰勒展开：</p>$$\boldsymbol\pi(\mathbf{t})\approx\boldsymbol\pi(\mathbf{t}_k)+J\,(\mathbf{t}-\mathbf{t}_k)$$</li>
+    <li><p>雅可比逐项求导：</p>$$J=\frac{\partial\boldsymbol\pi}{\partial\mathbf{t}}\Big|_{\mathbf{t}_k}=\begin{bmatrix}f_x/t_z & 0 & -f_x t_x/t_z^2\\ 0 & f_y/t_z & -f_y t_y/t_z^2\end{bmatrix}$$</li>
+    <li><p>高斯经过线性映射 $A$ 后协方差变成 $A\Sigma A^\top$，这里 $A=JW$（EWA splatting，Zwicker et al. 2001）：</p>$$\Sigma'=J\,W\,\Sigma\,W^\top J^\top$$</li>
+    <li><p>像素 $\mathbf{u}$ 处，第 $k$ 个高斯的 alpha 是 2D 高斯乘不透明度（$\mathbf{u}_k=\boldsymbol\pi(\mathbf{t}_k)$）：</p>$$\alpha_k(\mathbf{u})=o_k\exp\!\Big(-\tfrac12(\mathbf{u}-\mathbf{u}_k)^\top\Sigma_k'^{-1}(\mathbf{u}-\mathbf{u}_k)\Big)$$</li>
+    <li><p>按相机系深度 $t_z$ 从近到远排序后合成，形式和 NeRF 的离散公式一样，只是 $\alpha$ 来自投影的高斯、不用沿射线采样：</p>$$C(\mathbf{u})=\sum_{k}\mathbf{c}_k\,\alpha_k\prod_{j\lt k}(1-\alpha_j)$$</li>
+  </ol>
+
+  <figure class="viz" id="viz-gs">
+    <div class="viz-h"><b>六个 3D 高斯：投影、排序、逐像素合成</b><span>点击图像放探针</span></div>
+    <div class="viz-stage"><canvas id="cv-gs" aria-label="六个三维高斯渲染出的图像和探针像素"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="sl-gyaw">相机方位角 <input type="range" id="sl-gyaw" min="-180" max="180" step="1" value="35"><output id="o-gyaw">35°</output></label>
+      <div class="seg" id="sg-sort"><button type="button" data-v="sort" aria-pressed="true">按深度排序</button><button type="button" data-v="idx">不排序（按编号）</button></div>
+      <div class="seg" id="sg-ell"><button type="button" data-v="on" aria-pressed="true">显示 2σ 椭圆</button><button type="button" data-v="off">只看图像</button></div>
+    </div>
+    <div class="viz-read" id="rd-gs"></div>
+    <figcaption>图像按上面的公式逐像素算出来：每个高斯用 $\Sigma'=JW\Sigma W^\top J^\top$ 投成椭圆，按深度从近到远累乘 $(1-\alpha)$。转动相机，同一个 3D 高斯投出的椭圆形状和前后顺序都会变。切到「不排序」，重叠处的前后关系就错了。读数列出探针像素上每个高斯的深度、$\alpha$ 和到达它时剩下的透射率 $T$。</figcaption>
+  </figure>
+
+  <p>实现上把屏幕切成 16×16 的 tile，每个高斯按覆盖的 tile 复制，用一次 GPU 基数排序同时按 tile 和深度排好，每个 tile 独立合成。优化中按位置梯度的大小克隆或分裂高斯（densification），并删掉不透明度太低的。论文在 Mip-NeRF360 数据集上（30K 步）：每个场景 1–5 百万个高斯，模型 734 MB，1080p 下 134 FPS，训练约 42 分钟。</p>
+  <div class="note pit"><b>易错</b><p>3DGS 的高斯不贴着真实表面，渲染出的深度和抽出的网格都比较粗糙。要几何就用 2DGS（Huang et al., SIGGRAPH 2024，把高斯压成面片）或对渲染深度做 TSDF 融合。拿 3DGS 做仿真背景时，碰撞几何仍要另配网格。</p></div>
+</section>
+
+<section id="convert">
+  <h2>表征之间怎么转换</h2>
+  <div class="tbl"><table>
+    <thead><tr><th>从 → 到</th><th>方法</th><th>前提 / 坑</th></tr></thead>
+    <tbody>
+      <tr><td>深度图 → 点云</td><td>$\mathbf{X}_c=D\,K^{-1}[u,v,1]^\top$</td><td>要内参；分清 $z$ 深度和射线距离；剔除飞点</td></tr>
+      <tr><td>点云 → 体素</td><td>量化 $\lfloor(\mathbf{p}-\mathbf{o})/v\rfloor$</td><td>$v$ 是体素边长</td></tr>
+      <tr><td>多帧深度 → TSDF</td><td>逐体素加权平均（上面推导）</td><td>要每帧相机位姿，见 <a href="../slam/">SLAM</a></td></tr>
+      <tr><td>SDF / TSDF / 占据 → 网格</td><td>Marching Cubes</td><td>网格分辨率受体素限制</td></tr>
+      <tr><td>点云 → 网格</td><td>Poisson 重建</td><td>需要朝向一致的法向</td></tr>
+      <tr><td>网格 → 点云</td><td>按面积采样</td><td>不能每个三角形等概率</td></tr>
+      <tr><td>网格 → SDF</td><td>最近三角形距离 + 内外判定（射线奇偶或绕数）</td><td>网格要水密</td></tr>
+      <tr><td>网格 → 碰撞体</td><td>凸包、V-HACD、CoACD</td><td>凸包会封住开口</td></tr>
+      <tr><td>多视图照片 → NeRF / 3DGS</td><td>逐场景优化</td><td>要相机位姿（通常先跑 COLMAP）</td></tr>
+      <tr><td>NeRF / 3DGS → 网格</td><td>渲染深度做 TSDF 融合；或改用 NeuS / 2DGS</td><td>直接取等值面很毛糙</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Marching Squares / Cubes</h3>
+  <p class="def"><b>Marching Cubes</b>（Lorensen &amp; Cline, SIGGRAPH 1987）逐个格子抽等值面：看格子 8 个角在内（$f\lt 0$）还是在外，拼成 8 位编码，查表得到这个格子里的三角形；$2^8=256$ 种情况按对称性归成 15 类。二维版本 Marching Squares 是 4 个角、16 种情况，产生线段。</p>
+  <p>等值面和格子边的交点用线性插值：边两端 $\mathbf{a},\mathbf{b}$ 的值异号时，</p>
+  <div class="eq">$$\mathbf{x}=\mathbf{a}+\frac{f(\mathbf{a})}{f(\mathbf{a})-f(\mathbf{b})}\,(\mathbf{b}-\mathbf{a})$$</div>
+  <figure class="viz" id="viz-ms">
+    <div class="viz-h"><b>Marching Squares：两个圆的平滑并集</b><span>拖动圆心 · 点击格子看编码</span></div>
+    <div class="viz-stage"><canvas id="cv-ms" aria-label="网格角点的内外符号与抽出的等值线"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="sl-msn">每边格数 <input type="range" id="sl-msn" min="3" max="40" step="1" value="9"><output id="o-msn">9</output></label>
+      <div class="seg" id="sg-interp"><button type="button" data-v="lin" aria-pressed="true">线性插值</button><button type="button" data-v="mid">取边中点</button></div>
+    </div>
+    <div class="viz-read" id="rd-ms"></div>
+    <ul class="chips"><li><i style="background:var(--c2)"></i>角点在内（$f\lt 0$）</li><li><i style="background:var(--c1)"></i>角点在外</li><li><i style="background:var(--ink)"></i>抽出的等值线</li><li><i style="background:var(--muted)"></i>真实零等值线</li><li><i style="background:var(--c5)"></i>选中的格子</li></ul>
+    <figcaption>编码的第 $k$ 位表示第 $k$ 个角（左上、右上、右下、左下）在内部。编码 5 和 10 是对角两个角在内，有两种连法，这里用格子中心的值来决定（中心在内就把两块连起来）。低分辨率时「取边中点」的轮廓呈锯齿，线性插值即使格子很粗也贴得住。</figcaption>
+  </figure>
+
+  <h3>Poisson 重建</h3>
+  <p>Poisson 重建（Kazhdan et al., SGP 2006）从带法向的点云求一个指示函数 $\chi$（内部 1、外部 0）。平滑后的 $\nabla\chi$ 在表面上应当等于朝内的法向场 $\mathbf{V}$，于是求 $\min_\chi\|\nabla\chi-\mathbf{V}\|^2$；它的欧拉–拉格朗日方程是泊松方程 $\Delta\chi=\nabla\!\cdot\mathbf{V}$，在八叉树上解完，取采样点处 $\chi$ 的平均值做等值面，再用 Marching Cubes 抽出来。结果天然水密，但缺数据的地方会被「吹气球」似地封起来；法向朝向不一致会整片翻错。Screened Poisson（2013）加了让曲面贴近输入点的项，现在 Open3D、MeshLab 里的实现都是它。</p>
+
+  <h3>网格 → 点云</h3>
+  <p>先按面积 $A_f$ 成比例地选三角形，再在三角形里均匀取点（$r_1,r_2\sim U(0,1)$，开方是为了面积均匀而不是往顶点 $\mathbf{v}_0$ 扎堆）：</p>
+  <div class="eq">$$P(f)=\frac{A_f}{\sum_{g}A_g},\qquad \mathbf{p}=(1-\sqrt{r_1})\,\mathbf{v}_0+\sqrt{r_1}(1-r_2)\,\mathbf{v}_1+\sqrt{r_1}\,r_2\,\mathbf{v}_2$$</div>
+  <p>在第一张图切到「点云」，再选「每个三角形等概率」：杯沿和把手的三角形小而密，点就扎堆在那里，读数里把手上的点占比会远高于它的面积占比。</p>
+</section>
+
+<section id="choose">
+  <h2>什么任务用什么</h2>
+  <div class="tbl"><table>
+    <thead><tr><th>任务</th><th>常用表征</th><th>原因</th><th>例子</th></tr></thead>
+    <tbody>
+      <tr><td>策略输入</td><td>点云（几百到几千点）、体素，或多视角 RGB</td><td>点坐标就是度量空间里的位置，对视角、背景变化鲁棒；体素能做 3D 卷积，但分辨率受内存限制</td><td>DP3：512 / 1024 点、不用颜色；PerAct：$100^3$ 体素；RVT：把点云重渲染到几个虚拟视角；3D Diffuser Actor：带 2D 特征的 3D 点</td></tr>
+      <tr><td>抓取检测</td><td>点云</td><td>6-DoF 抓取由局部几何决定</td><td>Contact-GraspNet（ICRA 2021）</td></tr>
+      <tr><td>碰撞检测 / 运动规划</td><td>机器人：一串球或凸包；环境：占据栅格 / 八叉树、ESDF、网格或长方体</td><td>需要快速回答「在不在里面、离多远、往哪推」</td><td>MoveIt + OctoMap；cuRobo：机器人是球，世界是长方体、网格或 nvblox 从深度图建的 ESDF</td></tr>
+      <tr><td>仿真资产</td><td>visual mesh + 凸包 / 凸分解的 collision mesh；惯量从水密网格算</td><td>接触检测假设凸体</td><td>MuJoCo、Isaac Sim、SAPIEN；凸分解用 CoACD</td></tr>
+      <tr><td>新视角渲染 / 真实场景进仿真</td><td>3DGS（实时）、NeRF</td><td>外观逼真；几何不准，碰撞要另配网格</td><td>用照片重建桌面背景，叠加仿真物体</td></tr>
+      <tr><td>3D 生成</td><td>结构化潜空间：稀疏体素 + 局部潜变量、向量集、三平面；最后解码成网格或 3DGS</td><td>规则的潜空间方便扩散 / 流匹配模型</td><td>TRELLIS（稀疏体素）、Hunyuan3D 2.0（向量集）、EG3D（三平面）；见 <a href="../3d-foundation-models/">3D 基础模型</a></td></tr>
+      <tr><td>建图（导航、移动操作）</td><td>2D 占据栅格、OctoMap、TSDF / ESDF、点云或面元、3DGS 地图</td><td>能增量更新，能快速查询</td><td>见 <a href="../slam/">SLAM</a></td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="quiz">
+  <h2>自测</h2>
+  <details class="q"><summary>稠密 TSDF（每格 8 B）从 $256^3$ 提到 $512^3$，内存从多少变成多少？只存表面 ±4 格的稀疏 TSDF 呢？</summary><div><p>稠密：$256^3\times 8\,\text{B}\approx 134\,\text{MB}$ → $512^3\times8\,\text{B}\approx 1.07\,\text{GB}$，×8。稀疏版本只和表面积成正比，×4。</p></div></details>
+  <details class="q"><summary>为什么 PointNet 用 max 聚合，而不是把所有点的特征按顺序拼起来接 MLP？</summary><div><p>点云是集合，存储顺序没有意义。拼接后的输出依赖顺序，同一个物体换个顺序就得到不同结果；逐维 max 对任意排列都给同一个值。</p></div></details>
+  <details class="q"><summary>TSDF 融合时，为什么表面后方超过 $\mu$ 的体素不更新？</summary><div><p>那里被表面挡住，这一帧没有看到它们是空还是实。若写入负值，物体背面、薄壁另一侧的观测就会被这一帧错误覆盖。</p></div></details>
+  <details class="q"><summary>把杯子的视觉 mesh 直接作为 MuJoCo 的碰撞 mesh，会发生什么？</summary><div><p>MuJoCo 自动取它的凸包，杯口和把手孔被封上：放不进东西，也勾不住把手。要先做凸分解（如 CoACD），每块作为一个 geom。</p></div></details>
+  <details class="q"><summary>NeRF 一条射线上 $\sum_i w_i=0.6$，说明什么？</summary><div><p>光有 $T_{N+1}=0.4$ 的概率穿过整条射线没被挡住，像素颜色里 40% 来自背景。训练时背景色的设定会影响这类射线上学到的密度。</p></div></details>
+  <details class="q"><summary>3DGS 的 $\Sigma'=JW\Sigma W^\top J^\top$ 是精确的吗？</summary><div><p>不是。透视投影非线性，高斯投影后不再是高斯；$J$ 是在高斯中心的一阶近似。高斯离相机近、视场角大时误差明显，后续工作有专门修正。</p></div></details>
+  <details class="q"><summary>机器人近似成 20 个球，环境有 ESDF，怎么判断一个构型是否碰撞？</summary><div><p>正运动学算出每个球心 $\mathbf{c}_j$，查 $s(\mathbf{c}_j)$；只要有一个 $s(\mathbf{c}_j)\lt r_j$ 就碰撞。$\nabla s$ 还能给优化型规划器提供推离障碍的梯度。</p></div></details>
+  <details class="q"><summary>Marching Squares 中编码 5 为什么有歧义？</summary><div><p>编码 5 是左上和右下两个角在内、另外两个在外。等值线可以把两个内角连成一块，也可以把它们分开，只看角点无法区分；要额外看格子中心的值（或双线性插值的鞍点）。</p></div></details>
+</section>
+
+<section id="refs">
+  <h2>延伸阅读</h2>
+  <ol class="refs">
+    <li><b>Qi, Su, Mo, Guibas, PointNet: Deep Learning on Point Sets for 3D Classification and Segmentation</b>, CVPR 2017. <a href="https://arxiv.org/abs/1612.00593">arXiv:1612.00593</a></li>
+    <li><b>Qi, Yi, Su, Guibas, PointNet++: Deep Hierarchical Feature Learning on Point Sets in a Metric Space</b>, NeurIPS 2017. <a href="https://arxiv.org/abs/1706.02413">arXiv:1706.02413</a></li>
+    <li><b>Ze et al., 3D Diffusion Policy: Generalizable Visuomotor Policy Learning via Simple 3D Representations</b>, RSS 2024. <a href="https://arxiv.org/abs/2403.03954">arXiv:2403.03954</a></li>
+    <li><b>Shridhar, Manuelli, Fox, Perceiver-Actor: A Multi-Task Transformer for Robotic Manipulation</b>, CoRL 2022. <a href="https://arxiv.org/abs/2209.05451">arXiv:2209.05451</a></li>
+    <li><b>Goyal et al., RVT: Robotic View Transformer for 3D Object Manipulation</b>, CoRL 2023. <a href="https://arxiv.org/abs/2306.14896">arXiv:2306.14896</a></li>
+    <li><b>Ke, Gkanatsios, Fragkiadaki, 3D Diffuser Actor: Policy Diffusion with 3D Scene Representations</b>, 2024. <a href="https://arxiv.org/abs/2402.10885">arXiv:2402.10885</a></li>
+    <li><b>Sundermeyer et al., Contact-GraspNet: Efficient 6-DoF Grasp Generation in Cluttered Scenes</b>, ICRA 2021. <a href="https://arxiv.org/abs/2103.14127">arXiv:2103.14127</a></li>
+    <li><b>Lorensen, Cline, Marching Cubes: A High Resolution 3D Surface Construction Algorithm</b>, SIGGRAPH 1987.</li>
+    <li><b>Curless, Levoy, A Volumetric Method for Building Complex Models from Range Images</b>, SIGGRAPH 1996.</li>
+    <li><b>Newcombe et al., KinectFusion: Real-Time Dense Surface Mapping and Tracking</b>, ISMAR 2011.</li>
+    <li><b>Nießner, Zollhöfer, Izadi, Stamminger, Real-time 3D Reconstruction at Scale using Voxel Hashing</b>, ACM TOG (SIGGRAPH Asia) 2013.</li>
+    <li><b>Hornung et al., OctoMap: An Efficient Probabilistic 3D Mapping Framework Based on Octrees</b>, Autonomous Robots 2013. <a href="https://github.com/OctoMap/octomap">GitHub</a></li>
+    <li><b>Oleynikova et al., Voxblox: Incremental 3D Euclidean Signed Distance Fields for On-Board MAV Planning</b>, IROS 2017. <a href="https://arxiv.org/abs/1611.03631">arXiv:1611.03631</a></li>
+    <li><b>Millane et al., nvblox: GPU-Accelerated Incremental Signed Distance Field Mapping</b>, 2023. <a href="https://arxiv.org/abs/2311.00626">arXiv:2311.00626</a> · <a href="https://github.com/nvidia-isaac/nvblox">GitHub</a></li>
+    <li><b>Sundaralingam et al., cuRobo: Parallelized Collision-Free Minimum-Jerk Robot Motion Generation</b>, 2023. <a href="https://arxiv.org/abs/2310.17274">arXiv:2310.17274</a> · <a href="https://github.com/NVlabs/curobo">GitHub</a></li>
+    <li><b>Kazhdan, Bolitho, Hoppe, Poisson Surface Reconstruction</b>, SGP 2006；<b>Kazhdan, Hoppe, Screened Poisson Surface Reconstruction</b>, ACM TOG 2013.</li>
+    <li><b>Park et al., DeepSDF: Learning Continuous Signed Distance Functions for Shape Representation</b>, CVPR 2019. <a href="https://arxiv.org/abs/1901.05103">arXiv:1901.05103</a></li>
+    <li><b>Mescheder et al., Occupancy Networks: Learning 3D Reconstruction in Function Space</b>, CVPR 2019. <a href="https://arxiv.org/abs/1812.03828">arXiv:1812.03828</a></li>
+    <li><b>Gropp et al., Implicit Geometric Regularization for Learning Shapes</b>, ICML 2020. <a href="https://arxiv.org/abs/2002.10099">arXiv:2002.10099</a></li>
+    <li><b>Mildenhall et al., NeRF: Representing Scenes as Neural Radiance Fields for View Synthesis</b>, ECCV 2020. <a href="https://arxiv.org/abs/2003.08934">arXiv:2003.08934</a></li>
+    <li><b>Müller, Evans, Schied, Keller, Instant Neural Graphics Primitives with a Multiresolution Hash Encoding</b>, ACM TOG (SIGGRAPH) 2022. <a href="https://arxiv.org/abs/2201.05989">arXiv:2201.05989</a></li>
+    <li><b>Zwicker, Pfister, van Baar, Gross, EWA Volume Splatting</b>, IEEE Visualization 2001.</li>
+    <li><b>Kerbl, Kopanas, Leimkühler, Drettakis, 3D Gaussian Splatting for Real-Time Radiance Field Rendering</b>, ACM TOG (SIGGRAPH) 2023. <a href="https://arxiv.org/abs/2308.04079">arXiv:2308.04079</a> · <a href="https://github.com/graphdeco-inria/gaussian-splatting">GitHub</a></li>
+    <li><b>Huang et al., 2D Gaussian Splatting for Geometrically Accurate Radiance Fields</b>, SIGGRAPH 2024. <a href="https://arxiv.org/abs/2403.17888">arXiv:2403.17888</a></li>
+    <li><b>Wei, Liu, Ling, Su, Approximate Convex Decomposition for 3D Meshes with Collision-Aware Concavity and Tree Search</b>（CoACD）, ACM TOG (SIGGRAPH) 2022. <a href="https://arxiv.org/abs/2205.02961">arXiv:2205.02961</a> · <a href="https://github.com/SarahWeiii/CoACD">GitHub</a></li>
+    <li><b>Xiang et al., Structured 3D Latents for Scalable and Versatile 3D Generation</b>（TRELLIS）, CVPR 2025. <a href="https://arxiv.org/abs/2412.01506">arXiv:2412.01506</a></li>
+  </ol>
+</section>
+
+</main>
+</div>
+
+<!-- v4u:foot -->
+<footer class="v4u-foot"><div class="v4u-foot-in"><a class="pv" href="../camera/"><span>上一篇</span>相机模型与标定</a><a class="nx" href="../slam/"><span>下一篇</span>SLAM</a></div></footer>
+<!-- /v4u:foot -->
+
+<script>
+V4U.ready(() => {
+  const $ = (id) => document.getElementById(id);
+  const C = (n) => V4U.css(n);
+  const fmt = V4U.fmt;
+  /* ---------- colour helpers: every colour comes from a CSS token ---------- */
+  const parseCol = (s) => {
+    s = (s || '').trim();
+    if (s[0] === '#') {
+      if (s.length === 4) s = '#' + s[1] + s[1] + s[2] + s[2] + s[3] + s[3];
+      return [parseInt(s.slice(1, 3), 16), parseInt(s.slice(3, 5), 16), parseInt(s.slice(5, 7), 16)];
+    }
+    const m = s.match(/[\d.]+/g); return m ? m.slice(0, 3).map(Number) : [128, 128, 128];
+  };
+  const RGB = (n) => parseCol(C(n));
+  const rgba = (c, a = 1) => `rgba(${c[0] | 0},${c[1] | 0},${c[2] | 0},${a})`;
+  const mixc = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+  const rng = (seed) => () => { seed |= 0; seed = (seed + 0x6D2B79F5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  const gauss = (r) => Math.sqrt(-2 * Math.log(Math.max(1e-12, r()))) * Math.cos(2 * Math.PI * r());
+  const fmtB = (b) => b < 1e3 ? b.toFixed(0) + ' B' : b < 1e6 ? (b / 1e3).toFixed(1) + ' KB' : b < 1e9 ? (b / 1e6).toFixed(1) + ' MB' : (b / 1e9).toFixed(2) + ' GB';
+  /* ---------- small vector algebra ---------- */
+  const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+  const add = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+  const scl = (a, s) => [a[0] * s, a[1] * s, a[2] * s];
+  const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+  const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+  const nrm = (a) => { const n = Math.hypot(a[0], a[1], a[2]) || 1; return [a[0] / n, a[1] / n, a[2] / n]; };
+  const eyeOf = (v) => { const cp = Math.cos(v.pitch); return [v.target[0] + v.dist * cp * Math.cos(v.yaw), v.target[1] + v.dist * cp * Math.sin(v.yaw), v.target[2] + v.dist * Math.sin(v.pitch)]; };
+
+  /* ---------- the shared object: a mug (body + handle), as an SDF and as a mesh ---------- */
+  const MUG = { R: 0.4, H: 0.9, t: 0.06, tb: 0.06, hc: [0.4, 0, 0.47], ha: 0.2, hb: 0.05 };
+  const sdCylZ = (x, y, z, r, z0, z1) => { const dr = Math.hypot(x, y) - r, dz = Math.max(z0 - z, z - z1); return Math.min(Math.max(dr, dz), 0) + Math.hypot(Math.max(dr, 0), Math.max(dz, 0)); };
+  const sdMug = (x, y, z) => {
+    const { R, H, t, tb, hc, ha, hb } = MUG;
+    const body = Math.max(sdCylZ(x, y, z, R, 0, H), -sdCylZ(x, y, z, R - t, tb, H + 1));
+    const tor = Math.hypot(Math.hypot(x - hc[0], z - hc[2]) - ha, y) - hb;
+    return Math.min(body, Math.max(tor, (R - t * 0.5) - x));
+  };
+  function addGrid(M, nu, nv, f, wu, wv, g) {
+    const base = M.V.length, cu = wu ? nu : nu + 1, cvn = wv ? nv : nv + 1;
+    for (let i = 0; i < cu; i++) for (let j = 0; j < cvn; j++) { const r = f(i / nu, j / nv); M.V.push(r.p); M.N.push(r.n); }
+    const id = (i, j) => base + (i % cu) * cvn + (j % cvn);
+    for (let i = 0; i < nu; i++) for (let j = 0; j < nv; j++) {
+      const a = id(i, j), b = id(i + 1, j), c = id(i + 1, j + 1), d = id(i, j + 1);
+      M.F.push([a, b, c], [a, c, d]); M.G.push(g, g);
+    }
+  }
+  function addFan(M, n, r, z, nz, g) {
+    const c = M.V.length; M.V.push([0, 0, z]); M.N.push([0, 0, nz]);
+    for (let i = 0; i < n; i++) { const a = (i / n) * 2 * Math.PI; M.V.push([r * Math.cos(a), r * Math.sin(a), z]); M.N.push([0, 0, nz]); }
+    for (let i = 0; i < n; i++) { M.F.push([c, c + 1 + i, c + 1 + ((i + 1) % n)]); M.G.push(g); }
+  }
+  function mugMesh(n) {
+    const { R, H, t, tb, hc, ha, hb } = MUG, TAU = 2 * Math.PI;
+    const M = { V: [], N: [], F: [], G: [] };
+    const nz = Math.max(2, Math.round(n / 3));
+    addGrid(M, n, nz, (u, v) => { const a = u * TAU; return { p: [R * Math.cos(a), R * Math.sin(a), v * H], n: [Math.cos(a), Math.sin(a), 0] }; }, true, false, 0);
+    addGrid(M, n, nz, (u, v) => { const a = u * TAU, r = R - t; return { p: [r * Math.cos(a), r * Math.sin(a), tb + v * (H - tb)], n: [-Math.cos(a), -Math.sin(a), 0] }; }, true, false, 0);
+    addGrid(M, n, 1, (u, v) => { const a = u * TAU, r = R - t + v * t; return { p: [r * Math.cos(a), r * Math.sin(a), H], n: [0, 0, 1] }; }, true, false, 0);
+    addFan(M, n, R - t, tb, 1, 0);
+    addFan(M, n, R, 0, -1, 0);
+    const nu = Math.max(4, Math.round(n * 0.6)), nv = Math.max(5, Math.round(n / 2)), u0 = -Math.PI / 2 - 0.12, u1 = Math.PI / 2 + 0.12;
+    addGrid(M, nu, nv, (u, v) => {
+      const U = u0 + u * (u1 - u0), A = v * TAU, ca = Math.cos(A), sa = Math.sin(A), rr = ha + hb * ca;
+      return { p: [hc[0] + rr * Math.cos(U), hb * sa, hc[2] + rr * Math.sin(U)], n: [ca * Math.cos(U), sa, ca * Math.sin(U)] };
+    }, false, true, 1);
+    M.FC = []; M.FA = []; M.FN = [];
+    for (const [a, b, c] of M.F) {
+      const A = M.V[a], B = M.V[b], Cc = M.V[c];
+      M.FC.push(scl(add(add(A, B), Cc), 1 / 3));
+      M.FA.push(0.5 * Math.hypot(...cross(sub(B, A), sub(Cc, A))));
+      M.FN.push(nrm(add(add(M.N[a], M.N[b]), M.N[c])));
+    }
+    return M;
+  }
+  function samplePts(M, K, byArea, seed) {
+    const r = rng(seed), cdf = []; let s = 0;
+    for (let f = 0; f < M.F.length; f++) { s += byArea ? M.FA[f] : 1; cdf.push(s); }
+    const out = [];
+    for (let k = 0; k < K; k++) {
+      const x = r() * s; let lo = 0, hi = cdf.length - 1;
+      while (lo < hi) { const mid = (lo + hi) >> 1; if (cdf[mid] < x) lo = mid + 1; else hi = mid; }
+      const [a, b, c] = M.F[lo], r1 = Math.sqrt(r()), r2 = r();
+      const p = add(add(scl(M.V[a], 1 - r1), scl(M.V[b], r1 * (1 - r2))), scl(M.V[c], r1 * r2));
+      out.push({ p, n: M.FN[lo], g: M.G[lo] });
+    }
+    return out;
+  }
+  const march = (sdf, o, d, tmax) => {
+    let t = 0;
+    for (let i = 0; i < 160; i++) { const p = add(o, scl(d, t)), s = sdf(p[0], p[1], p[2]); if (s < 4e-4) return t; t += s; if (t > tmax) return -1; }
+    return -1;
+  };
+  const lookAt = (eye, tgt) => { const f = nrm(sub(tgt, eye)), r = nrm(cross(f, [0, 0, 1])), u = cross(r, f); return { f, r, u }; };
+  /* marching squares on a grid of values val[j][i] (rows j); returns segments in grid coords */
+  function msSegments(val, nx, ny, ok, lin = true) {
+    const segs = [];
+    for (let j = 0; j < ny - 1; j++) for (let i = 0; i < nx - 1; i++) {
+      if (ok && !(ok(i, j) && ok(i + 1, j) && ok(i + 1, j + 1) && ok(i, j + 1))) continue;
+      const P = [[i, j], [i + 1, j], [i + 1, j + 1], [i, j + 1]], v = P.map(([a, b]) => val[b][a]);
+      const ins = v.map((x) => x < 0);
+      const code = ins.reduce((s, b, k) => s + (b ? 1 << k : 0), 0);
+      if (code === 0 || code === 15) continue;
+      const ep = (k) => { const a = k, b = (k + 1) % 4, t = lin ? v[a] / (v[a] - v[b]) : 0.5; return [P[a][0] + t * (P[b][0] - P[a][0]), P[a][1] + t * (P[b][1] - P[a][1])]; };
+      const cuts = [0, 1, 2, 3].filter((k) => ins[k] !== ins[(k + 1) % 4]);
+      if (cuts.length === 2) segs.push([ep(cuts[0]), ep(cuts[1])]);
+      else {
+        const cin = (v[0] + v[1] + v[2] + v[3]) / 4 < 0;
+        for (let k = 0; k < 4; k++) if (ins[k] !== cin) segs.push([ep((k + 3) % 4), ep(k)]);
+      }
+    }
+    return segs;
+  }
+
+  /* =====================================================================
+     V1: one mug, seven representations
+     ===================================================================== */
+  (function () {
+    const cv = $('cv-rep'), rd = $('rd-rep'), sl = $('sl-res'), out = $('o-res'), sgSamp = $('sg-samp');
+    let mode = 'mesh', samp = 'area';
+    const cache = {};
+    const get = (k, fn) => cache[k] || (cache[k] = fn());
+    const LV = { depth: [[12, 9], [20, 15], [32, 24], [48, 36], [64, 48]], pts: [256, 512, 1024, 2048, 4096], vox: [8, 12, 16, 24, 32], mesh: [6, 10, 16, 24, 40], sdf: [12, 20, 32, 48, 64], nerf: [10, 14, 18, 24, 30], gs: [64, 128, 256, 512, 1024] };
+    const fine = () => get('fine', () => mugMesh(48));
+    const BOX = { o: [-0.425, -0.55, -0.1], L: 1.1 };
+    const DCAM = { eye: [-1.9, -1.5, 1.35], tgt: [0.12, 0, 0.42], fov: 30 };
+    const depthImg = (W, H) => get('d' + W, () => {
+      const B = lookAt(DCAM.eye, DCAM.tgt), fpx = (H / 2) / Math.tan((DCAM.fov * Math.PI) / 360), px = [];
+      for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) {
+        const x = (i + 0.5 - W / 2) / fpx, y = -(j + 0.5 - H / 2) / fpx;
+        const d = nrm(add(add(B.f, scl(B.r, x)), scl(B.u, y))), t = march(sdMug, DCAM.eye, d, 6);
+        px.push(t < 0 ? null : { p: add(DCAM.eye, scl(d, t)), z: t * dot(d, B.f) });
+      }
+      const zs = px.filter(Boolean).map((q) => q.z);
+      return { W, H, B, fpx, px, zmin: Math.min(...zs), zmax: Math.max(...zs) };
+    });
+    const voxels = (N) => get('v' + N, () => {
+      const s = BOX.L / N, occ = new Uint8Array(N * N * N), idx = (i, j, k) => (k * N + j) * N + i;
+      const offs = [-1 / 3, 0, 1 / 3];
+      let cnt = 0;
+      for (let k = 0; k < N; k++) for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+        const cx = BOX.o[0] + (i + 0.5) * s, cy = BOX.o[1] + (j + 0.5) * s, cz = BOX.o[2] + (k + 0.5) * s;
+        let hit = false;
+        for (const a of offs) { for (const b of offs) { for (const c of offs) if (sdMug(cx + a * s, cy + b * s, cz + c * s) < 0) { hit = true; break; } if (hit) break; } if (hit) break; }
+        if (hit) { occ[idx(i, j, k)] = 1; cnt++; }
+      }
+      const faces = [], dirs = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+      const isOcc = (i, j, k) => i >= 0 && j >= 0 && k >= 0 && i < N && j < N && k < N && occ[idx(i, j, k)];
+      for (let k = 0; k < N; k++) for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+        if (!occ[idx(i, j, k)]) continue;
+        for (const d of dirs) {
+          if (isOcc(i + d[0], j + d[1], k + d[2])) continue;
+          const c = [BOX.o[0] + (i + 0.5 + d[0] / 2) * s, BOX.o[1] + (j + 0.5 + d[1] / 2) * s, BOX.o[2] + (k + 0.5 + d[2] / 2) * s];
+          const ax = d[0] ? 0 : d[1] ? 1 : 2, u = [0, 0, 0], v = [0, 0, 0];
+          u[(ax + 1) % 3] = s / 2; v[(ax + 2) % 3] = s / 2;
+          faces.push({ c, n: d, q: [sub(sub(c, u), v), sub(add(c, u), v), add(add(c, u), v), add(sub(c, u), v)] });
+        }
+      }
+      return { N, cnt, faces };
+    });
+    const sdfSlice = (M) => get('s' + M, () => {
+      const x0 = -0.6, z0 = -0.2, L = 1.4, h = L / M, val = [];
+      for (let j = 0; j <= M; j++) { const row = []; for (let i = 0; i <= M; i++) row.push(sdMug(x0 + i * h, 0, z0 + j * h)); val.push(row); }
+      return { M, x0, z0, L, h, val, segs: msSegments(val, M + 1, M + 1, null, true) };
+    });
+    const density = (G) => get('n' + G, () => {
+      const s = BOX.L / G, beta = 0.02, pts = [], jr = rng(G);
+      for (let k = 0; k < G; k++) for (let j = 0; j < G; j++) for (let i = 0; i < G; i++) {
+        const p = [BOX.o[0] + (i + 0.2 + 0.6 * jr()) * s, BOX.o[1] + (j + 0.2 + 0.6 * jr()) * s, BOX.o[2] + (k + 0.2 + 0.6 * jr()) * s];
+        const sig = (1 / beta) / (1 + Math.exp(sdMug(...p) / beta)), a = 1 - Math.exp(-sig * s);
+        if (a > 0.03) pts.push({ p, a });
+      }
+      return { G, s, pts };
+    });
+    const gaussians = (K) => get('g' + K, () => {
+      const M = fine(), tot = M.FA.reduce((a, b) => a + b, 0), st = Math.sqrt(tot / K) * 0.36, sn = 0.006;
+      return samplePts(M, K, true, 11).map(({ p, n }) => {
+        let t1 = cross(n, [0, 0, 1]); if (Math.hypot(...t1) < 0.1) t1 = cross(n, [1, 0, 0]); t1 = nrm(t1);
+        const t2 = cross(n, t1), S = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+        for (let a = 0; a < 3; a++) for (let b = 0; b < 3; b++) S[a][b] = st * st * (t1[a] * t1[b] + t2[a] * t2[b]) + sn * sn * n[a] * n[b];
+        return { p, S, n };
+      });
+    });
+
+    let O = null;
+    O = V4U.orbit3d(cv, { height: (w) => Math.round(Math.min(430, Math.max(300, w * 0.6))), yaw: -1.2, pitch: 0.42, dist: 2.9, target: [0.12, 0, 0.42], fov: 36 }, (ctx, P, w, h) => {
+      const lv = +sl.value; out.textContent = (lv + 1) + '/5';
+      const eye = eyeOf(O ? O.view : { yaw: -1.2, pitch: 0.42, dist: 2.9, target: [0.12, 0, 0.42] });
+      const surf = C('--surface'), line = C('--line');
+      let read = '';
+      if (mode === 'depth') {
+        const [W, H] = LV.depth[lv], D = depthImg(W, H), B = D.B, zi = 0.9;
+        const near = RGB('--c2'), far = RGB('--c1');
+        const col = (z) => rgba(mixc(near, far, (z - D.zmin) / (D.zmax - D.zmin + 1e-9)));
+        const pl = (x, y) => add(DCAM.eye, scl(add(add(B.f, scl(B.r, x / D.fpx)), scl(B.u, -y / D.fpx)), zi));
+        const surf2 = C('--surface-2');
+        for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) {
+          const q = D.px[j * W + i], x = i - W / 2, y = j - H / 2;
+          P.poly([pl(x, y), pl(x + 1, y), pl(x + 1, y + 1), pl(x, y + 1)], q ? col(q.z) : surf2, null);
+        }
+        const ink2 = C('--ink-2');
+        for (const [x, y] of [[-W / 2, -H / 2], [W / 2, -H / 2], [W / 2, H / 2], [-W / 2, H / 2]]) P.line(DCAM.eye, pl(x, y), ink2, 1);
+        P.poly([pl(-W / 2, -H / 2), pl(W / 2, -H / 2), pl(W / 2, H / 2), pl(-W / 2, H / 2)], null, ink2, 1);
+        const pr = Math.max(1.4, 4.2 - lv * 0.7);
+        let n = 0;
+        for (const q of D.px) if (q) { P.point(q.p, pr, col(q.z)); n++; }
+        read = `<span>深度图 <b>${W}×${H}</b></span><span>命中杯子的像素 <b>${n}</b></span><span>uint16（mm）存储 <b>${fmtB(W * H * 2)}</b></span><span>只看到朝相机的一面</span>`;
+      } else if (mode === 'pts') {
+        const K = LV.pts[lv], pts = get('p' + K + samp, () => samplePts(fine(), K, samp === 'area', 3)), c1 = C('--c1');
+        const ds = pts.map((q) => P.depth(q.p)), dmin = Math.min(...ds), dmax = Math.max(...ds);
+        const pr = Math.max(1.1, 2.6 - lv * 0.35);
+        ctx.fillStyle = c1;
+        pts.forEach((q, k) => { const A = P.project(q.p); if (!A) return; ctx.globalAlpha = 0.95 - 0.6 * (ds[k] - dmin) / (dmax - dmin + 1e-9); ctx.beginPath(); ctx.arc(A.x, A.y, pr, 0, 2 * Math.PI); ctx.fill(); });
+        ctx.globalAlpha = 1;
+        const M = fine(), tot = M.FA.reduce((a, b) => a + b, 0), hArea = M.FA.reduce((a, b, f) => a + (M.G[f] ? b : 0), 0);
+        const onH = pts.filter((q) => q.g === 1).length;
+        read = `<span>N = <b>${K}</b> 点</span><span>N×3×4 B = <b>${fmtB(K * 12)}</b></span><span>落在把手上的点 <b>${(100 * onH / K).toFixed(1)}%</b></span><span>把手面积占比 <b>${(100 * hArea / tot).toFixed(1)}%</b></span>`;
+      } else if (mode === 'vox') {
+        const V = voxels(LV.vox[lv]), c = RGB('--c2');
+        const fs = V.faces.filter((f) => dot(f.n, sub(eye, f.c)) > 0).map((f) => ({ f, d: P.depth(f.c) })).sort((a, b) => b.d - a.d);
+        const lw = V.N > 20 ? 0.6 : 1;
+        for (const { f } of fs) {
+          const sh = 0.3 + 0.65 * Math.abs(dot(f.n, nrm(sub(eye, f.c))));
+          P.poly(f.q, surf, null);
+          P.poly(f.q, rgba(c, sh), surf, lw);
+        }
+        const N = V.N;
+        read = `<span>${N}³ = <b>${N * N * N}</b> 格</span><span>占据 <b>${V.cnt}</b>（${(100 * V.cnt / N ** 3).toFixed(1)}%）</span><span>1 bit/格 <b>${fmtB(N ** 3 / 8)}</b></span><span>float/格 <b>${fmtB(N ** 3 * 4)}</b></span><span>体素边长 <b>${(BOX.L / N * 100).toFixed(1)} cm</b></span>`;
+      } else if (mode === 'mesh') {
+        const M = get('m' + LV.mesh[lv], () => mugMesh(LV.mesh[lv])), c = RGB('--c3');
+        const fs = [];
+        for (let f = 0; f < M.F.length; f++) { const vv = sub(eye, M.FC[f]); if (dot(M.FN[f], vv) > 0) fs.push({ f, d: P.depth(M.FC[f]), sh: Math.abs(dot(M.FN[f], nrm(vv))) }); }
+        fs.sort((a, b) => b.d - a.d);
+        for (const { f, sh } of fs) {
+          const q = M.F[f].map((k) => M.V[k]);
+          P.poly(q, surf, null);
+          P.poly(q, rgba(c, 0.25 + 0.65 * sh), surf, 0.7);
+        }
+        const nv = M.V.length, nf = M.F.length;
+        read = `<span>顶点 <b>${nv}</b></span><span>三角面 <b>${nf}</b></span><span>12 B/顶点 + 12 B/面 = <b>${fmtB(12 * nv + 12 * nf)}</b></span>`;
+      } else if (mode === 'sdf') {
+        const M0 = get('m16', () => mugMesh(16)), S = sdfSlice(LV.sdf[lv]), cIn = RGB('--c2'), cOut = RGB('--c1');
+        for (let f = 0; f < M0.F.length; f++) { if (dot(M0.FN[f], sub(eye, M0.FC[f])) <= 0) continue; const q = M0.F[f].map((k) => M0.V[k]); P.poly(q, null, line, 0.6); }
+        const W3 = (i, j) => [S.x0 + i * S.h, 0, S.z0 + j * S.h];
+        for (let j = 0; j < S.M; j++) for (let i = 0; i < S.M; i++) {
+          const s = sdMug(S.x0 + (i + 0.5) * S.h, 0, S.z0 + (j + 0.5) * S.h), band = Math.floor(Math.abs(s) / 0.05) % 2;
+          const a = (0.12 + 0.6 * Math.max(0, 1 - Math.abs(s) / 0.55)) * (band ? 0.7 : 1);
+          P.poly([W3(i, j), W3(i + 1, j), W3(i + 1, j + 1), W3(i, j + 1)], rgba(s < 0 ? cIn : cOut, a), null);
+        }
+        P.poly([W3(0, 0), W3(S.M, 0), W3(S.M, S.M), W3(0, S.M)], null, C('--ink-2'), 1);
+        const ink = C('--ink');
+        for (const [a, b] of S.segs) P.line(W3(a[0], a[1]), W3(b[0], b[1]), ink, 2.2);
+        read = `<span>切面 y = 0 上 <b>${S.M}×${S.M}</b> 个格子</span><span>整个体积 ${S.M}³ 个 float = <b>${fmtB(S.M ** 3 * 4)}</b></span><span>零等值面 = 杯子表面</span>`;
+      } else if (mode === 'nerf') {
+        const Dn = density(LV.nerf[lv]), c = RGB('--c4'), pr = Math.max(1.2, 3.6 - lv * 0.55);
+        for (const q of Dn.pts) { const A = P.project(q.p); if (!A) continue; ctx.fillStyle = rgba(c, Math.min(0.9, q.a)); ctx.beginPath(); ctx.arc(A.x, A.y, pr, 0, 2 * Math.PI); ctx.fill(); }
+        read = `<span>在 <b>${Dn.G}³</b> 个格点上查询 σ(x)</span><span>不透明度 &gt; 0.03 的点 <b>${Dn.pts.length}</b></span><span>表面附近密度最大，内外都趋于 0</span>`;
+      } else if (mode === 'gs') {
+        const Gs = gaussians(LV.gs[lv]), c = RGB('--c5'), hh = 1e-3;
+        const list = [];
+        for (const g of Gs) {
+          const A = P.project(g.p); if (!A) continue;
+          const J = [0, 1, 2].map((k) => { const e = [0, 0, 0]; e[k] = hh; const B = P.project(add(g.p, e)); return [(B.x - A.x) / hh, (B.y - A.y) / hh]; });
+          let a = 0, b = 0, d = 0;
+          for (let p = 0; p < 3; p++) for (let q = 0; q < 3; q++) { a += J[p][0] * g.S[p][q] * J[q][0]; b += J[p][0] * g.S[p][q] * J[q][1]; d += J[p][1] * g.S[p][q] * J[q][1]; }
+          const tr = (a + d) / 2, det = Math.sqrt(Math.max(0, ((a - d) / 2) ** 2 + b * b)), l1 = tr + det, l2 = Math.max(tr - det, 0.25), ang = 0.5 * Math.atan2(2 * b, a - d);
+          list.push({ x: A.x, y: A.y, r1: 2 * Math.sqrt(l1), r2: 2 * Math.sqrt(l2), ang, d: A.d, sh: Math.abs(dot(g.n, nrm(sub(eye, g.p)))) });
+        }
+        list.sort((p, q) => q.d - p.d);
+        const bgc = RGB('--surface');
+        for (const e of list) {
+          const col = mixc(bgc, c, 0.15 + 0.85 * e.sh);
+          ctx.save(); ctx.translate(e.x, e.y); ctx.rotate(e.ang); ctx.scale(Math.max(0.8, e.r1), Math.max(0.8, e.r2));
+          const gr = ctx.createRadialGradient(0, 0, 0, 0, 0, 1);
+          gr.addColorStop(0, rgba(col, 0.92)); gr.addColorStop(0.5, rgba(col, 0.6)); gr.addColorStop(1, rgba(col, 0));
+          ctx.fillStyle = gr; ctx.beginPath(); ctx.arc(0, 0, 1, 0, 2 * Math.PI); ctx.fill(); ctx.restore();
+        }
+        const K = Gs.length;
+        read = `<span>高斯 <b>${K}</b> 个</span><span>59 float/个 = <b>${fmtB(K * 236)}</b></span><span>投影协方差 Σ′ = JΣJᵀ（J 由投影数值求导）</span>`;
+      }
+      rd.innerHTML = read;
+    });
+    V4U.seg($('sg-rep'), (v) => {
+      mode = v; sgSamp.hidden = v !== 'pts';
+      if (O) { const d = v === 'depth'; O.view.dist = d ? 4.6 : 2.9; O.view.yaw = d ? -1.95 : -1.2; O.view.target = d ? [-0.7, -0.55, 0.62] : [0.12, 0, 0.42]; O.redraw(); }
+    });
+    V4U.seg(sgSamp, (v) => { samp = v; O && O.redraw(); });
+    sl.addEventListener('input', () => O.redraw());
+    O.redraw();
+  })();
+
+  /* =====================================================================
+     V2: depth image -> point cloud (mug on a table), flying pixels
+     ===================================================================== */
+  (function () {
+    const cv = $('cv-lift'), rd = $('rd-lift'), sl = $('sl-lift'), out = $('o-lift');
+    const sdScene = (x, y, z) => Math.min(sdMug(x, y, z), z);
+    const W = 48, H = 36, E = [0.95, -1.2, 1.75], T = [0.15, 0, 0.35], B = lookAt(E, T), fpx = (H / 2) / Math.tan((38 * Math.PI) / 360), zImg = 0.5;
+    const ray = (x, y) => add(add(B.f, scl(B.r, x)), scl(B.u, y)); // z-component (along f) = 1
+    const zAt = (px, py) => { const d = ray((px - W / 2) / fpx, -(py - H / 2) / fpx), dn = nrm(d), t = march(sdScene, E, dn, 9); return t < 0 ? 9 : t * dot(dn, B.f); };
+    const ideal = [], mixed = [], edge = [];
+    for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) {
+      ideal.push(zAt(i + 0.5, j + 0.5));
+      const sub4 = [zAt(i + 0.25, j + 0.25), zAt(i + 0.75, j + 0.25), zAt(i + 0.25, j + 0.75), zAt(i + 0.75, j + 0.75)];
+      const mx = Math.max(...sub4), mn = Math.min(...sub4);
+      edge.push(mx - mn > 0.08);
+      mixed.push(mx - mn > 0.08 ? sub4.reduce((a, b) => a + b, 0) / 4 : ideal[ideal.length - 1]);
+    }
+    const nbBad = (Z, i, j) => { const z = Z[j * W + i]; for (const [a, b] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) { const ii = i + a, jj = j + b; if (ii < 0 || jj < 0 || ii >= W || jj >= H) continue; if (Math.abs(Z[jj * W + ii] - z) > 0.04 * z) return true; } return false; };
+    const zs = ideal, zmin = Math.min(...zs), zmax = Math.max(...zs);
+    const probe = [Math.round(W * 0.47), Math.round(H * 0.42)];
+    let fmode = 'fly';
+    const Rcam = [[B.r[0], -B.u[0], B.f[0]], [B.r[1], -B.u[1], B.f[1]], [B.r[2], -B.u[2], B.f[2]]];
+    const O = V4U.orbit3d(cv, { height: (w) => Math.round(Math.min(420, Math.max(300, w * 0.58))), yaw: -0.05, pitch: 0.5, dist: 4.0, target: [0.4, -0.45, 0.6], fov: 40 }, (ctx, P) => {
+      const s = +sl.value; out.textContent = fmt(s);
+      const near = RGB('--c5'), far = RGB('--c1'), bad = C('--bad'), ink = C('--ink'), ink2 = C('--ink-2');
+      const col = (z) => rgba(mixc(near, far, V4U.clamp((z - zmin) / (zmax - zmin), 0, 1)));
+      const pl = (x, y, z) => add(E, scl(ray(x / fpx, -y / fpx), z));
+      const Z = fmode === 'ideal' ? ideal : mixed;
+      for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) {
+        const x = i - W / 2, y = j - H / 2;
+        P.poly([pl(x, y, zImg), pl(x + 1, y, zImg), pl(x + 1, y + 1, zImg), pl(x, y + 1, zImg)], col(Z[j * W + i]), null);
+      }
+      for (const [x, y] of [[-W / 2, -H / 2], [W / 2, -H / 2], [W / 2, H / 2], [-W / 2, H / 2]]) P.line(E, pl(x, y, zImg), ink2, 1);
+      P.frame(E, Rcam, 0.3, 2);
+      const pts = [];
+      let nfly = 0, ndrop = 0;
+      for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) {
+        const k = j * W + i, z = Z[k];
+        if (fmode === 'filt' && nbBad(mixed, i, j)) { ndrop++; continue; }
+        const fly = fmode === 'fly' && edge[k];
+        if (fly) nfly++;
+        const zz = zImg + s * (z - zImg), p = pl(i + 0.5 - W / 2, j + 0.5 - H / 2, zz);
+        pts.push({ p, c: fly ? bad : col(z), r: fly ? 2.6 : 1.9, d: P.depth(p) });
+      }
+      pts.sort((a, b) => b.d - a.d);
+      for (const q of pts) P.point(q.p, q.r, q.c);
+      const [pi, pj] = probe, zp = Z[pj * W + pi], pp = pl(pi + 0.5 - W / 2, pj + 0.5 - H / 2, zImg + s * (zp - zImg));
+      const A = P.project(pp); if (A) { ctx.strokeStyle = ink; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(A.x, A.y, 6, 0, 2 * Math.PI); ctx.stroke(); }
+      const xn = (pi + 0.5 - W / 2) / fpx, yn = (pj + 0.5 - H / 2) / fpx;
+      rd.innerHTML = `<span>点数 <b>${pts.length}</b></span>` + (fmode === 'fly' ? `<span>飞点 <b>${nfly}</b></span>` : '') + (fmode === 'filt' ? `<span>剔除 <b>${ndrop}</b> 个像素</span>` : '') +
+        `<span>像素 (u,v) = (<b>${pi}</b>, <b>${pj}</b>)，D = <b>${fmt(zp)}</b> m</span><span>X<sub>c</sub> = (<b>${fmt(xn * zp)}</b>, <b>${fmt(yn * zp)}</b>, <b>${fmt(zp)}</b>) m</span>`;
+    });
+    V4U.seg($('sg-fly'), (v) => { fmode = v; O.redraw(); });
+    sl.addEventListener('input', O.redraw);
+    let anim = null;
+    $('bt-lift').addEventListener('click', (e) => {
+      if (anim) { anim.stop(); anim = null; e.target.textContent = '播放'; return; }
+      e.target.textContent = '暂停'; let t0 = 0;
+      anim = V4U.loop(cv, (t, dt) => { t0 += dt; sl.value = (Math.sin(t0 * 1.2 - Math.PI / 2) + 1) / 2; O.redraw(); });
+    });
+  })();
+
+  /* =====================================================================
+     V3: PointNet symmetric function
+     ===================================================================== */
+  (function () {
+    const cv = $('cv-pn'), rd = $('rd-pn');
+    const r = rng(5), K = 6, HID = 16;
+    const W1 = [...Array(HID)].map(() => [gauss(r) * 1.4, gauss(r) * 1.4]), b1 = [...Array(HID)].map(() => gauss(r) * 0.5);
+    const W2 = [...Array(K)].map(() => [...Array(HID)].map(() => gauss(r) * 0.45)), b2 = [...Array(K)].map(() => gauss(r) * 0.2);
+    const h = (p) => { const z = W1.map((w, i) => Math.max(0, w[0] * p[0] + w[1] * p[1] + b1[i])); return W2.map((w, k) => Math.max(0, w.reduce((s, x, i) => s + x * z[i], 0) + b2[k])); };
+    let pts = [[-0.7, -0.6], [-0.7, 0.1], [-0.7, 0.7], [-0.2, 0.7], [0.3, 0.6], [0.75, 0.2], [0.6, -0.5], [0.1, -0.7], [-0.2, -0.1], [0.25, 0.05]];
+    const n = pts.length;
+    const A = [...Array(n)].map(() => [...Array(3)].map(() => [...Array(K)].map(() => gauss(r) * 0.5)));
+    let order = [...Array(n).keys()], prevOrder = order.slice(), tween = 1, drag = -1, geo = null;
+    const comp = () => {
+      const F = pts.map(h), mx = [...Array(K)].map((_, k) => Math.max(...F.map((f) => f[k])));
+      const arg = mx.map((m, k) => F.findIndex((f) => f[k] === m));
+      const y = [0, 1, 2].map((o) => order.reduce((s, pi, row) => s + A[row][o].reduce((t, a, k) => t + a * F[pi][k], 0), 0));
+      return { F, mx, arg, y };
+    };
+    const y0 = comp().y;
+    const draw = V4U.canvas(cv, (w) => (w >= 560 ? 330 : 600), (ctx, w, hh) => {
+      const wide = w >= 560, R0 = comp(), c1 = RGB('--c1'), c2 = C('--c2'), c2r = RGB('--c2'), c4 = RGB('--c4'), ink = C('--ink'), ink2 = C('--ink-2'), line = C('--line'), mono = '12px ' + C('--f-mono');
+      // left: scatter
+      const sw = wide ? Math.min(w * 0.42, hh - 20) : Math.min(w - 20, 260), sx0 = wide ? 10 : (w - sw) / 2, sy0 = 10;
+      const S = (p) => [sx0 + (p[0] + 1) / 2 * sw, sy0 + (1 - (p[1] + 1) / 2) * sw];
+      geo = { S, sw, sx0, sy0 };
+      ctx.strokeStyle = line; ctx.lineWidth = 1; ctx.strokeRect(sx0, sy0, sw, sw);
+      const crit = new Set(R0.arg);
+      pts.forEach((p, i) => {
+        const [x, y] = S(p);
+        ctx.fillStyle = rgba(c1); ctx.beginPath(); ctx.arc(x, y, 6, 0, 2 * Math.PI); ctx.fill();
+        if (crit.has(i)) { ctx.strokeStyle = c2; ctx.lineWidth = 2.5; ctx.beginPath(); ctx.arc(x, y, 11, 0, 2 * Math.PI); ctx.stroke(); }
+        ctx.fillStyle = ink2; ctx.font = mono; ctx.fillText(String(i), x + 9, y - 8);
+      });
+      // right: feature matrix
+      const mx0 = wide ? sx0 + sw + 40 : 30, my0 = wide ? 14 : sw + 40, mw = w - mx0 - 10;
+      const cw = Math.min(34, (mw - 20) / K), rh = Math.min(22, ((wide ? hh : hh - my0) - 120) / (n + 3));
+      const vmax = Math.max(1e-6, ...R0.mx);
+      const pos = (pi) => { const a = prevOrder.indexOf(pi), b = order.indexOf(pi), e = tween < 1 ? (1 - Math.cos(Math.PI * tween)) / 2 : 1; return a + (b - a) * e; };
+      ctx.font = mono;
+      for (let pi = 0; pi < n; pi++) {
+        const yy = my0 + pos(pi) * rh;
+        ctx.fillStyle = ink2; ctx.textAlign = 'right'; ctx.fillText(String(pi), mx0 - 8, yy + rh * 0.72); ctx.textAlign = 'left';
+        for (let k = 0; k < K; k++) {
+          const v = R0.F[pi][k] / vmax;
+          ctx.fillStyle = rgba(c1, 0.08 + 0.88 * v); ctx.fillRect(mx0 + k * cw + 1, yy + 1, cw - 2, rh - 2);
+          if (R0.arg[k] === pi) { ctx.strokeStyle = c2; ctx.lineWidth = 2; ctx.strokeRect(mx0 + k * cw + 1, yy + 1, cw - 2, rh - 2); }
+        }
+      }
+      const yM = my0 + n * rh + 14;
+      ctx.fillStyle = ink; ctx.textAlign = 'right'; ctx.fillText('max', mx0 - 8, yM + rh * 0.72); ctx.textAlign = 'left';
+      for (let k = 0; k < K; k++) { ctx.fillStyle = rgba(c2r, 0.1 + 0.85 * R0.mx[k] / vmax); ctx.fillRect(mx0 + k * cw + 1, yM + 1, cw - 2, rh - 2); }
+      const yC = yM + rh + 18, ym = Math.max(1e-6, ...R0.y.map(Math.abs), ...y0.map(Math.abs));
+      ctx.fillStyle = ink; ctx.textAlign = 'right'; ctx.fillText('拼接', mx0 - 8, yC + rh * 0.72); ctx.textAlign = 'left';
+      for (let o = 0; o < 3; o++) {
+        const v = R0.y[o] / ym, x = mx0 + o * cw * 2, bw = cw * 2 - 2;
+        ctx.fillStyle = rgba(c4, 0.12); ctx.fillRect(x + 1, yC + 1, bw, rh - 2);
+        ctx.fillStyle = rgba(c4, 0.85); const mid = x + 1 + bw / 2; ctx.fillRect(Math.min(mid, mid + v * bw / 2), yC + 3, Math.abs(v * bw / 2), rh - 6);
+      }
+      rd.innerHTML = `<span>max 输出 = [<b>${R0.mx.map((v) => fmt(v)).join(', ')}</b>]</span><span>拼接 → 线性层 = [<b>${R0.y.map((v) => fmt(v)).join(', ')}</b>]</span><span>关键点 <b>${crit.size}</b> / ${n}</span><span>当前顺序 ${order.join(' ')}</span>`;
+    });
+    $('bt-shuf').addEventListener('click', () => {
+      prevOrder = order.slice();
+      const rr = rng((Date.now() & 0xffff) + 1), o = order.slice();
+      for (let i = o.length - 1; i > 0; i--) { const j = Math.floor(rr() * (i + 1)); [o[i], o[j]] = [o[j], o[i]]; }
+      order = o; tween = 0;
+      if (matchMedia('(prefers-reduced-motion: reduce)').matches) { tween = 1; draw(); return; }
+      const t0 = performance.now();
+      const step = (now) => { tween = Math.min(1, (now - t0) / 450); draw(); if (tween < 1) requestAnimationFrame(step); };
+      requestAnimationFrame(step);
+    });
+    V4U.drag(cv, (x, y, ph) => {
+      if (!geo) return;
+      if (ph === 'down') { drag = -1; let best = 16; pts.forEach((p, i) => { const [sx, sy] = geo.S(p); const d = Math.hypot(sx - x, sy - y); if (d < best) { best = d; drag = i; } }); }
+      if (drag >= 0 && ph !== 'up') { pts[drag] = [V4U.clamp(((x - geo.sx0) / geo.sw) * 2 - 1, -1, 1), V4U.clamp(1 - ((y - geo.sy0) / geo.sw) * 2, -1, 1)]; draw(); }
+      if (ph === 'up') drag = -1;
+    });
+    cv.style.touchAction = 'pan-y';
+  })();
+
+  /* =====================================================================
+     V4: memory vs resolution (log-log, to scale)
+     ===================================================================== */
+  (function () {
+    const cv = $('cv-mem'), rd = $('rd-mem'), sl = $('sl-mem'), out = $('o-mem');
+    const S = [
+      { k: '--c2', n: '稠密 TSDF', f: (N) => 8 * N ** 3 },
+      { k: '--c5', n: '稠密占据', f: (N) => N ** 3 / 8 },
+      { k: '--c4', n: '稀疏 TSDF', f: (N) => Math.PI * N * N * 8 * 8 },
+      { k: '--c3', n: '网格', f: (N) => 36 * Math.PI * N * N },
+      { k: '--c1', n: '点云', f: (N) => 12 * Math.PI * N * N },
+    ];
+    const draw = V4U.canvas(cv, (w) => Math.round(Math.min(360, Math.max(260, w * 0.55))), (ctx, w, h) => {
+      const N = Math.round(2 ** +sl.value); out.textContent = N;
+      const L = 54, Rm = 14, T = 12, Bm = 34, x0 = 5, x1 = 11, y0 = 3, y1 = 11;
+      const X = (lgN) => L + (lgN - x0) / (x1 - x0) * (w - L - Rm), Y = (lgB) => T + (1 - (lgB - y0) / (y1 - y0)) * (h - T - Bm);
+      const line = C('--line'), ink2 = C('--ink-2'), mono = '11.5px ' + C('--f-mono');
+      ctx.font = mono; ctx.lineWidth = 1;
+      const yl = { 3: '1 KB', 6: '1 MB', 9: '1 GB', 11: '100 GB' };
+      for (let e = y0; e <= y1; e++) { ctx.strokeStyle = line; ctx.beginPath(); ctx.moveTo(L, Y(e)); ctx.lineTo(w - Rm, Y(e)); ctx.stroke(); if (yl[e]) { ctx.fillStyle = ink2; ctx.textAlign = 'right'; ctx.fillText(yl[e], L - 6, Y(e) + 4); } }
+      for (let e = x0; e <= x1; e++) { ctx.strokeStyle = line; ctx.beginPath(); ctx.moveTo(X(e), T); ctx.lineTo(X(e), h - Bm); ctx.stroke(); ctx.fillStyle = ink2; ctx.textAlign = 'center'; ctx.fillText(String(2 ** e), X(e), h - Bm + 16); }
+      ctx.textAlign = 'center'; ctx.fillText('N', (L + w - Rm) / 2, h - 4);
+      // 32 GB line
+      const g = Math.log10(32e9); ctx.setLineDash([5, 4]); ctx.strokeStyle = C('--bad'); ctx.beginPath(); ctx.moveTo(L, Y(g)); ctx.lineTo(w - Rm, Y(g)); ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle = C('--bad'); ctx.textAlign = 'left'; ctx.fillText('32 GB', L + 6, Y(g) - 5);
+      ctx.save(); ctx.beginPath(); ctx.rect(L, T, w - L - Rm, h - T - Bm); ctx.clip();
+      for (const s of S) {
+        ctx.strokeStyle = C(s.k); ctx.lineWidth = 2.4; ctx.beginPath();
+        for (let lg = x0; lg <= x1 + 1e-9; lg += 0.05) { const v = Math.log10(s.f(2 ** lg)); lg === x0 ? ctx.moveTo(X(lg), Y(v)) : ctx.lineTo(X(lg), Y(v)); }
+        ctx.stroke();
+      }
+      ctx.restore();
+      const lx = X(Math.log2(N));
+      ctx.strokeStyle = C('--ink'); ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(lx, T); ctx.lineTo(lx, h - Bm); ctx.stroke();
+      for (const s of S) { const v = Math.log10(s.f(N)); if (v < y0 || v > y1) continue; ctx.fillStyle = C(s.k); ctx.beginPath(); ctx.arc(lx, Y(v), 4.5, 0, 2 * Math.PI); ctx.fill(); }
+      rd.innerHTML = S.map((s) => `<span>${s.n} <b>${fmtB(s.f(N))}</b></span>`).join('');
+    });
+    sl.addEventListener('input', draw);
+  })();
+
+  /* =====================================================================
+     V5: TSDF fusion in 2D (vertical section of the mug through the handle)
+     ===================================================================== */
+  (function () {
+    const cv = $('cv-tsdf'), rd = $('rd-tsdf'), slN = $('sl-noise'), slM = $('sl-mu');
+    const sd2 = (x, z) => sdMug(x, 0, z);
+    const G = 56, gx0 = -0.75, gz0 = -0.3, gL = 1.75, gs = gL / G;
+    const VX0 = -1.3, VZ0 = -0.85, VL = 2.85; // view square
+    const ctr = [0.12, 0.5], RAD = 1.3, FOV = (56 * Math.PI) / 180, NR = 80;
+    const angs = [70, 15, 125, 330, 180, 250, 100, 35].map((a) => (a * Math.PI) / 180);
+    let F, Wt, frames, lastRays = null, hover = null;
+    const truth = (() => { const M = 140, h = gL / M, val = []; for (let j = 0; j <= M; j++) { const row = []; for (let i = 0; i <= M; i++) row.push(sd2(gx0 + i * h, gz0 + j * h)); val.push(row); } return { M, h, segs: msSegments(val, M + 1, M + 1, null, true) }; })();
+    const march2 = (o, d) => { let t = 0; for (let i = 0; i < 200; i++) { const s = sd2(o[0] + d[0] * t, o[1] + d[1] * t); if (s < 3e-4) return t; t += s; if (t > 4) return -1; } return -1; };
+    const fuse = (k) => {
+      const a = angs[k % angs.length], cam = [ctr[0] + RAD * Math.cos(a), ctr[1] + RAD * Math.sin(a)], base = a + Math.PI;
+      const sig = +slN.value, mu = +slM.value, r = rng(101 + k * 7919), meas = [], rays = [];
+      for (let q = 0; q < NR; q++) {
+        const th = base + (q / (NR - 1) - 0.5) * FOV, d = [Math.cos(th), Math.sin(th)], t = march2(cam, d);
+        const m = t < 0 ? -1 : t + sig * gauss(r); meas.push(m); rays.push({ d, t: m });
+      }
+      for (let j = 0; j <= G; j++) for (let i = 0; i <= G; i++) {
+        const p = [gx0 + i * gs, gz0 + j * gs], v = [p[0] - cam[0], p[1] - cam[1]], rho = Math.hypot(v[0], v[1]);
+        let da = Math.atan2(v[1], v[0]) - base; da = Math.atan2(Math.sin(da), Math.cos(da));
+        if (Math.abs(da) > FOV / 2) continue;
+        const q = Math.round((da / FOV + 0.5) * (NR - 1)), m = meas[q];
+        if (m < 0) continue;
+        const eta = m - rho; if (eta < -mu) continue;
+        const psi = Math.min(1, eta / mu), id = j * (G + 1) + i;
+        F[id] = (Wt[id] * F[id] + psi) / (Wt[id] + 1); Wt[id] = Math.min(Wt[id] + 1, 64);
+      }
+      lastRays = { cam, rays, base };
+    };
+    const reset = (nf) => { F = new Float32Array((G + 1) ** 2); Wt = new Float32Array((G + 1) ** 2); frames = 0; lastRays = null; for (let k = 0; k < nf; k++) { fuse(k); frames++; } };
+    reset(3);
+    let geo = null;
+    const offc = document.createElement('canvas'); offc.width = G + 1; offc.height = G + 1;
+    const draw = V4U.canvas(cv, (w) => Math.round(Math.min(540, w * 0.95)), (ctx, w, h) => {
+      $('o-noise').textContent = (+slN.value).toFixed(3); $('o-mu').textContent = fmt(+slM.value);
+      const S = Math.min(w, h) / VL, ox = (w - VL * S) / 2;
+      const X = (x) => ox + (x - VX0) * S, Y = (z) => h - (z - VZ0) * S;
+      geo = { X, Y, S, ox, h };
+      const cP = RGB('--c1'), cN = RGB('--c2'), ink = C('--ink'), muted = C('--muted'), c5 = C('--c5'), line = C('--line');
+      ctx.strokeStyle = line; ctx.lineWidth = 1; ctx.strokeRect(X(gx0 - gs / 2), Y(gz0 + gL + gs / 2), (gL + gs) * S, (gL + gs) * S);
+      let obs = 0;
+      const bgc = RGB('--surface'), img = offc.getContext('2d').createImageData(G + 1, G + 1);
+      for (let j = 0; j <= G; j++) for (let i = 0; i <= G; i++) {
+        const id = j * (G + 1) + i, k = ((G - j) * (G + 1) + i) * 4;
+        let c = bgc;
+        if (Wt[id]) { obs++; const v = F[id], a = Math.abs(v) > 0.999 ? 0.14 : 0.22 + 0.5 * (1 - Math.abs(v)); c = mixc(bgc, v >= 0 ? cP : cN, a); }
+        img.data[k] = c[0]; img.data[k + 1] = c[1]; img.data[k + 2] = c[2]; img.data[k + 3] = 255;
+      }
+      offc.getContext('2d').putImageData(img, 0, 0);
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(offc, X(gx0 - gs / 2), Y(gz0 + gL + gs / 2), (G + 1) * gs * S, (G + 1) * gs * S);
+      ctx.imageSmoothingEnabled = true;
+      ctx.setLineDash([4, 3]); ctx.strokeStyle = muted; ctx.lineWidth = 1.2; ctx.beginPath();
+      for (const [a, b] of truth.segs) { ctx.moveTo(X(gx0 + a[0] * truth.h), Y(gz0 + a[1] * truth.h)); ctx.lineTo(X(gx0 + b[0] * truth.h), Y(gz0 + b[1] * truth.h)); }
+      ctx.stroke(); ctx.setLineDash([]);
+      const val = []; for (let j = 0; j <= G; j++) { const row = []; for (let i = 0; i <= G; i++) row.push(F[j * (G + 1) + i]); val.push(row); }
+      const segs = msSegments(val, G + 1, G + 1, (i, j) => Wt[j * (G + 1) + i] > 0, true);
+      ctx.strokeStyle = ink; ctx.lineWidth = 2.2; ctx.beginPath();
+      for (const [a, b] of segs) { ctx.moveTo(X(gx0 + a[0] * gs), Y(gz0 + a[1] * gs)); ctx.lineTo(X(gx0 + b[0] * gs), Y(gz0 + b[1] * gs)); }
+      ctx.stroke();
+      // cameras
+      for (let k = 0; k < Math.min(frames, angs.length); k++) {
+        const a = angs[k], cam = [ctr[0] + RAD * Math.cos(a), ctr[1] + RAD * Math.sin(a)], b = a + Math.PI, L2 = 0.16;
+        ctx.strokeStyle = k === (frames - 1) % angs.length ? c5 : C('--ink-2'); ctx.lineWidth = 2; ctx.beginPath();
+        ctx.moveTo(X(cam[0] + L2 * Math.cos(b - FOV / 2)), Y(cam[1] + L2 * Math.sin(b - FOV / 2))); ctx.lineTo(X(cam[0]), Y(cam[1]));
+        ctx.lineTo(X(cam[0] + L2 * Math.cos(b + FOV / 2)), Y(cam[1] + L2 * Math.sin(b + FOV / 2))); ctx.stroke();
+      }
+      if (lastRays) {
+        const { cam, rays } = lastRays;
+        ctx.strokeStyle = c5; ctx.globalAlpha = 0.45; ctx.lineWidth = 1; ctx.beginPath();
+        rays.forEach((q, k) => { if (k % 3 || q.t < 0) return; ctx.moveTo(X(cam[0]), Y(cam[1])); ctx.lineTo(X(cam[0] + q.d[0] * q.t), Y(cam[1] + q.d[1] * q.t)); });
+        ctx.stroke(); ctx.globalAlpha = 1; ctx.fillStyle = c5;
+        rays.forEach((q) => { if (q.t < 0) return; ctx.beginPath(); ctx.arc(X(cam[0] + q.d[0] * q.t), Y(cam[1] + q.d[1] * q.t), 2, 0, 2 * Math.PI); ctx.fill(); });
+      }
+      let hv = '';
+      const hc = hover || [Math.round((-0.45 - gx0) / gs), Math.round((0.5 - gz0) / gs)];
+      const hid = hc[1] * (G + 1) + hc[0];
+      if (hc[0] >= 0 && hc[1] >= 0 && hc[0] <= G && hc[1] <= G) {
+        ctx.strokeStyle = ink; ctx.lineWidth = 1.5; ctx.strokeRect(X(gx0 + (hc[0] - 0.5) * gs), Y(gz0 + (hc[1] + 0.5) * gs), gs * S, gs * S);
+        hv = `<span>格子 (${fmt(gx0 + hc[0] * gs)}, ${fmt(gz0 + hc[1] * gs)}) m：F = <b>${Wt[hid] ? fmt(F[hid]) : '—'}</b>，W = <b>${Wt[hid]}</b>，真 SDF/μ = <b>${fmt(V4U.clamp(sd2(gx0 + hc[0] * gs, gz0 + hc[1] * gs) / +slM.value, -1, 1))}</b></span>`;
+      }
+      rd.innerHTML = `<span>已融合 <b>${frames}</b> 帧</span><span>被观测的格子 <b>${obs}</b> / ${(G + 1) ** 2}</span>` + hv;
+    });
+    $('bt-fuse').addEventListener('click', () => { fuse(frames); frames++; draw(); });
+    $('bt-freset').addEventListener('click', () => { reset(0); draw(); });
+    const redo = () => { const n = frames; reset(n); draw(); };
+    slN.addEventListener('input', redo); slM.addEventListener('input', redo);
+    cv.addEventListener('pointermove', (e) => {
+      if (!geo) return; const r = cv.getBoundingClientRect(), x = e.clientX - r.left, y = e.clientY - r.top;
+      const wx = VX0 + (x - geo.ox) / geo.S, wz = VZ0 + (geo.h - y) / geo.S;
+      const i = Math.round((wx - gx0) / gs), j = Math.round((wz - gz0) / gs);
+      hover = i >= 0 && j >= 0 && i <= G && j <= G ? [i, j] : null; draw();
+    });
+  })();
+
+  /* =====================================================================
+     V6: marching squares
+     ===================================================================== */
+  (function () {
+    const cv = $('cv-ms'), rd = $('rd-ms'), sl = $('sl-msn');
+    let lin = true, sel = null, drag = -1, geo = null;
+    const circ = [{ c: [0.42, 0.5], r: 0.24 }, { c: [0.95, 0.45], r: 0.17 }];
+    const smin = (a, b, k) => { const h = V4U.clamp(0.5 + 0.5 * (b - a) / k, 0, 1); return b + (a - b) * h - k * h * (1 - h); };
+    const f = (x, y) => smin(Math.hypot(x - circ[0].c[0], y - circ[0].c[1]) - circ[0].r, Math.hypot(x - circ[1].c[0], y - circ[1].c[1]) - circ[1].r, 0.22);
+    const draw = V4U.canvas(cv, (w) => Math.round(Math.min(380, Math.max(260, w * 0.6))), (ctx, w, h) => {
+      const N = +sl.value; $('o-msn').textContent = N;
+      const pad = 10, S = h - 2 * pad, A = (w - 2 * pad) / S, ny = N, nx = Math.max(2, Math.round(N * A)), cs = 1 / N;
+      const X = (x) => pad + x * S, Y = (y) => pad + y * S;
+      geo = { X, Y, S, pad, cs, nx, ny, A };
+      const val = []; for (let j = 0; j <= ny; j++) { const row = []; for (let i = 0; i <= nx; i++) row.push(f(i * cs, j * cs)); val.push(row); }
+      const line = C('--line'), ink = C('--ink'), muted = C('--muted'), c1 = C('--c1'), c2 = C('--c2'), c1s = C('--c1s');
+      if (sel && (sel[0] >= nx || sel[1] >= ny)) sel = null;
+      if (sel) { ctx.fillStyle = C('--c5s'); ctx.fillRect(X(sel[0] * cs), Y(sel[1] * cs), cs * S, cs * S); ctx.strokeStyle = C('--c5'); ctx.lineWidth = 2; ctx.strokeRect(X(sel[0] * cs), Y(sel[1] * cs), cs * S, cs * S); }
+      ctx.strokeStyle = line; ctx.lineWidth = 1; ctx.beginPath();
+      for (let i = 0; i <= nx; i++) { ctx.moveTo(X(i * cs), Y(0)); ctx.lineTo(X(i * cs), Y(ny * cs)); }
+      for (let j = 0; j <= ny; j++) { ctx.moveTo(X(0), Y(j * cs)); ctx.lineTo(X(nx * cs), Y(j * cs)); }
+      ctx.stroke();
+      // true contour
+      const M = 220, fh = Math.max(nx * cs, 1) / M, fv = []; const mny = Math.ceil(ny * cs / fh);
+      for (let j = 0; j <= mny; j++) { const row = []; for (let i = 0; i <= M; i++) row.push(f(i * fh, j * fh)); fv.push(row); }
+      ctx.setLineDash([4, 3]); ctx.strokeStyle = muted; ctx.lineWidth = 1.2; ctx.beginPath();
+      for (const [a, b] of msSegments(fv, M + 1, mny + 1, null, true)) { ctx.moveTo(X(a[0] * fh), Y(a[1] * fh)); ctx.lineTo(X(b[0] * fh), Y(b[1] * fh)); }
+      ctx.stroke(); ctx.setLineDash([]);
+      const segs = msSegments(val, nx + 1, ny + 1, null, lin);
+      ctx.strokeStyle = ink; ctx.lineWidth = 2.5; ctx.beginPath();
+      for (const [a, b] of segs) { ctx.moveTo(X(a[0] * cs), Y(a[1] * cs)); ctx.lineTo(X(b[0] * cs), Y(b[1] * cs)); }
+      ctx.stroke();
+      const rr = Math.max(2, Math.min(4.5, cs * S * 0.16));
+      for (let j = 0; j <= ny; j++) for (let i = 0; i <= nx; i++) {
+        const inside = val[j][i] < 0; ctx.beginPath(); ctx.arc(X(i * cs), Y(j * cs), rr, 0, 2 * Math.PI);
+        if (inside) { ctx.fillStyle = c2; ctx.fill(); } else { ctx.fillStyle = c1s; ctx.fill(); ctx.strokeStyle = c1; ctx.lineWidth = 1.2; ctx.stroke(); }
+      }
+      for (const q of circ) { ctx.strokeStyle = C('--ink-2'); ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(X(q.c[0]), Y(q.c[1]), 7, 0, 2 * Math.PI); ctx.stroke(); ctx.beginPath(); ctx.moveTo(X(q.c[0]) - 4, Y(q.c[1])); ctx.lineTo(X(q.c[0]) + 4, Y(q.c[1])); ctx.moveTo(X(q.c[0]), Y(q.c[1]) - 4); ctx.lineTo(X(q.c[0]), Y(q.c[1]) + 4); ctx.stroke(); }
+      let amb = 0;
+      for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) { const c = (val[j][i] < 0 ? 1 : 0) + (val[j][i + 1] < 0 ? 2 : 0) + (val[j + 1][i + 1] < 0 ? 4 : 0) + (val[j + 1][i] < 0 ? 8 : 0); if (c === 5 || c === 10) amb++; }
+      let s = '';
+      if (sel) { const [i, j] = sel, c = (val[j][i] < 0 ? 1 : 0) + (val[j][i + 1] < 0 ? 2 : 0) + (val[j + 1][i + 1] < 0 ? 4 : 0) + (val[j + 1][i] < 0 ? 8 : 0); s = `<span>选中格子编码 <b>${c.toString(2).padStart(4, '0')}</b>₂ = <b>${c}</b></span>`; }
+      else s = '<span>点击一个格子看它的编码</span>';
+      rd.innerHTML = `<span>格子 <b>${nx}×${ny}</b></span><span>线段 <b>${segs.length}</b></span>${s}<span>歧义格（5 或 10）<b>${amb}</b></span>`;
+    });
+    V4U.seg($('sg-interp'), (v) => { lin = v === 'lin'; draw(); });
+    sl.addEventListener('input', draw);
+    V4U.drag(cv, (x, y, ph) => {
+      if (!geo) return;
+      const wx = (x - geo.pad) / geo.S, wy = (y - geo.pad) / geo.S;
+      if (ph === 'down') {
+        drag = circ.findIndex((q) => Math.hypot(geo.X(q.c[0]) - x, geo.Y(q.c[1]) - y) < 18);
+        if (drag < 0) { const i = Math.floor(wx / geo.cs), j = Math.floor(wy / geo.cs); sel = i >= 0 && j >= 0 && i < geo.nx && j < geo.ny ? [i, j] : null; draw(); }
+      } else if (drag >= 0 && ph === 'move') { circ[drag].c = [V4U.clamp(wx, 0.05, geo.A - 0.05), V4U.clamp(wy, 0.05, 0.95)]; draw(); }
+      if (ph === 'up') drag = -1;
+    });
+    cv.style.touchAction = 'pan-y';
+  })();
+
+  /* =====================================================================
+     V7: volume rendering along one ray
+     ===================================================================== */
+  (function () {
+    const cv = $('cv-ray'), rd = $('rd-ray'), slN = $('sl-ns'), slA = $('sl-sa'), slB = $('sl-tb');
+    let strat = true, seed = 3;
+    const tn = 2, tf = 6, sigB = 30, k = 30;
+    const sg = (x) => 1 / (1 + Math.exp(-x));
+    const sigma = (t) => { const sa = +slA.value, tb = +slB.value; return sa * (sg(k * (t - 2.75)) - sg(k * (t - 3.35))) + sigB * (sg(k * (t - tb)) - sg(k * (t - tb - 0.6))); };
+    const colAt = (t) => (t < 3.55 ? 0 : 1);
+    const render = (ts, tEnd) => {
+      let T = 1; const out = [];
+      for (let i = 0; i < ts.length; i++) { const d = (i + 1 < ts.length ? ts[i + 1] : tEnd) - ts[i], s = sigma(ts[i]), a = 1 - Math.exp(-s * d); out.push({ t: ts[i], T, a, w: T * a, c: colAt(ts[i]), s }); T *= 1 - a; }
+      return { out, Tend: T };
+    };
+    const draw = V4U.canvas(cv, (w) => Math.round(Math.min(400, Math.max(320, w * 0.5))), (ctx, w, h) => {
+      const N = +slN.value; $('o-ns').textContent = N; $('o-sa').textContent = (+slA.value).toFixed(1); $('o-tb').textContent = fmt(+slB.value);
+      const r = rng(seed), ts = [];
+      for (let i = 0; i < N; i++) ts.push(tn + (i + (strat ? r() : 0.5)) * (tf - tn) / N);
+      const R = render(ts, tf);
+      const ref = (() => { const M = 4000, tt = []; for (let i = 0; i < M; i++) tt.push(tn + (i + 0.5) * (tf - tn) / M); return render(tt, tf); })();
+      const cA = RGB('--c1'), cB = RGB('--c2'), bg = RGB('--surface');
+      const comp = (Rr) => { let c = [0, 0, 0]; for (const q of Rr.out) c = [c[0] + q.w * (q.c ? cB : cA)[0], c[1] + q.w * (q.c ? cB : cA)[1], c[2] + q.w * (q.c ? cB : cA)[2]]; return [c[0] + Rr.Tend * bg[0], c[1] + Rr.Tend * bg[1], c[2] + Rr.Tend * bg[2]]; };
+      const Ch = comp(R), Cr = comp(ref);
+      const L = 46, Rm = 12, gap = 16, ph = (h - 30 - 2 * gap) / 3;
+      const X = (t) => L + (t - tn) / (tf - tn) * (w - L - Rm);
+      const line = C('--line'), ink2 = C('--ink-2'), mono = '11.5px ' + C('--f-mono');
+      ctx.font = mono;
+      const panel = (k2, lab, ymax, ticks) => { const y0 = 6 + k2 * (ph + gap); ctx.strokeStyle = line; ctx.lineWidth = 1; ctx.strokeRect(L, y0, w - L - Rm, ph); ctx.fillStyle = ink2; ctx.textAlign = 'right'; ctx.font = '13px ' + C('--f-mono'); ctx.fillText(lab, L - 22, y0 + ph / 2 + 4); ctx.font = mono; for (const tk of ticks) { const yy = y0 + ph - tk / ymax * ph; ctx.fillText(String(tk), L - 6, yy + 4); } return (v) => y0 + ph - Math.min(v, ymax) / ymax * ph; };
+      // sigma panel (log-ish: clamp display at 8)
+      const smax = 8, Ys = panel(0, 'σ', smax, [0, 8]);
+      ctx.beginPath(); for (let i = 0; i <= 400; i++) { const t = tn + i / 400 * (tf - tn); const y = Ys(sigma(t)); i ? ctx.lineTo(X(t), y) : ctx.moveTo(X(t), y); }
+      ctx.lineTo(X(tf), Ys(0)); ctx.lineTo(X(tn), Ys(0)); ctx.closePath(); ctx.fillStyle = rgba(RGB('--ink-2'), 0.12); ctx.fill(); ctx.strokeStyle = ink2; ctx.lineWidth = 1.5; ctx.stroke();
+      // shade object extents
+      const tb = +slB.value; ctx.fillStyle = rgba(cA, 0.15); ctx.fillRect(X(2.75), Ys(smax), X(3.35) - X(2.75), Ys(0) - Ys(smax)); ctx.fillStyle = rgba(cB, 0.15); ctx.fillRect(X(tb), Ys(smax), X(Math.min(tf, tb + 0.6)) - X(tb), Ys(0) - Ys(smax));
+      for (const q of R.out) { ctx.strokeStyle = C('--ink'); ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(X(q.t), Ys(0)); ctx.lineTo(X(q.t), Ys(0) - 8); ctx.stroke(); }
+      // T panel
+      const Yt = panel(1, 'T', 1, [0, 1]);
+      ctx.beginPath(); let Tc = 1; const M = 600, dt = (tf - tn) / M;
+      for (let i = 0; i <= M; i++) { const t = tn + i * dt; i ? ctx.lineTo(X(t), Yt(Tc)) : ctx.moveTo(X(t), Yt(Tc)); Tc *= Math.exp(-sigma(t + dt / 2) * dt); }
+      ctx.strokeStyle = ink2; ctx.lineWidth = 1.5; ctx.stroke();
+      for (const q of R.out) { ctx.fillStyle = C('--ink'); ctx.beginPath(); ctx.arc(X(q.t), Yt(q.T), 3.2, 0, 2 * Math.PI); ctx.fill(); }
+      // weights panel
+      const wmax = Math.max(0.05, ...R.out.map((q) => q.w));
+      const Yw = panel(2, 'w', wmax, [0]);
+      const bw = Math.max(2, Math.min(14, (w - L - Rm) / N * 0.6));
+      for (const q of R.out) { ctx.fillStyle = rgba(q.c ? cB : cA); ctx.fillRect(X(q.t) - bw / 2, Yw(q.w), bw, Yw(0) - Yw(q.w)); }
+      ctx.fillStyle = ink2; ctx.textAlign = 'center';
+      for (let t = 2; t <= 6; t++) ctx.fillText(String(t), X(t), h - 6);
+      const sw = (c) => `<i class="sw" style="background:${rgba(c)}"></i>`;
+      const sumw = R.out.reduce((s, q) => s + q.w, 0), Dhat = R.out.reduce((s, q) => s + q.w * q.t, 0) / Math.max(1e-9, sumw);
+      const err = Math.hypot(Ch[0] - Cr[0], Ch[1] - Cr[1], Ch[2] - Cr[2]) / 255;
+      rd.innerHTML = `<span>渲染色 ${sw(Ch)} 参考（N = 4000）${sw(Cr)}</span><span>颜色误差 <b>${fmt(err, 3)}</b></span><span>Σw<sub>i</sub> = <b>${fmt(sumw, 3)}</b></span><span>T<sub>N+1</sub> = <b>${fmt(R.Tend, 3)}</b></span><span>深度 Σw<sub>i</sub>t<sub>i</sub>/Σw<sub>i</sub> = <b>${fmt(Dhat)}</b> m</span>`;
+    });
+    V4U.seg($('sg-strat'), (v) => { strat = v === 's'; draw(); });
+    [slN, slA, slB].forEach((s) => s.addEventListener('input', draw));
+    $('bt-resamp').addEventListener('click', () => { seed++; draw(); });
+  })();
+
+  /* =====================================================================
+     V8: 3D Gaussian splatting — projection + sorted alpha compositing
+     ===================================================================== */
+  (function () {
+    const cv = $('cv-gs'), rd = $('rd-gs'), sl = $('sl-gyaw');
+    let sorted = true, ell = true, probe = null;
+    const Rz = (a) => [[Math.cos(a), -Math.sin(a), 0], [Math.sin(a), Math.cos(a), 0], [0, 0, 1]];
+    const Rx = (a) => [[1, 0, 0], [0, Math.cos(a), -Math.sin(a)], [0, Math.sin(a), Math.cos(a)]];
+    const mm = (A, B) => A.map((r) => [0, 1, 2].map((j) => r[0] * B[0][j] + r[1] * B[1][j] + r[2] * B[2][j]));
+    const tr = (A) => [0, 1, 2].map((i) => [A[0][i], A[1][i], A[2][i]]);
+    const G = [
+      { mu: [0, 0, 0], s: [0.62, 0.2, 0.12], rz: 0.35, rx: 0.2, o: 0.97, c: '--c1' },
+      { mu: [0.3, 0.42, 0.28], s: [0.14, 0.5, 0.1], rz: -0.5, rx: 0.7, o: 0.92, c: '--c2' },
+      { mu: [-0.5, -0.15, 0.38], s: [0.12, 0.14, 0.45], rz: 0, rx: 0.35, o: 0.95, c: '--c3' },
+      { mu: [0.55, -0.4, -0.25], s: [0.34, 0.09, 0.22], rz: 0.9, rx: -0.4, o: 0.92, c: '--c4' },
+      { mu: [-0.25, 0.5, -0.32], s: [0.38, 0.22, 0.08], rz: -0.2, rx: 0.1, o: 0.95, c: '--c5' },
+      { mu: [0.05, -0.55, 0.15], s: [0.1, 0.32, 0.26], rz: 0.3, rx: 1.0, o: 0.9, c: '--c6' },
+    ].map((g) => { const R = mm(Rz(g.rz), Rx(g.rx)), S2 = [[g.s[0] ** 2, 0, 0], [0, g.s[1] ** 2, 0], [0, 0, g.s[2] ** 2]]; return { ...g, Sig: mm(mm(R, S2), tr(R)) }; });
+    const off = document.createElement('canvas');
+    let last = null;
+    const draw = V4U.canvas(cv, (w) => Math.round(Math.min(360, Math.max(240, w * 0.56))), (ctx, w, h) => {
+      const yaw = (+sl.value * Math.PI) / 180; $('o-gyaw').textContent = sl.value + '°';
+      const ds = 3, bw = Math.max(40, Math.round(w / ds)), bh = Math.max(30, Math.round(h / ds));
+      const pitch = 0.35, dist = 3.3, eye = [dist * Math.cos(pitch) * Math.cos(yaw), dist * Math.cos(pitch) * Math.sin(yaw), dist * Math.sin(pitch)];
+      const f = nrm(scl(eye, -1)), r = nrm(cross(f, [0, 0, 1])), dn = cross(f, r); // OpenCV camera: x right, y down, z forward
+      const Wm = [r, dn, f], fp = 0.95 * bh, cx = bw / 2, cy = bh / 2;
+      const P = G.map((g, idx) => {
+        const t = [0, 1, 2].map((k) => dot(Wm[k], sub(g.mu, eye)));
+        const J = [[fp / t[2], 0, -fp * t[0] / t[2] ** 2], [0, fp / t[2], -fp * t[1] / t[2] ** 2]];
+        const Sc = mm(mm(Wm, g.Sig), tr(Wm));
+        const JS = J.map((row) => [0, 1, 2].map((j) => row[0] * Sc[0][j] + row[1] * Sc[1][j] + row[2] * Sc[2][j]));
+        const a = JS[0][0] * J[0][0] + JS[0][1] * J[0][1] + JS[0][2] * J[0][2] + 0.3;
+        const b = JS[0][0] * J[1][0] + JS[0][1] * J[1][1] + JS[0][2] * J[1][2];
+        const d = JS[1][0] * J[1][0] + JS[1][1] * J[1][1] + JS[1][2] * J[1][2] + 0.3;
+        const det = a * d - b * b;
+        return { idx, u: [fp * t[0] / t[2] + cx, fp * t[1] / t[2] + cy], z: t[2], a, b, d, ia: d / det, ib: -b / det, id: a / det, o: g.o, col: RGB(g.c) };
+      });
+      const ord = sorted ? P.slice().sort((p, q) => p.z - q.z) : P.slice();
+      const bg = RGB('--surface-2');
+      off.width = bw; off.height = bh;
+      const octx = off.getContext('2d'), img = octx.createImageData(bw, bh);
+      const shade = (x, y, trace) => {
+        let T = 1, c = [0, 0, 0]; const list = [];
+        for (const g of ord) {
+          const dx = x - g.u[0], dy = y - g.u[1], pw = -0.5 * (g.ia * dx * dx + 2 * g.ib * dx * dy + g.id * dy * dy);
+          if (pw > 0) continue;
+          const al = Math.min(0.99, g.o * Math.exp(pw)); if (al < 1 / 255) continue;
+          if (trace) list.push({ g, al, T });
+          c = [c[0] + g.col[0] * al * T, c[1] + g.col[1] * al * T, c[2] + g.col[2] * al * T]; T *= 1 - al;
+          if (T < 1e-4) break;
+        }
+        return { c: [c[0] + T * bg[0], c[1] + T * bg[1], c[2] + T * bg[2]], T, list };
+      };
+      for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) {
+        const { c } = shade(x + 0.5, y + 0.5, false), k = (y * bw + x) * 4;
+        img.data[k] = c[0]; img.data[k + 1] = c[1]; img.data[k + 2] = c[2]; img.data[k + 3] = 255;
+      }
+      octx.putImageData(img, 0, 0);
+      ctx.imageSmoothingEnabled = true; ctx.drawImage(off, 0, 0, w, h);
+      const sx = w / bw, sy = h / bh;
+      if (ell) {
+        for (const g of P) {
+          const tr2 = (g.a + g.d) / 2, q = Math.sqrt(((g.a - g.d) / 2) ** 2 + g.b * g.b), l1 = tr2 + q, l2 = Math.max(1e-6, tr2 - q), ang = 0.5 * Math.atan2(2 * g.b, g.a - g.d);
+          ctx.strokeStyle = rgba(g.col); ctx.lineWidth = 1.5; ctx.setLineDash([5, 4]);
+          ctx.save(); ctx.translate(g.u[0] * sx, g.u[1] * sy); ctx.scale(sx, sy); ctx.rotate(ang);
+          ctx.beginPath(); ctx.ellipse(0, 0, 2 * Math.sqrt(l1), 2 * Math.sqrt(l2), 0, 0, 2 * Math.PI); ctx.restore(); ctx.stroke(); ctx.setLineDash([]);
+          ctx.fillStyle = C('--ink'); ctx.font = '12px ' + C('--f-mono'); ctx.fillText(String(g.idx + 1), g.u[0] * sx + 4, g.u[1] * sy - 4);
+        }
+      }
+      const pr = probe || [w * 0.47, h * 0.48];
+      const S2 = shade(pr[0] / sx, pr[1] / sy, true);
+      ctx.strokeStyle = C('--ink'); ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(pr[0], pr[1], 7, 0, 2 * Math.PI); ctx.moveTo(pr[0] - 12, pr[1]); ctx.lineTo(pr[0] - 4, pr[1]); ctx.moveTo(pr[0] + 4, pr[1]); ctx.lineTo(pr[0] + 12, pr[1]); ctx.stroke();
+      last = { sx, sy };
+      const items = S2.list.map((q) => `<span><i class="sw" style="background:${rgba(q.g.col)}"></i>#${q.g.idx + 1} z=<b>${fmt(q.g.z * 1)}</b> α=<b>${fmt(q.al)}</b> T=<b>${fmt(q.T)}</b></span>`).join('');
+      rd.innerHTML = (items || '<span>探针处没有高斯</span>') + `<span>剩余透射 T = <b>${fmt(S2.T)}</b></span><span>像素颜色 <i class="sw" style="background:${rgba(S2.c)}"></i></span>`;
+    });
+    V4U.seg($('sg-sort'), (v) => { sorted = v === 'sort'; draw(); });
+    V4U.seg($('sg-ell'), (v) => { ell = v === 'on'; draw(); });
+    sl.addEventListener('input', draw);
+    cv.addEventListener('click', (e) => { const r = cv.getBoundingClientRect(); probe = [e.clientX - r.left, e.clientY - r.top]; draw(); });
+  })();
+});
+</script>
+</body>
+</html>

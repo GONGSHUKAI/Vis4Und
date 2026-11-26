@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<!-- v4u:head -->
+<!-- /v4u:head -->
+<title>示例页 · Vis4Und</title>
+<meta name="description" content="一句话说清这一页讲什么。">
+<style>
+/* Page-specific styles only. Colours come from the tokens in assets/v4u.css (var(--c1) … var(--accent)). */
+</style>
+</head>
+<body>
+<!-- v4u:nav -->
+<!-- /v4u:nav -->
+
+<header class="hero"><div class="wrap">
+  <p class="kicker">(1) 机器人学 · 示例</p>
+  <h1>二维旋转</h1>
+  <p class="lede">一句或两句：这一页讲什么，读者为什么需要它。</p>
+  <p class="asks-h">读完能回答</p>
+  <ul class="asks">
+    <li>旋转矩阵为什么是正交的、行列式为 1？</li>
+    <li>先转 α 再转 β，和一次转 α+β 一样吗？</li>
+    <li>网络直接回归角度 θ 有什么问题？</li>
+  </ul>
+</div></header>
+
+<div class="wrap layout">
+<nav class="toc" id="toc" aria-label="本页目录"></nav>
+<main>
+
+<section id="def">
+  <h2>旋转矩阵</h2>
+  <p class="def"><b>二维旋转</b>把平面上的向量绕原点转过角度 $\theta$，长度不变：$\mathbf{p}' = R(\theta)\,\mathbf{p}$。</p>
+
+  <figure class="viz" id="viz-rot">
+    <div class="viz-h"><b>拖动角度，看基向量怎么转</b><span>单位：弧度</span></div>
+    <div class="viz-stage"><canvas id="cv-rot" aria-label="单位圆上的两个基向量和一个被旋转的向量"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="sl-theta">θ <input type="range" id="sl-theta" min="-3.1416" max="3.1416" step="0.01" value="0.6"><output id="o-theta">0.60</output></label>
+      <button type="button" class="btn ghost" id="bt-play">播放</button>
+    </div>
+    <div class="viz-read" id="rd-rot"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>旋转后的 x 轴（R 的第一列）</li><li><i style="background:var(--c2)"></i>旋转后的 y 轴（R 的第二列）</li><li><i style="background:var(--c3)"></i>被旋转的点 p</li></ul>
+  </figure>
+
+  <table class="notation">
+    <caption>记号</caption>
+    <thead><tr><th>符号</th><th>含义</th><th>形状</th></tr></thead>
+    <tbody>
+      <tr><td>$\theta$</td><td>旋转角，逆时针为正</td><td>标量</td></tr>
+      <tr><td>$\mathbf{p},\ \mathbf{p}'$</td><td>旋转前、后的点</td><td>$\mathbb{R}^2$</td></tr>
+      <tr><td>$R(\theta)$</td><td>旋转矩阵</td><td>$2\times 2$</td></tr>
+    </tbody>
+  </table>
+
+  <h3>推导</h3>
+  <ol class="derive">
+    <li><p>把基向量 $\mathbf{e}_x=(1,0)^\top$ 转 $\theta$，落到单位圆上：</p>$$R\,\mathbf{e}_x = (\cos\theta,\ \sin\theta)^\top$$</li>
+    <li><p>$\mathbf{e}_y$ 比 $\mathbf{e}_x$ 多 $90^\circ$：</p>$$R\,\mathbf{e}_y = (\cos(\theta+\tfrac{\pi}{2}),\ \sin(\theta+\tfrac{\pi}{2}))^\top = (-\sin\theta,\ \cos\theta)^\top$$</li>
+    <li><p>线性映射由基向量的像决定，按列拼起来：</p>$$R(\theta)=\begin{bmatrix}\cos\theta & -\sin\theta\\ \sin\theta & \cos\theta\end{bmatrix},\qquad R^\top R = I,\ \det R = 1$$</li>
+  </ol>
+
+  <div class="note pit"><b>易错</b><p>直接回归 $\theta$ 在 $\pm\pi$ 处不连续：$3.14$ 和 $-3.14$ 几乎是同一个旋转，L2 损失却很大。回归 $(\cos\theta,\sin\theta)$ 可以避开。</p></div>
+</section>
+
+<section id="compare">
+  <h2>几种表示对照</h2>
+  <div class="tbl"><table>
+    <thead><tr><th>表示</th><th>参数个数</th><th>连续性</th><th>什么时候用</th></tr></thead>
+    <tbody>
+      <tr><td>角度 θ</td><td class="num">1</td><td>在 ±π 处跳变</td><td>给人看</td></tr>
+      <tr><td>(cos θ, sin θ)</td><td class="num">2</td><td>连续</td><td>网络输出</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="quiz">
+  <h2>自测</h2>
+  <details class="q"><summary>$R(\alpha)R(\beta)$ 等于什么？</summary><div><p>$R(\alpha+\beta)$。二维旋转可交换，三维一般不可交换。</p></div></details>
+</section>
+
+<section id="refs">
+  <h2>延伸阅读</h2>
+  <ol class="refs">
+    <li><b>Zhou et al., On the Continuity of Rotation Representations in Neural Networks</b>, CVPR 2019. <a href="https://arxiv.org/abs/1812.07035">arXiv:1812.07035</a></li>
+  </ol>
+</section>
+
+</main>
+</div>
+
+<!-- v4u:foot -->
+<!-- /v4u:foot -->
+
+<script>
+V4U.ready(() => {
+  const sl = document.getElementById('sl-theta'), out = document.getElementById('o-theta'), rd = document.getElementById('rd-rot');
+  const p0 = [0.8, 0.35];
+  const redraw = V4U.canvas(document.getElementById('cv-rot'), (w) => Math.min(340, w * 0.75), (ctx, w, h) => {
+    const th = +sl.value, c = Math.cos(th), s = Math.sin(th);
+    const S = Math.min(w, h) * 0.38, ox = w / 2, oy = h / 2;
+    const X = (x, y) => [ox + S * x, oy - S * y];
+    ctx.strokeStyle = V4U.css('--line-2'); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(ox, oy, S, 0, 2 * Math.PI); ctx.stroke();
+    const arrow = (v, col) => { const [x, y] = X(v[0], v[1]); ctx.strokeStyle = col; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(ox, oy); ctx.lineTo(x, y); ctx.stroke(); };
+    arrow([c, s], V4U.css('--c1'));
+    arrow([-s, c], V4U.css('--c2'));
+    const p = [c * p0[0] - s * p0[1], s * p0[0] + c * p0[1]];
+    const [px, py] = X(p[0], p[1]);
+    ctx.fillStyle = V4U.css('--c3'); ctx.beginPath(); ctx.arc(px, py, 6, 0, 2 * Math.PI); ctx.fill();
+    out.textContent = V4U.fmt(th);
+    rd.innerHTML = `<span>R = [[<b>${V4U.fmt(c)}</b>, <b>${V4U.fmt(-s)}</b>], [<b>${V4U.fmt(s)}</b>, <b>${V4U.fmt(c)}</b>]]</span><span>p′ = (<b>${V4U.fmt(p[0])}</b>, <b>${V4U.fmt(p[1])}</b>)</span>`;
+  });
+  sl.addEventListener('input', redraw);
+  let anim = null;
+  document.getElementById('bt-play').addEventListener('click', (e) => {
+    if (anim) { anim.stop(); anim = null; e.target.textContent = '播放'; return; }
+    e.target.textContent = '暂停';
+    anim = V4U.loop(sl, (t, dt) => { let v = +sl.value + dt * 0.8; if (v > Math.PI) v -= 2 * Math.PI; sl.value = v; redraw(); });
+  });
+});
+</script>
+</body>
+</html>

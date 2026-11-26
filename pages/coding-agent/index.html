@@ -1,0 +1,677 @@
+<!doctype html>
+<html lang="zh-CN" data-sec="agentic-rl">
+<head>
+<!-- v4u:head -->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="icon" href="data:,">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700&family=Inter+Tight:wght@700&family=JetBrains+Mono:wght@400;700&family=Noto+Sans+SC:wght@400;700&display=swap">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<link rel="stylesheet" href="../../assets/v4u.css?v=4288b6c4">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
+<script src="../../assets/v4u.js?v=d6640e00"></script>
+<!-- /v4u:head -->
+<title>Coding Agent 的训练 · Vis4Und</title>
+<meta name="description" content="Coding agent 怎么训：多轮工具调用轨迹与 loss mask、SWE-bench 的 FAIL_TO_PASS / PASS_TO_PASS 评分、可执行任务实例怎么造、SFT 冷启动加多轮 RL、异步 rollout、奖励设计，以及开源 scaffold、RL 框架和模型配方对照。">
+<style>
+.nscroll{overflow-x:auto;max-width:100%}
+/* wide comparison tables scroll sideways on phones instead of squeezing columns */
+/* score + setting column: monospace but allowed to wrap */
+.tbl td.score{font-family:var(--f-mono);font-size:13px;font-variant-numeric:tabular-nums;min-width:16em}
+@media (max-width:760px){.tbl table.wide{min-width:620px}.tbl table.xwide{min-width:1100px}}
+/* keep KaTeX's absolutely positioned MathML inside scroll boxes (otherwise wide math widens the page on phones) */
+.katex-display,.eq,.tbl,.nscroll{position:relative}
+.msg{margin:10px 0 0;border:1px solid var(--line);border-radius:8px;background:var(--bg);padding:10px 12px;min-height:7.5em}
+.msg .who{font:700 12px/1.4 var(--f-mono);letter-spacing:.04em;margin:0 0 4px}
+.msg pre{margin:0;padding:0;border:0;background:none;font:400 12.5px/1.6 var(--f-mono);white-space:pre-wrap;overflow-wrap:anywhere;color:var(--ink)}
+.who.model{color:var(--c1)} .who.env{color:var(--c3)} .who.prompt{color:var(--c5)} .who.reward{color:var(--ok)}
+.code{font:400 12.5px/1.6 var(--f-mono);background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin:0;white-space:pre;overflow-x:auto}
+.code .del{background:var(--bad-soft);color:var(--bad);display:inline-block;min-width:100%}
+.code .add{background:var(--ok-soft);color:var(--ok);display:inline-block;min-width:100%}
+.tests{width:100%;border-collapse:collapse;font:400 13px/1.5 var(--f-mono)}
+.tests th{font:400 12px/1.4 var(--f-mono);color:var(--muted);text-align:left;padding:5px 8px;border-bottom:1px solid var(--line-2)}
+.tests td{padding:5px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
+.pill{display:inline-block;font:700 11.5px/1 var(--f-mono);padding:4px 7px;border-radius:999px}
+.pill.ok{background:var(--ok-soft);color:var(--ok)} .pill.bad{background:var(--bad-soft);color:var(--bad)} .pill.na{background:var(--surface-2);color:var(--muted)}
+.pill.f2p{background:var(--c4s);color:var(--c4)} .pill.p2p{background:var(--c1s);color:var(--c1)}
+.split{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr));gap:14px}
+.verdict{font:700 14px/1.5 var(--f-body);margin:10px 0 0}
+.verdict.ok{color:var(--ok)} .verdict.bad{color:var(--bad)}
+.issue{border-left:3px solid var(--c5);padding:4px 0 4px 12px;margin:10px 0 0;font-size:14px;color:var(--ink-2)}
+.rmat{width:100%;border-collapse:collapse;font-size:14px}
+.rmat th{font:400 12px/1.4 var(--f-mono);color:var(--muted);text-align:left;padding:6px 8px;border-bottom:1px solid var(--line-2)}
+.rmat td{padding:7px 8px;border-bottom:1px solid var(--line);vertical-align:middle}
+.rmat td.num{font-family:var(--f-mono);text-align:right;white-space:nowrap}
+.rmat tr.hack td:first-child::after{content:" 钻空子";font:700 11px/1 var(--f-mono);color:var(--bad);margin-left:4px}
+.rbar{display:inline-block;height:9px;border-radius:2px;vertical-align:middle;background:var(--accent)}
+</style>
+</head>
+<body>
+<!-- v4u:nav -->
+<nav class="v4u-nav" aria-label="站点导航"><div class="v4u-nav-in"><span class="v4u-crumb"><a href="../../"><b>Vis4Und</b></a><span class="v4u-sep">/</span><a href="../../#agentic-rl">(3) Agentic RL</a></span><span class="v4u-links"><a href="../llm-rl-basics/">补充 RL 基础</a><a href="../coding-agent/" aria-current="page">(i) Coding Agent</a><a href="../robot-use-agent/">(ii) Robot-Use Agent</a><button type="button" class="v4u-theme" aria-label="切换深浅色">深色</button></span></div></nav>
+<!-- /v4u:nav -->
+
+<header class="hero"><div class="wrap">
+  <p class="kicker">(3) Agentic RL · (i)</p>
+  <h1>Coding Agent 的训练</h1>
+  <p class="lede">Coding agent = 语言模型 + 一套工具（bash、看文件、改文件）+ 一个循环。训练它要三样东西：能跑测试的任务环境、从强模型轨迹做的 SFT 冷启动、以测试是否通过为奖励的多轮 RL。策略梯度和 GRPO 的记号沿用<a href="../llm-rl-basics/">补充篇</a>。</p>
+  <p class="asks-h">读完能回答</p>
+  <ul class="asks">
+    <li>一条多轮轨迹里，哪些 token 计入 loss？为什么？</li>
+    <li>SWE-bench 怎么判定「解决了」？FAIL_TO_PASS 和 PASS_TO_PASS 各管什么？</li>
+    <li>一个可训练的任务实例由哪几部分构成，合成数据怎么批量造？</li>
+    <li>同步 rollout 为什么会让 GPU 空转？异步的代价是什么？</li>
+    <li>SWE-RL、DeepSWE、Kimi-Dev、Qwen3-Coder 这些开源配方各用了什么环境、算法和 scaffold？</li>
+  </ul>
+</div></header>
+
+<div class="wrap layout">
+<nav class="toc" id="toc" aria-label="本页目录"></nav>
+<main>
+
+<section id="agent">
+  <h2 data-toc="Agent = 模型 + scaffold">什么是 coding agent</h2>
+  <p class="def"><b>Coding agent</b>：模型在一个循环里交替「输出一段思考和一个工具调用」和「读工具返回的结果」，直到它调用 submit；最终产物是对仓库的一个补丁（diff）。</p>
+  <ul>
+    <li><b>Scaffold</b>（也叫 harness）：负责把工具描述写进系统提示、解析模型输出里的工具调用、在沙箱里执行、把结果拼回上下文。同一个模型换 scaffold，SWE-bench 分数能差很多，所以报分必须注明 scaffold。</li>
+    <li><b>工具</b>：最小集合是 bash；常见的还有文件查看 / 按字符串替换编辑（str_replace）、搜索、提交。mini-SWE-agent 只给 bash。</li>
+    <li><b>ReAct 循环</b>：思考（reason）→ 动作（act）→ 观察（observation），重复。每一轮的观察都追加到上下文，轨迹越长上下文越长。</li>
+    <li><b>上下文管理</b>：测试日志、文件内容可能有上千 token。常见做法是截断长观察（只留头尾）、只保留最近几轮的完整观察、把更早的历史压缩成摘要。</li>
+  </ul>
+
+  <figure class="viz" id="viz-traj">
+    <div class="viz-h"><b>一条修 bug 的轨迹，以及哪些 token 有梯度</b><span>横轴：上下文里的 token，宽度 ∝ token 数（示意）</span></div>
+    <div class="viz-stage">
+      <canvas id="cv-traj" aria-label="按角色着色的 token 序列和 loss mask"></canvas>
+      <div class="msg" id="traj-msg" aria-live="polite"></div>
+    </div>
+    <div class="viz-ctrl">
+      <button type="button" class="btn ghost" id="tr-prev">上一步</button>
+      <button type="button" class="btn" id="tr-next">下一步</button>
+      <button type="button" class="btn ghost" id="tr-play">播放</button>
+      <div class="seg" id="seg-mask" role="group" aria-label="哪些 token 计入 loss"><button type="button" data-v="model" aria-pressed="true">只算模型 token</button><button type="button" data-v="all">所有 token</button></div>
+      <label><input type="checkbox" id="ck-trunc"> 截断长观察（&gt;200 token 只留头尾）</label>
+    </div>
+    <div class="viz-read" id="rd-traj"></div>
+    <ul class="chips"><li><i style="background:var(--c5)"></i>系统提示 + issue</li><li><i style="background:var(--c1)"></i>模型输出（思考 + 工具调用）</li><li><i style="background:var(--c3)"></i>工具 / 环境输出</li><li><i style="background:var(--accent)"></i>下方细条：loss mask = 1</li></ul>
+    <figcaption>逐步播放：上下文一轮轮变长，奖励只在 submit 之后由隐藏测试给出。切到「所有 token」会让模型也去拟合 pytest 日志、文件内容这些不是它生成的文本，下面<a href="#objective">多轮目标</a>一节说明为什么这是错的。勾选截断：最后那段长测试日志从 620 token 缩到 200，后续每一轮都少带这么多上下文。</figcaption>
+  </figure>
+</section>
+
+<section id="bench">
+  <h2>怎么评测：SWE-bench 一族</h2>
+  <p class="def"><b>SWE-bench 任务实例</b>：一个真实 GitHub issue，加上提出它时的仓库快照（base commit），以及修复它的 PR。PR 里的代码改动是参考答案（gold patch），PR 里的测试改动用来评分，agent 看不到这些测试。</p>
+  <table class="notation">
+    <caption>评分用的两组测试</caption>
+    <thead><tr><th>名称</th><th>含义</th><th>作用</th></tr></thead>
+    <tbody>
+      <tr><td>FAIL_TO_PASS</td><td>在 base commit 上失败、打上 gold patch 后通过的测试</td><td>检查 issue 真的被修了</td></tr>
+      <tr><td>PASS_TO_PASS</td><td>打补丁前后都通过的测试</td><td>检查没有改坏别的功能</td></tr>
+    </tbody>
+  </table>
+  <div class="eq">$$\text{resolved}=\Big[\bigwedge_{t\in\text{F2P}}\text{pass}(t)\Big]\wedge\Big[\bigwedge_{t\in\text{P2P}}\text{pass}(t)\Big],\qquad \text{分数}=\frac{\#\text{resolved}}{\#\text{实例}}$$</div>
+  <p>评测流程：在该实例的 Docker 镜像里检出 base commit → 应用 agent 的补丁 → 把测试文件恢复成 PR 里的版本 → 只跑 F2P 和 P2P 里的测试，按日志判定通过与否。</p>
+
+  <figure class="viz" id="viz-score">
+    <div class="viz-h"><b>同一个任务，不同补丁怎么判分</b><span>迷你仓库 stats.py，issue：偶数长度时 median 错</span></div>
+    <div class="viz-stage">
+      <div class="seg" id="seg-patch" role="group" aria-label="选择候选补丁"><button type="button" data-v="good" aria-pressed="true">正确修复</button><button type="button" data-v="wrong">改错地方</button><button type="button" data-v="break">修好但改坏 mean</button><button type="button" data-v="test">只改测试文件</button><button type="button" data-v="none">空补丁</button></div>
+      <div class="split" style="margin-top:12px">
+        <div><p class="cands-h" style="font:400 12px/1.4 var(--f-mono);color:var(--muted);margin:0 0 6px">agent 的补丁</p><pre class="code" id="sc-diff"></pre></div>
+        <div class="nscroll"><table class="tests" id="sc-tests"></table><p class="verdict" id="sc-verdict"></p></div>
+      </div>
+    </div>
+    <figcaption>F2P 只有 <code>test_median_even</code>（PR 新加的测试），其余 4 个是 P2P。「改坏 mean」修好了 issue，但 P2P 里的 <code>test_mean_empty</code> 挂了，仍算失败。「只改测试文件」无效，因为评测前测试文件会被恢复成 PR 里的版本。</figcaption>
+  </figure>
+
+  <div class="nscroll"><div class="tbl"><table class="wide">
+    <thead><tr><th>基准</th><th>规模</th><th>内容</th><th>判分</th></tr></thead>
+    <tbody>
+      <tr><td>SWE-bench</td><td class="num">2,294</td><td>12 个 Python 仓库的真实 issue（Jimenez et al., ICLR 2024）</td><td>F2P + P2P</td></tr>
+      <tr><td>SWE-bench Lite</td><td class="num">300</td><td>从全集挑出的较自包含的子集</td><td>同上</td></tr>
+      <tr><td>SWE-bench Verified</td><td class="num">500</td><td>OpenAI 2024.08 发布，人工筛掉描述不清、测试不合理的实例；开源模型最常报的一项</td><td>同上</td></tr>
+      <tr><td>SWE-bench Multimodal</td><td>—</td><td>JavaScript 前端仓库，issue 里带截图</td><td>同上</td></tr>
+      <tr><td>SWE-bench Multilingual</td><td>—</td><td>Python 以外的多种语言</td><td>同上</td></tr>
+      <tr><td>SWE-bench Pro</td><td>—</td><td>Scale AI 2025，改动更大、更难，部分仓库不公开以防污染</td><td>同上</td></tr>
+      <tr><td>SWE-rebench</td><td>—</td><td>Nebius，持续从新 issue 自动构造，按时间切分防污染（详见下节）</td><td>同上</td></tr>
+      <tr><td>Terminal-Bench</td><td>—</td><td>在终端里完成任务（编译、配置、数据处理等），不限于改仓库</td><td>每个任务自带测试脚本</td></tr>
+      <tr><td>LiveCodeBench</td><td>—</td><td>持续收集的竞赛题，按发布日期切分防污染；单轮写代码，不是 agent 任务</td><td>测试用例</td></tr>
+    </tbody>
+  </table></div></div>
+  <p>「—」表示这里不给具体数字（各版本规模不同）。比较两个模型时要同时看：基准版本、scaffold、最大轮数 / 上下文、是否 pass@1（单次）还是 best-of-N 加验证器挑选（test-time scaling, TTS）。</p>
+</section>
+
+<section id="env">
+  <h2 data-toc="任务环境怎么造">任务环境与数据</h2>
+  <p class="def"><b>可训练的任务实例</b> = 仓库快照 + 任务描述（issue）+ 装好依赖的 Docker 镜像 + 能判定成功的测试（F2P / P2P）。参考补丁只用来验证实例有效，不给 agent 看。</p>
+  <p>真实 issue 能直接用的不多：大量 PR 没有配套测试，依赖装不起来，测试不确定性高。所以出现了两条路：</p>
+  <ul>
+    <li><b>挖真实数据</b>：自动化地爬 PR、搭环境、跑测试，留下「打 gold patch 前后测试结果确实翻转」的实例。SWE-Gym、SWE-rebench 属于这一类。</li>
+    <li><b>合成</b>：在本来测试全过的仓库里人为引入 bug，让一些测试失败，这些测试就是 F2P；再让 LM 根据失败的测试写一段 issue。SWE-smith、R2E-Gym 属于这一类，规模更容易扩大。</li>
+  </ul>
+
+  <figure class="viz" id="viz-inject">
+    <div class="viz-h"><b>往一个测试全过的仓库里注入 bug，造出一个任务实例</b><span>同一个迷你仓库 stats.py</span></div>
+    <div class="viz-stage">
+      <div class="seg" id="seg-inj" role="group" aria-label="选择注入方式"><button type="button" data-v="op" aria-pressed="true">改运算</button><button type="button" data-v="del">删一行</button><button type="button" data-v="cond">条件取反</button><button type="button" data-v="combo">组合两个 bug</button><button type="button" data-v="rename">改变量名</button></div>
+      <div class="split" style="margin-top:12px">
+        <div><pre class="code" id="inj-diff"></pre><p class="issue" id="inj-issue"></p></div>
+        <div class="nscroll"><table class="tests" id="inj-tests"></table><p class="verdict" id="inj-verdict"></p></div>
+      </div>
+    </div>
+    <figcaption>注入前 5 个测试全部通过。注入后失败的测试就是 F2P（修复后应重新通过），仍通过的是 P2P。「改变量名」不改变行为，没有测试失败，没有 F2P，这个候选被丢弃。issue 文字由 LM 看着失败的测试和报错写出来，不能泄露补丁本身。</figcaption>
+  </figure>
+  <div class="nscroll"><div class="tbl"><table class="xwide">
+    <thead><tr><th>数据 / 环境</th><th>时间</th><th>规模</th><th>来源与构造</th></tr></thead>
+    <tbody>
+      <tr><td>SWE-Gym</td><td class="num">2024.12</td><td class="num">2,438 实例，11 仓库</td><td>真实 Python issue，带可执行环境；最早专门为训练（而非评测）做的 SWE 环境</td></tr>
+      <tr><td>R2E-Gym</td><td class="num">2025.04</td><td class="num">8.1k 环境</td><td>从仓库的提交历史程序化地挖任务，issue 文字由 LM 反向生成，不依赖人写的 issue</td></tr>
+      <tr><td>SWE-smith</td><td class="num">2025.04</td><td class="num">50k 实例，128 仓库</td><td>在测试全过的仓库里自动注入 bug（上图的做法），每个仓库只需配一次环境</td></tr>
+      <tr><td>SWE-rebench</td><td class="num">2025.05</td><td class="num">21,336 任务，3,468 仓库</td><td>全自动流水线从新 PR 构造；同时是按模型发布日期去污染的排行榜。V2（2026.02）扩到 32,079 个任务、20 种语言</td></tr>
+      <tr><td>Skywork-SWE</td><td class="num">2025.06</td><td class="num">10,169 实例，2,531 仓库</td><td>真实 issue，自动化搭环境与验证，研究数据量与分数的 scaling 关系</td></tr>
+      <tr><td>SWE-Mirror</td><td class="num">2025.09</td><td class="num">60,671 任务，40 仓库，4 种语言</td><td>ByteDance Seed：把一个仓库里的 issue「镜像」到其他仓库里重现，多语言</td></tr>
+      <tr><td>Qwen3-Coder-Next</td><td class="num">2026.02</td><td class="num">约 80 万实例</td><td>从 GitHub PR 和合成 issue 大规模构造的可验证任务，配可执行环境，用于 mid-training 和 RL</td></tr>
+    </tbody>
+  </table></div></div>
+  <p>截至 2026-11 的趋势：环境数量从几千涨到几十万，语言从 Python 扩到多语言，构造过程几乎全自动（LLM 负责装依赖、写 issue、筛实例）。</p>
+</section>
+
+<section id="recipe">
+  <h2>训练配方</h2>
+  <p>公开配方大体是三段，每一段都可以省略或合并：</p>
+  <ol>
+    <li><p><b>继续预训练 / mid-training</b>：大量代码、仓库级上下文、合成的 agent 轨迹，让基座熟悉「读仓库、跑命令、读日志」的格式。闭源细节最多的一段。</p></li>
+    <li><p><b>SFT（冷启动）</b>：用更强的模型在环境里跑 agent，只保留最终补丁通过测试的轨迹（rejection sampling），按多轮对话格式微调，loss 只算模型 token。</p></li>
+    <li><p><b>多轮 RL</b>：策略自己在沙箱里跑，奖励是隐藏测试是否通过，用 GRPO / PPO 类算法更新。环境越多、越难、越「刚好在能力边界」，RL 收益越大。</p></li>
+  </ol>
+  <p>两种采样都依赖任务对当前模型的难度。设某任务的单次成功率为 $p$：</p>
+  <div class="eq">$$P(\text{k 次里至少成功一次})=1-(1-p)^k,\qquad P(\text{GRPO 组有梯度})=1-p^G-(1-p)^G$$</div>
+
+  <figure class="viz" id="viz-diff">
+    <div class="viz-h"><b>任务难度分布决定 SFT 能收多少轨迹、RL 有多少组有信号</b><span>1000 个任务，单次成功率 p 服从 Beta 分布</span></div>
+    <div class="viz-stage"><canvas id="cv-diff" aria-label="任务成功率直方图和两条覆盖率曲线"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="sl-pm">平均成功率 <input type="range" id="sl-pm" min="0.03" max="0.8" step="0.01" value="0.2"><output id="o-pm">0.20</output></label>
+      <label for="sl-k">拒绝采样次数 k <input type="range" id="sl-k" min="1" max="32" step="1" value="4"><output id="o-k">4</output></label>
+      <label for="sl-dg">GRPO 组大小 G <input type="range" id="sl-dg" min="2" max="32" step="1" value="8"><output id="o-dg">8</output></label>
+    </div>
+    <div class="viz-read" id="rd-diff"></div>
+    <ul class="chips"><li><i style="background:var(--c1s)"></i>任务数（按 p 分箱，左轴）</li><li><i style="background:var(--c2)"></i>k 次至少成功一次（右轴）</li><li><i style="background:var(--c3)"></i>GRPO 组有梯度（右轴）</li></ul>
+    <figcaption>真实任务集的成功率常呈两头多的 U 形：很多任务一直做不出、很多一直做得对。$p\approx0$ 的任务 SFT 收不到轨迹、RL 也没有信号；$p\approx1$ 的任务 RL 同样没有信号。所以 RL 前常按当前模型的通过率筛任务，训练中再动态丢掉全对 / 全错的组。</figcaption>
+  </figure>
+</section>
+
+<section id="objective">
+  <h2>多轮目标与 loss mask</h2>
+  <table class="notation">
+    <caption>记号</caption>
+    <thead><tr><th>符号</th><th>含义</th><th>形状</th></tr></thead>
+    <tbody>
+      <tr><td>$x$</td><td>系统提示 + issue</td><td>token 序列</td></tr>
+      <tr><td>$a_k$</td><td>第 $k$ 轮模型输出（思考 + 工具调用）</td><td>token 序列</td></tr>
+      <tr><td>$o_k$</td><td>第 $k$ 轮工具 / 环境返回的观察</td><td>token 序列</td></tr>
+      <tr><td>$h_k$</td><td>第 $k$ 轮开始时的历史 $(x,a_1,o_1,\dots,a_{k-1},o_{k-1})$</td><td>token 序列</td></tr>
+      <tr><td>$\tau$</td><td>整条轨迹，共 $K$ 轮，拼成 token 序列 $z_1,\dots,z_L$</td><td>长度 $L$</td></tr>
+      <tr><td>$P_\text{env}(o_k\mid h_k,a_k)$</td><td>沙箱执行工具调用的结果分布，与 $\theta$ 无关</td><td>—</td></tr>
+      <tr><td>$m_t$</td><td>loss mask：$z_t$ 是模型生成的为 1，否则为 0</td><td>$\{0,1\}$</td></tr>
+      <tr><td>$R(\tau)$</td><td>提交后隐藏测试给的奖励</td><td>标量</td></tr>
+    </tbody>
+  </table>
+  <ol class="derive">
+    <li><p>轨迹概率是模型和环境交替的乘积：</p>$$p_\theta(\tau)=\prod_{k=1}^{K}\pi_\theta(a_k\mid h_k)\,P_\text{env}(o_k\mid h_k,a_k)$$</li>
+    <li><p>取对数再对 $\theta$ 求导，环境项是常数，消失：</p>$$\nabla_\theta\log p_\theta(\tau)=\sum_{k=1}^{K}\nabla_\theta\log\pi_\theta(a_k\mid h_k)$$</li>
+    <li><p>每个 $a_k$ 再拆成 token，正好是序列里 $m_t=1$ 的位置；观察 token 只作为条件出现在 $z_{&lt;t}$ 里：</p>$$\nabla_\theta\log p_\theta(\tau)=\sum_{t=1}^{L}m_t\,\nabla_\theta\log\pi_\theta(z_t\mid z_{&lt;t})$$</li>
+    <li><p>代入策略梯度（推导见<a href="../llm-rl-basics/#pg">补充篇</a>）：</p>$$\nabla_\theta J=\mathbb E_{\tau}\Big[R(\tau)\sum_{t}m_t\,\nabla_\theta\log\pi_\theta(z_t\mid z_{&lt;t})\Big]$$</li>
+    <li><p>同一任务采 $G$ 条轨迹，用组内基线、token-mean 聚合（只数 mask 内的 token），就是常见的多轮 GRPO / DAPO 目标：</p>$$\mathcal J=\mathbb E\Bigg[\frac{1}{\sum_i\sum_t m_{i,t}}\sum_{i=1}^{G}\sum_{t}m_{i,t}\min\big(\rho_{i,t}\hat A_i,\ \operatorname{clip}(\rho_{i,t},1-\epsilon_\text{low},1+\epsilon_\text{high})\hat A_i\big)\Bigg],\quad \hat A_i=\frac{R_i-\bar R}{\operatorname{std}(R)}$$</li>
+  </ol>
+  <div class="note pit"><b>易错</b>
+    <p><b>重新分词</b>：如果把历史先解码成文本、下一轮再重新分词，得到的 token 可能和模型当时采样的不一样，$\log\pi_\text{old}$ 就对不上。做法是全程保存 token id（token-in, token-out），只把观察部分新分词后拼上去。</p>
+    <p><b>被截断的轨迹</b>：撞上最大轮数、上下文或时间上限的轨迹没有真正的结局，直接给 0 分会惩罚「还没做完」。常见做法是把这类轨迹整条 mask 掉，不参与 loss。</p>
+    <p><b>信用分配粗</b>：$\hat A_i$ 对整条轨迹所有模型 token 相同，几十轮里哪一步关键分不出来。这是多轮 agent RL 目前的主要难点之一。</p>
+  </div>
+</section>
+
+<section id="infra">
+  <h2 data-toc="Rollout 基础设施">Rollout 基础设施</h2>
+  <p>一条 SWE 轨迹要几十轮、每轮都要在容器里执行命令，长度从几千到十几万 token 不等，耗时长尾很重。训练系统要同时管：</p>
+  <ul>
+    <li><b>沙箱</b>：每条轨迹一个容器（每个任务实例一个镜像），成百上千个并发；命令要有超时，容器要能快速创建和回收。</li>
+    <li><b>推理引擎</b>：vLLM / SGLang 做多轮生成，保留 KV cache 前缀；权重每个训练步后同步过来。</li>
+    <li><b>调度</b>：同步还是异步，允许多大的陈旧度，长轨迹能否中途换新权重（partial rollout）。</li>
+  </ul>
+
+  <figure class="viz" id="viz-async">
+    <div class="viz-h"><b>同步与异步 rollout 的时间线</b><span>每行一个 rollout 槽，颜色 = 采样时的策略版本；最下一行是训练；横轴为时间</span></div>
+    <div class="viz-stage"><canvas id="cv-async" aria-label="rollout 槽与训练器的时间线甘特图"></canvas></div>
+    <div class="viz-ctrl">
+      <div class="seg" id="seg-sync" role="group" aria-label="同步或异步"><button type="button" data-v="sync" aria-pressed="true">同步</button><button type="button" data-v="async">异步</button></div>
+      <label for="sl-tail">耗时长尾 σ <input type="range" id="sl-tail" min="0.1" max="1.2" step="0.05" value="0.8"><output id="o-tail">0.80</output></label>
+      <label for="sl-eta">最大陈旧度 η <input type="range" id="sl-eta" min="0" max="4" step="1" value="2"><output id="o-eta">2</output></label>
+      <button type="button" class="btn ghost" id="bt-async">换一批耗时</button>
+    </div>
+    <div class="viz-read" id="rd-async"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i><i style="background:var(--c2)"></i><i style="background:var(--c3)"></i><i style="background:var(--c4)"></i>策略版本 0, 1, 2, 3 …（循环）</li><li><i style="background:var(--surface-2)"></i>空转</li><li><i style="background:transparent;border:1.5px solid var(--c2)"></i>空心：超过 η 被丢弃</li></ul>
+    <figcaption>8 个 rollout 槽，每个训练步用 8 条轨迹，训练一步耗时 3 个单位，耗时服从对数正态。同步：等最慢的一条结束才能训练，训练时推理槽也停着。异步（训练和推理分在不同 GPU 上）：槽一空就开新轨迹，攒够 8 条就训练；代价是样本来自旧版本，比值要相对行为策略计算（见<a href="../llm-rl-basics/#practice">补充篇·异步与陈旧度</a>）。η 是允许的最大陈旧度：推理端最多领先训练端 η 个版本，用到时已经旧了超过 η 个版本的轨迹被丢弃（白算了）。η 调大，吞吐更高、样本更旧。</figcaption>
+  </figure>
+</section>
+
+<section id="reward">
+  <h2>奖励设计与 reward hacking</h2>
+  <p>最常见的奖励是二值的 resolved：隐藏的 F2P 与 P2P 全部通过得 1，否则 0（有的配方给格式错误、超时额外负分）。也有别的设计：</p>
+  <ul>
+    <li><b>测试通过比例</b>（部分分）：信号更密，但修一半也拿分，模型可能学会只修容易的那部分。</li>
+    <li><b>补丁相似度</b>（SWE-RL）：不执行代码，奖励是模型补丁和参考补丁的序列相似度，格式错误给 −1。好处是不需要可执行环境，能用海量 PR 数据；坏处是不同但正确的修法拿不到满分。</li>
+  </ul>
+  <p>只要奖励由一个可被策略影响的程序计算，策略就会去找它的漏洞。对 coding agent，漏洞多半来自「判分时跑的是什么测试、在什么状态下跑」。</p>
+
+  <figure class="viz" id="viz-reward">
+    <div class="viz-h"><b>同一组行为，在四种奖励实现下各得几分</b><span>任务：修 median 的偶数分支</span></div>
+    <div class="viz-stage">
+      <div class="seg" id="seg-rw" role="group" aria-label="奖励实现方式"><button type="button" data-v="hidden" aria-pressed="true">隐藏测试 + 恢复测试文件</button><button type="button" data-v="inrepo">跑仓库里现有的测试</button><button type="button" data-v="partial">测试通过比例</button><button type="button" data-v="sim">补丁相似度</button></div>
+      <div class="nscroll" style="margin-top:12px"><table class="rmat" id="rw-table"></table></div>
+    </div>
+    <figcaption>「跑仓库里现有的测试」时，agent 能改到判分用的测试文件，改测试、删测试都能拿满分。「测试通过比例」下改坏 mean 仍有 0.8 分。只针对 issue 里那个例子硬编码返回值，在隐藏测试只有这一个例子时也能骗到分，测试覆盖要比 issue 里给的多。补丁相似度对另一种正确写法只给 0.62。</figcaption>
+  </figure>
+  <p>对应的防护：判分只用 agent 看不到的测试，并在跑之前把测试文件恢复原状；P2P 要覆盖足够多的既有功能；隐藏测试的输入不要只是 issue 里的例子；仓库快照里不留包含答案的后续提交；训练中抽查高奖励轨迹，监控「改了测试文件」「补丁里出现针对测试的分支」这类信号。</p>
+</section>
+
+<section id="oss">
+  <h2>经典开源实现</h2>
+  <h3>Scaffold</h3>
+  <div class="nscroll"><div class="tbl"><table class="wide">
+    <thead><tr><th>Scaffold</th><th>形态</th><th>常见的报分用户</th></tr></thead>
+    <tbody>
+      <tr><td><a href="https://github.com/SWE-agent/SWE-agent">SWE-agent</a></td><td>agent 循环 + 专门设计的 Agent-Computer Interface：文件查看、搜索、编辑命令，编辑时带 lint 检查（NeurIPS 2024）</td><td>SWE-smith；Kimi K2 系列的内部 harness 由它衍生</td></tr>
+      <tr><td><a href="https://github.com/SWE-agent/mini-swe-agent">mini-SWE-agent</a></td><td>约百行的循环，只有 bash，每步一条命令，不依赖工具调用接口</td><td>Qwen3-Coder-Next 报告的三种 scaffold 之一</td></tr>
+      <tr><td><a href="https://github.com/OpenHands/OpenHands">OpenHands</a></td><td>原 OpenDevin。CodeAct：动作就是 bash / Python 代码，另有文件编辑、浏览器</td><td>SWE-Gym、Skywork-SWE、Devstral、GLM-4.5 / GLM-5、SWE-Mirror</td></tr>
+      <tr><td><a href="https://github.com/R2E-Gym/R2E-Gym">R2E-Gym</a></td><td>在 OpenHands 基础上精简的 scaffold，附环境和验证器</td><td>DeepSWE、MiniMax-M2</td></tr>
+      <tr><td><a href="https://github.com/OpenAutoCoder/Agentless">Agentless</a></td><td>不是 agent 循环，固定三段：定位文件与函数 → 采样大量候选补丁 → 用复现测试和回归测试过滤、重排</td><td>SWE-RL（Agentless Mini）、Kimi-Dev</td></tr>
+    </tbody>
+  </table></div></div>
+
+  <h3>RL 框架</h3>
+  <div class="nscroll"><div class="tbl"><table class="wide">
+    <thead><tr><th>框架</th><th>机构</th><th>和多轮 coding RL 相关的点</th></tr></thead>
+    <tbody>
+      <tr><td><a href="https://github.com/verl-project/verl">verl</a></td><td>ByteDance Seed</td><td>HybridFlow（EuroSys 2025）的实现；训练与推理可在同一批卡上切换，支持多轮 agent 循环；SkyRL-v0 就是 verl 的 fork</td></tr>
+      <tr><td><a href="https://github.com/skyrl-project/SkyRL">SkyRL</a></td><td>UC Berkeley NovaSky</td><td>面向长程 agent 的 RL 库；SkyRL-v0（2025.05）在 OpenHands 上训了 7B–14B；SkyRL-Agent（2025.11）训出 SA-SWE-32B</td></tr>
+      <tr><td><a href="https://github.com/rllm-org/rllm">rLLM</a></td><td>Agentica</td><td>DeepSWE 用它训练（64 张 H100，6 天）</td></tr>
+      <tr><td><a href="https://github.com/THUDM/slime">slime</a></td><td>清华 THUDM / Z.ai</td><td>Megatron + SGLang，有训推分离的异步模式；GLM-4.5、GLM-5 的 RL 基础设施</td></tr>
+      <tr><td><a href="https://github.com/areal-project/AReaL">AReaL</a></td><td>蚂蚁 inclusionAI + 清华</td><td>全异步，rollout 可中断换新权重，解耦 PPO 目标与陈旧度上限 η（见<a href="../llm-rl-basics/#practice">补充篇</a>）</td></tr>
+      <tr><td><a href="https://github.com/NVIDIA-NeMo/RL">NeMo-RL</a></td><td>NVIDIA</td><td>Nemotron 3 的后训练用它和 NeMo-Gym，异步 GRPO，环境里包括 OpenHands SWE</td></tr>
+    </tbody>
+  </table></div></div>
+
+  <h3>公开配方（研究型，32B–72B）</h3>
+  <p>分数一律是 SWE-bench Verified（%）。「单次」= 每题只跑一条轨迹（pass@1，常对多次运行取平均）；「k 选 1」= 跑 k 条再由验证器或测试挑一个提交（test-time scaling），两者不可直接比较。</p>
+  <div class="nscroll"><div class="tbl"><table class="xwide">
+    <thead><tr><th>名称</th><th>时间</th><th>基座</th><th>数据 / 环境</th><th>SFT</th><th>RL</th><th>Verified（scaffold，设定）</th></tr></thead>
+    <tbody>
+      <tr><td><a href="https://arxiv.org/abs/2412.21139">SWE-Gym</a></td><td class="num">2024.12</td><td>Qwen2.5-Coder-32B-Instruct</td><td>SWE-Gym 2,438 实例</td><td>491 条通过的轨迹（GPT-4o、Claude 3.5 Sonnet 拒绝采样）</td><td>无（另训验证器）</td><td class="score">20.6 单次；32.0 16 选 1（OpenHands）</td></tr>
+      <tr><td><a href="https://arxiv.org/abs/2502.18449">SWE-RL</a></td><td class="num">2025.02</td><td>Llama-3.3-70B-Instruct</td><td>约 11M PR 中筛出 273k，不执行代码</td><td>无</td><td>GRPO，奖励 = 与参考补丁的 difflib 相似度，格式错 −1</td><td class="score">41.0（Agentless Mini，500 个候选经复现测试重排后提交 1 个）</td></tr>
+      <tr><td><a href="https://arxiv.org/abs/2504.07164">R2E-Gym</a></td><td class="num">2025.04</td><td>Qwen2.5-Coder-32B</td><td>R2E-Gym 8.1k 环境</td><td>3,321 条 Claude 3.5 Sonnet 轨迹</td><td>无</td><td class="score">34.4 单次；51 混合验证器 26 选 1（基于 OpenHands）</td></tr>
+      <tr><td><a href="https://arxiv.org/abs/2504.21798">SWE-smith</a></td><td class="num">2025.04</td><td>Qwen2.5-Coder-32B-Instruct</td><td>SWE-smith 50k 合成实例</td><td>5,016 条 Claude 3.7 Sonnet 轨迹</td><td>无</td><td class="score">40.2 单次（SWE-agent）</td></tr>
+      <tr><td><a href="https://arxiv.org/abs/2506.19290">Skywork-SWE-32B</a></td><td class="num">2025.06</td><td>Qwen2.5-Coder-32B-Instruct</td><td>10,169 实例</td><td>8,209 条轨迹</td><td>无</td><td class="score">38.0 单次；47.0 8 选 1（OpenHands）</td></tr>
+      <tr><td><a href="https://arxiv.org/abs/2509.23045">Kimi-Dev-72B</a></td><td class="num">2025.06</td><td>Qwen2.5-72B-Base</td><td>约 150B token mid-training；Docker 环境</td><td>DeepSeek-R1 轨迹冷启动</td><td>REINFORCE 式，奖励 = Docker 里执行结果 0/1</td><td class="score">60.4（Agentless 式，40 补丁 × 40 测试选 1）；单补丁单测试 48.0</td></tr>
+      <tr><td><a href="https://www.together.ai/blog/deepswe">DeepSWE-Preview</a></td><td class="num">2025.07</td><td>Qwen3-32B</td><td>R2E-Gym 子集 4.5k（去掉与 Verified 重叠的仓库）</td><td>无，纯 RL</td><td>GRPO++（rLLM）：Clip-High、无 KL、无 std 归一化、留一基线、截断轨迹 mask 掉</td><td class="score">42.2 单次（16 次平均）；59.0 混合验证器 16 选 1（R2E-Gym，64K，100 步）</td></tr>
+      <tr><td><a href="https://arxiv.org/abs/2509.08724">SWE-Mirror-LM-32B</a></td><td class="num">2025.09</td><td>Qwen2.5-Coder-32B-Instruct</td><td>SWE-Mirror 60,671 任务</td><td>12,456 条轨迹（Claude 3.7 / 4 Sonnet）</td><td>无</td><td class="score">52.2（OpenHands）</td></tr>
+      <tr><td><a href="https://arxiv.org/abs/2510.02387">CWM</a></td><td class="num">2025.09</td><td>自训 32B dense（Meta）</td><td>5T token mid-training，含 Python 执行轨迹和约 3M 条 agent 轨迹</td><td>有</td><td>GRPO 变体：异步、多任务多轮、clip-high 0.25、无 KL</td><td class="score">53.9 单次（4 次平均）；65.8 16 选 1（bash / edit / create / submit 工具）</td></tr>
+      <tr><td><a href="https://arxiv.org/abs/2511.16108">SA-SWE-32B</a></td><td class="num">2025.11</td><td>Qwen3-32B</td><td>SkyRL-Agent</td><td>无</td><td>纯 RL</td><td class="score">39.4 单次（基座 24.4）</td></tr>
+      <tr><td><a href="https://arxiv.org/abs/2602.03411">SWE-Master</a></td><td class="num">2026.02</td><td>Qwen2.5-Coder-32B</td><td>教师轨迹合成 + 数据筛选</td><td>长程 SFT</td><td>真实执行反馈的 RL</td><td class="score">61.4 单次；70.8 TTS@8</td></tr>
+    </tbody>
+  </table></div></div>
+
+  <h3>开放权重的大模型</h3>
+  <p>这些模型的技术报告透露了 agent RL 的规模和基础设施，但训练数据与完整配方大多不公开。</p>
+  <div class="nscroll"><div class="tbl"><table class="xwide">
+    <thead><tr><th>模型</th><th>时间</th><th>参数（总 / 激活）</th><th>公开的训练信息</th><th>Verified（scaffold，设定）</th></tr></thead>
+    <tbody>
+      <tr><td><a href="https://huggingface.co/mistralai/Devstral-Small-2505">Devstral Small</a></td><td class="num">2025.05 / 07</td><td class="num">24B</td><td>Mistral 与 All Hands AI 合作，基于 Mistral-Small-3.1；配方未公开</td><td class="score">46.8（1.0）/ 53.6（1.1），OpenHands</td></tr>
+      <tr><td><a href="https://arxiv.org/abs/2507.20534">Kimi K2</a></td><td class="num">2025.07</td><td class="num">1T / 32B</td><td>大规模 agent 数据合成；真实与合成环境上的联合 RL</td><td class="score">65.8 单次（bash / 编辑器工具）</td></tr>
+      <tr><td><a href="https://github.com/QwenLM/Qwen3-Coder">Qwen3-Coder-480B-A35B</a></td><td class="num">2025.07</td><td class="num">480B / 35B</td><td>预训练 7.5T token（70% 代码）；agent RL 用 2 万个并行环境</td><td>官方只在图中给出，未写设定，这里不列</td></tr>
+      <tr><td><a href="https://arxiv.org/abs/2508.06471">GLM-4.5</a></td><td class="num">2025.07</td><td class="num">355B / 32B</td><td>RL 基础设施 slime；SWE 方向的 RL 用带可执行测试的 GitHub issue 与 PR</td><td class="score">64.2（OpenHands v0.34.0，100 轮，128K）</td></tr>
+      <tr><td><a href="https://huggingface.co/MiniMaxAI/MiniMax-M2">MiniMax-M2</a></td><td class="num">2025.10</td><td class="num">230B / 10B</td><td>—</td><td class="score">69.4（R2E-Gym 式 scaffold，128K，100 步，无 TTS）</td></tr>
+      <tr><td><a href="https://arxiv.org/abs/2512.02556">DeepSeek-V3.2</a></td><td class="num">2025.12</td><td>—</td><td>GRPO；agent RL 用 1,800+ 个环境、8.5 万条复杂提示，另有数万个可复现的 issue 环境</td><td class="score">73.1（内部 agent 框架，thinking 模式）</td></tr>
+      <tr><td><a href="https://arxiv.org/abs/2603.00729">Qwen3-Coder-Next</a></td><td class="num">2026.02</td><td class="num">80B / 3B</td><td>约 80 万个可验证 SWE 任务实例；mid-training + 以执行结果为奖励的 RL</td><td class="score">70.6 SWE-agent / 71.1 mini-SWE-agent / 71.3 OpenHands（最多 300 轮）</td></tr>
+      <tr><td><a href="https://arxiv.org/abs/2602.15763">GLM-5</a></td><td class="num">2026.02</td><td class="num">744B / 40B</td><td>继续用 slime，异步 agent RL</td><td class="score">77.8（OpenHands，定制提示，200K）</td></tr>
+    </tbody>
+  </table></div></div>
+  <div class="note"><b>截至 2026-11 的读数提醒</b>
+    <p>2026-02 OpenAI 发文说明不再用 SWE-bench Verified 评测：复查发现大量题目的测试或描述有问题，并有训练数据污染的迹象，建议改用 SWE-bench Pro。此后不少新发布的模型卡不再报 Verified，改报 SWE-bench Pro、Terminal-Bench 等。读 2026 年的数字时先确认基准版本和 scaffold。</p>
+  </div>
+</section>
+
+<section id="quiz">
+  <h2>自测</h2>
+  <details class="q"><summary>一条 30 轮的轨迹里，pytest 的输出 token 要不要算 loss？</summary><div><p>不算。轨迹概率里环境项 $P_\text{env}(o_k\mid h_k,a_k)$ 与 $\theta$ 无关，求导后消失，所以只有 $m_t=1$ 的模型 token 有梯度。若把观察也算进去，模型会被训练去「预测」测试日志，目标就错了。</p></div></details>
+  <details class="q"><summary>补丁修好了 issue，但另一个原本通过的测试挂了，SWE-bench 算解决吗？</summary><div><p>不算。挂掉的测试属于 PASS_TO_PASS，resolved 要求 F2P 全过且 P2P 全过。</p></div></details>
+  <details class="q"><summary>用 SWE-smith 的方式注入一个 bug 后，所有测试仍然通过，这个候选怎么处理？</summary><div><p>丢弃。没有 FAIL_TO_PASS 测试就无法判定「修好了」，也说明这个改动在现有测试下不可观测。</p></div></details>
+  <details class="q"><summary>某任务当前模型的成功率约 0.02，用 G = 8 的 GRPO 训练，这个任务能提供多少学习信号？</summary><div><p>一组有梯度的概率是 $1-0.02^8-0.98^8\approx0.15$，大多数组白采。这类任务更适合先靠 SFT（强模型轨迹）或更大的 $G$、课程式筛选来处理。</p></div></details>
+  <details class="q"><summary>同步 rollout 时 GPU 空转主要来自哪两部分？</summary><div><p>一是等最慢的轨迹（长尾）时，已完成轨迹的推理槽空着；二是训练这段时间推理端停着（同一批 GPU 轮流做推理和训练时）。异步把两者重叠，代价是样本陈旧，需要重要性比值修正。</p></div></details>
+  <details class="q"><summary>为什么判分前要把测试文件恢复成参考版本？</summary><div><p>否则 agent 改测试、删测试、把断言改成恒真都能让「测试通过」，奖励和「修好了 issue」脱钩。恢复后，判分用的测试完全不受 agent 补丁影响。</p></div></details>
+  <details class="q"><summary>两个模型的 SWE-bench Verified 分数能直接比吗？要看哪些条件？</summary><div><p>要看 scaffold（OpenHands、SWE-agent、Agentless、自研）、最大轮数和上下文、是 pass@1 还是 best-of-N 加验证器、是否用了测试时扩展。同一模型在不同条件下能差十几个点。</p></div></details>
+</section>
+
+<section id="refs">
+  <h2>延伸阅读</h2>
+  <ol class="refs" id="refs-list">
+    <li><b>Jimenez et al., SWE-bench: Can Language Models Resolve Real-World GitHub Issues?</b>, ICLR 2024. <a href="https://arxiv.org/abs/2310.06770">arXiv:2310.06770</a></li>
+    <li><b>Yao et al., ReAct: Synergizing Reasoning and Acting in Language Models</b>, ICLR 2023. <a href="https://arxiv.org/abs/2210.03629">arXiv:2210.03629</a></li>
+    <li><b>Yang et al., SWE-agent: Agent-Computer Interfaces Enable Automated Software Engineering</b>, NeurIPS 2024. <a href="https://arxiv.org/abs/2405.15793">arXiv:2405.15793</a></li>
+    <li><b>Wang et al., OpenHands: An Open Platform for AI Software Developers as Generalist Agents</b>, ICLR 2025. <a href="https://arxiv.org/abs/2407.16741">arXiv:2407.16741</a></li>
+    <li><b>Xia et al., Agentless: Demystifying LLM-based Software Engineering Agents</b>, 2024. <a href="https://arxiv.org/abs/2407.01489">arXiv:2407.01489</a></li>
+    <li><b>Jain et al., LiveCodeBench: Holistic and Contamination Free Evaluation of Large Language Models for Code</b>, 2024. <a href="https://arxiv.org/abs/2403.07974">arXiv:2403.07974</a></li>
+    <li><b>Pan et al., Training Software Engineering Agents and Verifiers with SWE-Gym</b>, 2024. <a href="https://arxiv.org/abs/2412.21139">arXiv:2412.21139</a></li>
+    <li><b>Wei et al., SWE-RL: Advancing LLM Reasoning via Reinforcement Learning on Open Software Evolution</b>, 2025. <a href="https://arxiv.org/abs/2502.18449">arXiv:2502.18449</a></li>
+    <li><b>Jain et al., R2E-Gym: Procedural Environments and Hybrid Verifiers for Scaling Open-Weights SWE Agents</b>, 2025. <a href="https://arxiv.org/abs/2504.07164">arXiv:2504.07164</a></li>
+    <li><b>Yang et al., SWE-smith: Scaling Data for Software Engineering Agents</b>, 2025. <a href="https://arxiv.org/abs/2504.21798">arXiv:2504.21798</a></li>
+    <li><b>Badertdinov et al., SWE-rebench: An Automated Pipeline for Task Collection and Decontaminated Evaluation of Software Engineering Agents</b>, 2025. <a href="https://arxiv.org/abs/2505.20411">arXiv:2505.20411</a></li>
+    <li><b>Zeng et al., Skywork-SWE: Unveiling Data Scaling Laws for Software Engineering in LLMs</b>, 2025. <a href="https://arxiv.org/abs/2506.19290">arXiv:2506.19290</a></li>
+    <li><b>Yang et al., Kimi-Dev: Agentless Training as Skill Prior for SWE-Agents</b>, 2025. <a href="https://arxiv.org/abs/2509.23045">arXiv:2509.23045</a></li>
+    <li><b>Agentica &amp; Together AI, DeepSWE: Training a Fully Open-sourced, State-of-the-Art Coding Agent by Scaling RL</b>, blog, 2025.07. <a href="https://www.together.ai/blog/deepswe">together.ai</a></li>
+    <li><b>FAIR CodeGen Team, CWM: An Open-Weights LLM for Research on Code Generation with World Models</b>, 2025. <a href="https://arxiv.org/abs/2510.02387">arXiv:2510.02387</a></li>
+    <li><b>Wang et al., SWE-Mirror: Scaling Issue-Resolving Datasets by Mirroring Issues Across Repositories</b>, 2025. <a href="https://arxiv.org/abs/2509.08724">arXiv:2509.08724</a></li>
+    <li><b>Cao et al., SkyRL-Agent: Efficient RL Training for Multi-turn LLM Agent</b>, 2025. <a href="https://arxiv.org/abs/2511.16108">arXiv:2511.16108</a></li>
+    <li><b>DeepSeek-AI, DeepSeek-V3.2: Pushing the Frontier of Open Large Language Models</b>, 2025. <a href="https://arxiv.org/abs/2512.02556">arXiv:2512.02556</a></li>
+    <li><b>Kimi Team, Kimi K2: Open Agentic Intelligence</b>, 2025. <a href="https://arxiv.org/abs/2507.20534">arXiv:2507.20534</a></li>
+    <li><b>GLM-4.5 Team, GLM-4.5: Agentic, Reasoning, and Coding (ARC) Foundation Models</b>, 2025. <a href="https://arxiv.org/abs/2508.06471">arXiv:2508.06471</a></li>
+    <li><b>Qwen Team, Qwen3-Coder-Next Technical Report</b>, 2026. <a href="https://arxiv.org/abs/2603.00729">arXiv:2603.00729</a></li>
+    <li><b>GLM-5 Team, GLM-5: from Vibe Coding to Agentic Engineering</b>, 2026. <a href="https://arxiv.org/abs/2602.15763">arXiv:2602.15763</a></li>
+    <li><b>Song et al., SWE-Master: Unleashing the Potential of Software Engineering Agents via Post-Training</b>, 2026. <a href="https://arxiv.org/abs/2602.03411">arXiv:2602.03411</a></li>
+    <li><b>OpenAI, Why we no longer evaluate SWE-bench Verified</b>, blog, 2026.02. <a href="https://openai.com/index/why-we-no-longer-evaluate-swe-bench-verified/">openai.com</a></li>
+    <li><b>Sheng et al., HybridFlow: A Flexible and Efficient RLHF Framework</b>, EuroSys 2025.（verl）<a href="https://arxiv.org/abs/2409.19256">arXiv:2409.19256</a></li>
+    <li><b>Fu et al., AReaL: A Large-Scale Asynchronous Reinforcement Learning System for Language Reasoning</b>, 2025. <a href="https://arxiv.org/abs/2505.24298">arXiv:2505.24298</a></li>
+  </ol>
+</section>
+
+</main>
+</div>
+
+<!-- v4u:foot -->
+<footer class="v4u-foot"><div class="v4u-foot-in"><a class="pv" href="../llm-rl-basics/"><span>上一篇</span>LLM 强化学习基础</a><a class="nx" href="../robot-use-agent/"><span>下一篇</span>Robot-Use Agent 的训练</a></div></footer>
+<!-- /v4u:foot -->
+
+<script>
+V4U.ready(() => {
+  const $ = (id) => document.getElementById(id);
+  const C = (n) => V4U.css(n);
+  const F = (px, mono) => px + 'px ' + C(mono ? '--f-mono' : '--f-body');
+  const fmt = V4U.fmt;
+  const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const rng = (seed) => () => { seed |= 0; seed = (seed + 0x6D2B79F5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  const gauss = (r) => { let u = 0; while (!u) u = r(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * r()); };
+  function chart(ctx, box, xr, yr, o) {
+    o = o || {};
+    const { x, y, w, h } = box;
+    const X = (v) => x + ((v - xr[0]) / (xr[1] - xr[0])) * w;
+    const Y = (v) => y + h - ((v - yr[0]) / (yr[1] - yr[0])) * h;
+    ctx.font = F(11, true); ctx.lineWidth = 1;
+    (o.yt || []).forEach((v) => {
+      ctx.strokeStyle = C('--line'); ctx.beginPath(); ctx.moveTo(x, Y(v)); ctx.lineTo(x + w, Y(v)); ctx.stroke();
+      ctx.fillStyle = C('--muted'); ctx.textAlign = 'right'; ctx.textBaseline = 'middle'; ctx.fillText(o.fy ? o.fy(v) : String(v), x - 6, Y(v));
+    });
+    (o.xt || []).forEach((v) => {
+      ctx.fillStyle = C('--muted'); ctx.textAlign = 'center'; ctx.textBaseline = 'top'; ctx.fillText(o.fx ? o.fx(v) : String(v), X(v), y + h + 6);
+    });
+    ctx.strokeStyle = C('--line-2'); ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x, y + h); ctx.lineTo(x + w, y + h); ctx.stroke();
+    ctx.fillStyle = C('--ink-2'); ctx.font = F(12, true);
+    if (o.xl) { ctx.textAlign = 'right'; ctx.textBaseline = 'bottom'; ctx.fillText(o.xl, x + w, y + h - 4); }
+    return { X, Y };
+  }
+  const path = (ctx, pts, col, wd, dash) => { ctx.strokeStyle = col; ctx.lineWidth = wd || 2; ctx.setLineDash(dash || []); ctx.beginPath(); pts.forEach((p, i) => (i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]))); ctx.stroke(); ctx.setLineDash([]); };
+
+  /* ---------- 1. trajectory + loss mask ---------- */
+  (() => {
+    const T = [
+      { r: 'prompt', who: '系统提示', n: 420, text: 'You are a software engineering agent working in /repo.\nTools: bash(cmd) · str_replace_editor(path, old_str, new_str) · submit()\nThink step by step, then call exactly one tool per turn.' },
+      { r: 'prompt', who: '用户（issue）', n: 140, text: 'median() 对偶数长度的列表返回错误：\nmedian([1, 2, 3, 4]) 返回 3，应为 2.5。' },
+      { r: 'model', who: '模型 · 第 1 轮', n: 70, text: '先找到 median 的实现。\n<bash>grep -rn "def median" src/</bash>' },
+      { r: 'env', who: '工具输出', n: 18, text: 'src/stats.py:9:def median(xs):' },
+      { r: 'model', who: '模型 · 第 2 轮', n: 45, text: '<bash>sed -n 9,15p src/stats.py</bash>' },
+      { r: 'env', who: '工具输出', n: 95, text: 'def median(xs):\n    s = sorted(xs)\n    n = len(s)\n    if n % 2 == 1:\n        return s[n // 2]\n    return s[n // 2]' },
+      { r: 'model', who: '模型 · 第 3 轮', n: 120, text: '偶数分支只取了一个元素，应取中间两个的平均。\n<str_replace_editor path="src/stats.py">\n  old: "    return s[n // 2]"\n  new: "    return (s[n // 2 - 1] + s[n // 2]) / 2"\n</str_replace_editor>' },
+      { r: 'env', who: '工具输出', n: 30, text: 'Error: old_str 在文件中出现 2 次，必须唯一。' },
+      { r: 'model', who: '模型 · 第 4 轮', n: 95, text: '带上前一行，让 old_str 唯一。\n<str_replace_editor path="src/stats.py">\n  old: "        return s[n // 2]\\n    return s[n // 2]"\n  new: "        return s[n // 2]\\n    return (s[n // 2 - 1] + s[n // 2]) / 2"\n</str_replace_editor>' },
+      { r: 'env', who: '工具输出', n: 60, text: 'The file src/stats.py has been edited.\n    13          return s[n // 2]\n    14      return (s[n // 2 - 1] + s[n // 2]) / 2' },
+      { r: 'model', who: '模型 · 第 5 轮', n: 40, text: '<bash>python -m pytest tests/ -q</bash>' },
+      { r: 'env', who: '工具输出', n: 620, long: true, text: '============ test session starts ============\nplatform linux -- Python 3.11 …\ncollected 12 items\n\ntests/test_stats.py ............   [100%]\n… （此处省略几百行插件、警告和计时信息）…\n============ 12 passed in 0.31s ============' },
+      { r: 'model', who: '模型 · 第 6 轮', n: 20, text: '测试通过，提交。\n<submit/>' },
+      { r: 'reward', who: '判分（agent 看不到）', n: 0, text: '恢复测试文件 → 运行隐藏测试\nFAIL_TO_PASS: test_median_even ✓\nPASS_TO_PASS: 4 / 4 ✓\nR = 1' },
+    ];
+    let k = 6, maskMode = 'model', anim = null;
+    const ck = $('ck-trunc');
+    const len = (t) => (ck.checked && t.long ? 200 : t.n);
+    const col = (r) => ({ prompt: '--c5', model: '--c1', env: '--c3' }[r]);
+    const draw = V4U.canvas($('cv-traj'), (w) => (w < 500 ? 124 : 116), (ctx, w, h) => {
+      const total = T.reduce((s, t) => s + len(t), 0), pad = 2, W = w - 2 * pad;
+      const y0 = 16, hh = 54, my = y0 + hh + 10, mh = 10;
+      let x = pad;
+      ctx.font = F(11, true); ctx.textBaseline = 'bottom'; ctx.textAlign = 'left';
+      T.forEach((t, i) => {
+        const n = len(t); if (!n) return;
+        const ww = (n / total) * W, shown = i <= k;
+        if (shown) {
+          ctx.fillStyle = C(col(t.r) + 's'); ctx.fillRect(x, y0, ww, hh);
+          ctx.fillStyle = C(col(t.r)); ctx.fillRect(x, y0 + hh - 6, ww, 6);
+          const inMask = maskMode === 'all' || t.r === 'model';
+          if (inMask) { ctx.fillStyle = C('--accent'); ctx.fillRect(x, my, ww, mh); }
+        } else {
+          ctx.strokeStyle = C('--line-2'); ctx.lineWidth = 1; ctx.strokeRect(x + 0.5, y0 + 0.5, ww - 1, hh - 1);
+        }
+        if (i === k) { ctx.strokeStyle = C('--ink'); ctx.lineWidth = 2; ctx.strokeRect(x + 1, y0 + 1, ww - 2, hh - 2); }
+        ctx.strokeStyle = C('--surface'); ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(x, y0); ctx.lineTo(x, y0 + hh); ctx.stroke();
+        x += ww;
+      });
+      ctx.strokeStyle = C('--line-2'); ctx.lineWidth = 1; ctx.strokeRect(pad + 0.5, my - 0.5, W - 1, mh + 1);
+      ctx.fillStyle = C('--muted'); ctx.textBaseline = 'top'; ctx.textAlign = 'left'; ctx.fillText('0', pad, my + mh + 4);
+      ctx.textAlign = 'right'; ctx.fillText(total + ' tok', w - pad, my + mh + 4);
+      ctx.textAlign = 'left'; ctx.textBaseline = 'bottom'; ctx.fillStyle = C('--ink-2'); ctx.fillText('上下文', pad, y0 - 2);
+    });
+    const msg = $('traj-msg'), rd = $('rd-traj');
+    const upd = () => {
+      draw();
+      const t = T[k];
+      msg.innerHTML = `<p class="who ${t.r}">${t.who}${t.n ? ' · ' + len(t) + ' tok' : ''}</p><pre>${esc(t.text)}</pre>`;
+      const shown = T.slice(0, k + 1);
+      const ctxLen = shown.reduce((s, x) => s + len(x), 0), nm = shown.filter((x) => x.r === 'model').reduce((s, x) => s + len(x), 0);
+      const inLoss = maskMode === 'all' ? ctxLen : nm;
+      rd.innerHTML = `<span>当前上下文 <b>${ctxLen}</b> tok</span><span>模型 token <b>${nm}</b></span><span>计入 loss <b>${inLoss}</b>（${fmt((100 * inLoss) / ctxLen, 0)}%）</span><span>轮数 <b>${shown.filter((x) => x.r === 'model').length}</b></span>`;
+      $('tr-prev').disabled = k === 0; $('tr-next').disabled = k === T.length - 1;
+    };
+    $('tr-prev').addEventListener('click', () => { if (k > 0) { k--; upd(); } });
+    $('tr-next').addEventListener('click', () => { if (k < T.length - 1) { k++; upd(); } });
+    const play = $('tr-play');
+    play.addEventListener('click', () => {
+      if (anim) { anim.stop(); anim = null; play.textContent = '播放'; return; }
+      if (k === T.length - 1) k = 0;
+      play.textContent = '暂停'; let acc = 0;
+      anim = V4U.loop($('cv-traj'), (t, dt) => { acc += dt; if (acc > 1.1) { acc = 0; k++; upd(); if (k >= T.length - 1) { anim.stop(); anim = null; play.textContent = '播放'; } } });
+    });
+    ck.addEventListener('change', upd);
+    V4U.seg($('seg-mask'), (v) => { maskMode = v; upd(); });
+  })();
+
+  /* ---------- shared mini repo ---------- */
+  const TESTS = ['test_mean', 'test_mean_empty', 'test_median_odd', 'test_median_even', 'test_variance'];
+  const pill = (cls, s) => `<span class="pill ${cls}">${s}</span>`;
+  const diffHTML = (lines) => lines.map(([k, s]) => (k === '-' ? `<span class="del">- ${esc(s)}</span>` : k === '+' ? `<span class="add">+ ${esc(s)}</span>` : '  ' + esc(s))).join('\n');
+
+  /* ---------- 2. scoring ---------- */
+  (() => {
+    const F2P = ['test_median_even'];
+    const before = { test_mean: 1, test_mean_empty: 1, test_median_odd: 1, test_median_even: 0, test_variance: 1 };
+    const P = {
+      good: { d: [[' ', 'def median(xs):'], [' ', '    ...'], [' ', '        return s[n // 2]'], ['-', '    return s[n // 2]'], ['+', '    return (s[n // 2 - 1] + s[n // 2]) / 2']], after: { test_mean: 1, test_mean_empty: 1, test_median_odd: 1, test_median_even: 1, test_variance: 1 } },
+      wrong: { d: [[' ', '    if n % 2 == 1:'], ['-', '        return s[n // 2]'], ['+', '        return (s[n // 2 - 1] + s[n // 2]) / 2'], [' ', '    return s[n // 2]']], after: { test_mean: 1, test_mean_empty: 1, test_median_odd: 0, test_median_even: 0, test_variance: 1 } },
+      break: { d: [[' ', 'def mean(xs):'], ['-', '    if not xs: raise ValueError("empty")'], ['+', '    if not xs: return 0.0'], [' ', '...'], ['-', '    return s[n // 2]'], ['+', '    return (s[n // 2 - 1] + s[n // 2]) / 2']], after: { test_mean: 1, test_mean_empty: 0, test_median_odd: 1, test_median_even: 1, test_variance: 1 } },
+      test: { d: [[' ', '# tests/test_stats.py'], [' ', 'def test_median_even():'], ['-', '    assert median([1, 2, 3, 4]) == 2.5'], ['+', '    assert median([1, 2, 3, 4]) == 3']], after: { test_mean: 1, test_mean_empty: 1, test_median_odd: 1, test_median_even: 0, test_variance: 1 } },
+      none: { d: [[' ', '（没有改动）']], after: { test_mean: 1, test_mean_empty: 1, test_median_odd: 1, test_median_even: 0, test_variance: 1 } },
+    };
+    V4U.seg($('seg-patch'), (v) => {
+      const p = P[v];
+      $('sc-diff').innerHTML = diffHTML(p.d);
+      let ok = true;
+      $('sc-tests').innerHTML = '<thead><tr><th>测试</th><th>类别</th><th>打补丁前</th><th>打补丁后</th></tr></thead><tbody>' + TESTS.map((t) => {
+        const isF = F2P.includes(t), a = p.after[t];
+        if (!a) ok = false;
+        return `<tr><td>${t}</td><td>${isF ? pill('f2p', 'F2P') : pill('p2p', 'P2P')}</td><td>${before[t] ? pill('ok', 'pass') : pill('bad', 'fail')}</td><td>${a ? pill('ok', 'pass') : pill('bad', 'fail')}</td></tr>`;
+      }).join('') + '</tbody>';
+      const v2 = $('sc-verdict'); v2.className = 'verdict ' + (ok ? 'ok' : 'bad');
+      const f = F2P.every((t) => p.after[t]), q = TESTS.filter((t) => !F2P.includes(t)).every((t) => p.after[t]);
+      v2.textContent = `F2P ${f ? '全过' : '未过'} · P2P ${q ? '全过' : '有失败'} → ${ok ? 'resolved，R = 1' : '未解决，R = 0'}`;
+    });
+  })();
+
+  /* ---------- 3. bug injection ---------- */
+  (() => {
+    const I = {
+      op: { d: [[' ', 'def variance(xs):'], [' ', '    m = mean(xs)'], ['-', '    return sum((x - m) ** 2 for x in xs) / len(xs)'], ['+', '    return sum((x - m) ** 2 for x in xs) / (len(xs) - 1)']], fail: ['test_variance'], issue: 'variance([2, 4, 4, 4, 5, 5, 7, 9]) 返回 4.571，文档说是总体方差，应为 4.0。' },
+      del: { d: [[' ', 'def mean(xs):'], ['-', '    if not xs: raise ValueError("empty")'], [' ', '    return sum(xs) / len(xs)']], fail: ['test_mean_empty'], issue: 'mean([]) 抛出 ZeroDivisionError，按文档应抛 ValueError("empty")。' },
+      cond: { d: [[' ', '    n = len(s)'], ['-', '    if n % 2 == 1:'], ['+', '    if n % 2 == 0:'], [' ', '        return s[n // 2]']], fail: ['test_median_odd', 'test_median_even'], issue: 'median() 结果不对：median([1, 3, 2]) 返回 2.5，median([1, 2, 3, 4]) 返回 3。' },
+      combo: { d: [['-', '    if n % 2 == 1:'], ['+', '    if n % 2 == 0:'], [' ', '...'], ['-', '    return sum((x - m) ** 2 for x in xs) / len(xs)'], ['+', '    return sum((x - m) ** 2 for x in xs) / (len(xs) - 1)']], fail: ['test_median_odd', 'test_median_even', 'test_variance'], issue: 'median() 和 variance() 在若干输入上结果都不对（附三个失败用例）。' },
+      rename: { d: [[' ', 'def median(xs):'], ['-', '    s = sorted(xs)'], ['+', '    ordered = sorted(xs)'], [' ', '    …（后面同步改名）']], fail: [], issue: '' },
+    };
+    V4U.seg($('seg-inj'), (v) => {
+      const it = I[v];
+      $('inj-diff').innerHTML = diffHTML(it.d);
+      $('inj-tests').innerHTML = '<thead><tr><th>测试</th><th>注入前</th><th>注入后</th><th>归类</th></tr></thead><tbody>' + TESTS.map((t) => {
+        const f = it.fail.includes(t);
+        return `<tr><td>${t}</td><td>${pill('ok', 'pass')}</td><td>${f ? pill('bad', 'fail') : pill('ok', 'pass')}</td><td>${f ? pill('f2p', 'F2P') : pill('p2p', 'P2P')}</td></tr>`;
+      }).join('') + '</tbody>';
+      const iss = $('inj-issue'), vd = $('inj-verdict');
+      if (it.fail.length) { iss.hidden = false; iss.textContent = 'LM 生成的 issue：' + it.issue; vd.className = 'verdict ok'; vd.textContent = `有效实例：F2P ${it.fail.length} 个，P2P ${TESTS.length - it.fail.length} 个`; }
+      else { iss.hidden = true; vd.className = 'verdict bad'; vd.textContent = '无效：没有测试失败，丢弃'; }
+    });
+  })();
+
+  /* ---------- 4. difficulty distribution ---------- */
+  (() => {
+    const NT = 1000, CONC = 0.8, NB = 20, NG = 2000;
+    const draw = V4U.canvas($('cv-diff'), (w) => Math.min(300, Math.max(240, w * 0.4)), (ctx, w, h) => {
+      const m = +$('sl-pm').value, k = +$('sl-k').value, G = +$('sl-dg').value;
+      const a = m * CONC, b = (1 - m) * CONC;
+      // Beta pdf on a fine grid (midpoints), normalised numerically
+      const ps = [], ws = []; let Z = 0;
+      for (let i = 0; i < NG; i++) { const p = (i + 0.5) / NG, wv = Math.pow(p, a - 1) * Math.pow(1 - p, b - 1); ps.push(p); ws.push(wv); Z += wv; }
+      const bins = new Array(NB).fill(0); let sft = 0, rl = 0, dead = 0, done = 0;
+      ps.forEach((p, i) => { const q = ws[i] / Z; bins[Math.min(NB - 1, Math.floor(p * NB))] += q * NT; sft += q * (1 - Math.pow(1 - p, k)); rl += q * (1 - Math.pow(p, G) - Math.pow(1 - p, G)); if (p < 0.05) dead += q; if (p > 0.95) done += q; });
+      const bmax = Math.max(...bins);
+      const box = { x: 44, y: 14, w: w - 88, h: h - 40 };
+      const ytop = Math.ceil(bmax / 100) * 100;
+      const P = chart(ctx, box, [0, 1], [0, ytop], { xt: [0, 0.25, 0.5, 0.75, 1], yt: [0, ytop / 2, ytop], xl: 'p' });
+      bins.forEach((c, i) => { ctx.fillStyle = C('--c1s'); ctx.strokeStyle = C('--c1'); ctx.lineWidth = 1; const x0 = P.X(i / NB) + 1, x1 = P.X((i + 1) / NB) - 1; ctx.fillRect(x0, P.Y(c), x1 - x0, P.Y(0) - P.Y(c)); ctx.strokeRect(x0, P.Y(c), x1 - x0, P.Y(0) - P.Y(c)); });
+      const Y2 = (v) => box.y + box.h - v * box.h;
+      ctx.font = F(11, true); ctx.fillStyle = C('--muted'); ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+      [0, 0.5, 1].forEach((v) => ctx.fillText(String(v), box.x + box.w + 6, Y2(v)));
+      const c1 = [], c2 = [];
+      for (let i = 0; i <= 200; i++) { const p = i / 200; c1.push([P.X(p), Y2(1 - Math.pow(1 - p, k))]); c2.push([P.X(p), Y2(1 - Math.pow(p, G) - Math.pow(1 - p, G))]); }
+      path(ctx, c1, C('--c2'), 2.5); path(ctx, c2, C('--c3'), 2.5);
+      $('rd-diff').innerHTML = `<span>p &lt; 0.05 的任务 <b>${fmt(100 * dead, 0)}%</b></span><span>p &gt; 0.95 的任务 <b>${fmt(100 * done, 0)}%</b></span><span>SFT 能收到轨迹的任务 <b>${fmt(sft * NT, 0)}</b> / ${NT}</span><span>GRPO 有梯度的组占比 <b>${fmt(100 * rl, 0)}%</b></span>`;
+    });
+    ['sl-pm', 'sl-k', 'sl-dg'].forEach((id) => $(id).addEventListener('input', () => { $('o-pm').textContent = fmt(+$('sl-pm').value); $('o-k').textContent = $('sl-k').value; $('o-dg').textContent = $('sl-dg').value; draw(); }));
+  })();
+
+  /* ---------- 5. sync vs async timeline ---------- */
+  (() => {
+    const S = 8, B = 8, TTR = 3, TMAX = 60;
+    let mode = 'sync', seed = 4;
+    const durs = (sig) => { const r = rng(seed); return Array.from({ length: 400 }, () => Math.max(0.6, 4 * Math.exp(sig * gauss(r) - (sig * sig) / 2))); };
+    const simulate = () => {
+      const sig = +$('sl-tail').value, eta = +$('sl-eta').value, D = durs(sig);
+      let di = 0; const bars = [], trains = [], stale = [];
+      if (mode === 'sync') {
+        let t = 0, v = 0;
+        while (t < TMAX) {
+          let end = t;
+          for (let s = 0; s < S; s++) { const d = D[di++]; bars.push({ s, t0: t, t1: t + d, v }); end = Math.max(end, t + d); }
+          trains.push({ t0: end, t1: end + TTR, v }); stale.push(...new Array(B).fill(0));
+          t = end + TTR; v++;
+        }
+      } else {
+        const free = new Array(S).fill(0); let v = 0, started = 0, trainerFree = 0, curTrain = null; const done = [];
+        const dt = 0.05;
+        for (let t = 0; t < TMAX; t += dt) {
+          if (curTrain && t >= curTrain.t1 - 1e-9) { v++; curTrain = null; }
+          for (let s = 0; s < S; s++) {
+            if (free[s] <= t + 1e-9 && Math.floor(started / B) <= v + eta) {
+              const d = D[di++], bar = { s, t0: t, t1: t + d, v }; bars.push(bar); done.push(bar); free[s] = t + d; started++;
+            }
+          }
+          // samples more than eta versions old are discarded
+          for (let i = done.length - 1; i >= 0; i--) if (v - done[i].v > eta) { done[i].drop = true; done.splice(i, 1); }
+          if (!curTrain && t >= trainerFree) {
+            const ready = done.filter((x) => x.t1 <= t + 1e-9).sort((p, q) => p.t1 - q.t1);
+            if (ready.length >= B) {
+              ready.slice(0, B).forEach((x) => { stale.push(v - x.v); done.splice(done.indexOf(x), 1); });
+              curTrain = { t0: t, t1: t + TTR, v }; trains.push(curTrain); trainerFree = t + TTR;
+            }
+          }
+        }
+      }
+      return { bars, trains, stale };
+    };
+    let sim = simulate();
+    const vc = ['--c1', '--c2', '--c3', '--c4', '--c5', '--c6'];
+    const draw = V4U.canvas($('cv-async'), (w) => (w < 500 ? 250 : 270), (ctx, w, h) => {
+      const lab = 44, box = { x: lab, y: 6, w: w - lab - 8, h: h - 30 };
+      const rows = S + 1, rh = box.h / rows, X = (t) => box.x + (Math.min(t, TMAX) / TMAX) * box.w;
+      ctx.fillStyle = C('--surface-2'); ctx.fillRect(box.x, box.y, box.w, box.h);
+      ctx.font = F(11, true); ctx.textAlign = 'right'; ctx.textBaseline = 'middle'; ctx.fillStyle = C('--muted');
+      for (let s = 0; s < S; s++) ctx.fillText('槽' + (s + 1), lab - 6, box.y + rh * (s + 0.5));
+      ctx.fillText('训练', lab - 6, box.y + rh * (S + 0.5));
+      const bar = (row, t0, t1, v, drop) => { if (t0 >= TMAX) return; const x0 = X(t0), x1 = X(t1); if (drop) { ctx.strokeStyle = C(vc[v % 6]); ctx.lineWidth = 1.5; ctx.strokeRect(x0 + 1, box.y + rh * row + 2.5, Math.max(1, Math.min(x1, X(TMAX)) - x0 - 2), rh - 5); return; } ctx.fillStyle = C(vc[v % 6]); ctx.fillRect(x0 + 0.5, box.y + rh * row + 2, Math.max(1, x1 - x0 - 1), rh - 4); if (x1 - x0 > 14 && rh > 12) { ctx.fillStyle = C('--surface'); ctx.textAlign = 'center'; ctx.font = F(10, true); ctx.fillText(String(v), (x0 + Math.min(x1, X(TMAX))) / 2, box.y + rh * (row + 0.5)); } };
+      sim.bars.forEach((b) => bar(b.s, b.t0, b.t1, b.v, b.drop));
+      sim.trains.forEach((t) => bar(S, t.t0, t.t1, t.v));
+      ctx.strokeStyle = C('--line-2'); ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(box.x, box.y + rh * S); ctx.lineTo(box.x + box.w, box.y + rh * S); ctx.stroke();
+      ctx.fillStyle = C('--muted'); ctx.textAlign = 'center'; ctx.textBaseline = 'top'; ctx.font = F(11, true);
+      [0, 15, 30, 45, 60].forEach((t) => ctx.fillText(String(t), X(t), box.y + box.h + 6));
+    });
+    const rd = $('rd-async');
+    const upd = (re) => {
+      $('o-tail').textContent = fmt(+$('sl-tail').value); $('o-eta').textContent = $('sl-eta').value;
+      if (re) sim = simulate();
+      draw();
+      let busy = 0; sim.bars.forEach((b) => { busy += Math.max(0, Math.min(b.t1, TMAX) - Math.min(b.t0, TMAX)); });
+      const steps = sim.trains.filter((t) => t.t1 <= TMAX).length;
+      const used = sim.stale.slice(0, steps * B);
+      const ms = used.length ? used.reduce((a, b) => a + b, 0) / used.length : 0, mx = used.length ? Math.max(...used) : 0;
+      const nd = sim.bars.filter((b) => b.drop).length;
+      rd.innerHTML = `<span>完成训练步 <b>${steps}</b></span><span>rollout 槽利用率 <b>${fmt((100 * busy) / (S * TMAX), 0)}%</b></span><span>平均陈旧度 <b>${fmt(ms, 2)}</b></span><span>最大陈旧度 <b>${mx}</b></span><span>因过旧丢弃 <b>${nd}</b> 条</span>`;
+    };
+    V4U.seg($('seg-sync'), (v) => { mode = v; $('sl-eta').disabled = v === 'sync'; upd(true); });
+    $('sl-tail').addEventListener('input', () => upd(true)); $('sl-eta').addEventListener('input', () => upd(true));
+    $('bt-async').addEventListener('click', () => { seed++; upd(true); });
+  })();
+
+  /* ---------- 6. reward designs ---------- */
+  (() => {
+    // per behaviour: hidden F2P (2 tests: issue example + another even case), P2P (4), in-repo visible tests after agent edits, patch similarity
+    const B = [
+      { n: '正确修复', hid: [1, 1], p2p: 4, repo: 1, sim: 1.0, hack: false },
+      { n: '另一种正确写法', hid: [1, 1], p2p: 4, repo: 1, sim: 0.62, hack: false },
+      { n: '修好但改坏 mean', hid: [1, 1], p2p: 3, repo: 0, sim: 0.71, hack: false },
+      { n: '只修了 issue 里那个例子（硬编码）', hid: [1, 0], p2p: 4, repo: 1, sim: 0.18, hack: true },
+      { n: '修改测试的期望值', hid: [0, 0], p2p: 4, repo: 1, sim: 0.05, hack: true },
+      { n: '删掉失败的测试', hid: [0, 0], p2p: 4, repo: 1, sim: 0.02, hack: true },
+      { n: '什么都不改', hid: [0, 0], p2p: 4, repo: 0, sim: 0.0, hack: false },
+    ];
+    const score = (b, mode) => {
+      if (mode === 'hidden') return b.hid.every(Boolean) && b.p2p === 4 ? 1 : 0;
+      if (mode === 'inrepo') return b.repo;
+      if (mode === 'partial') return (b.hid[0] + b.hid[1] + b.p2p) / 6;
+      return b.sim;
+    };
+    V4U.seg($('seg-rw'), (mode) => {
+      $('rw-table').innerHTML = '<thead><tr><th>行为</th><th>奖励</th><th></th></tr></thead><tbody>' + B.map((b) => {
+        const s = score(b, mode), bad = b.hack && s > 0.5;
+        return `<tr class="${bad ? 'hack' : ''}"><td>${b.n}</td><td class="num">${fmt(s)}</td><td style="width:45%"><span class="rbar" style="width:${(s * 100).toFixed(0)}%;background:var(${bad ? '--bad' : '--accent'})"></span></td></tr>`;
+      }).join('') + '</tbody>';
+    });
+  })();
+});
+</script>
+</body>
+</html>

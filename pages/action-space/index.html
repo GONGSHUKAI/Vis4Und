@@ -1,0 +1,1010 @@
+<!doctype html>
+<html lang="zh-CN" data-sec="robotics">
+<head>
+<!-- v4u:head -->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="icon" href="data:,">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700&family=Inter+Tight:wght@700&family=JetBrains+Mono:wght@400;700&family=Noto+Sans+SC:wght@400;700&display=swap">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<link rel="stylesheet" href="../../assets/v4u.css?v=4288b6c4">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
+<script src="../../assets/v4u.js?v=d6640e00"></script>
+<!-- /v4u:head -->
+<title>机器人的运动空间 · Vis4Und</title>
+<meta name="description" content="关节空间与末端空间、绝对动作与增量动作、正运动学、雅可比与逆运动学；VLA 的动作到底在哪个空间里。">
+<style>
+.pane-t{font:700 13px/1.4 var(--f-body);color:var(--ink-2);margin:0 0 6px}
+.viz-ctrl .grp{display:flex;flex-wrap:wrap;gap:8px 18px}
+.dh td{font-family:var(--f-mono);font-size:13.5px}
+.dh td:first-child{font-family:var(--f-body)}
+#spatial .tbl table{min-width:640px}
+#datasets .tbl table{min-width:860px}
+</style>
+</head>
+<body>
+<!-- v4u:nav -->
+<nav class="v4u-nav" aria-label="站点导航"><div class="v4u-nav-in"><span class="v4u-crumb"><a href="../../"><b>Vis4Und</b></a><span class="v4u-sep">/</span><a href="../../#robotics">(1) 机器人学</a></span><span class="v4u-links"><a href="../rotations/">补充 旋转与位姿</a><a href="../action-space/" aria-current="page">(i) 运动空间</a><a href="../camera/">(ii) 相机</a><button type="button" class="v4u-theme" aria-label="切换深浅色">深色</button></span></div></nav>
+<!-- /v4u:nav -->
+
+<header class="hero"><div class="wrap">
+  <p class="kicker">(1) 机器人学 · (i)</p>
+  <h1>机器人的运动空间</h1>
+  <p class="lede">VLA 输出的一串数字，要先说清三件事机器人才知道怎么动：在哪个空间（关节还是末端）、相对什么（绝对、相对上一步、相对 chunk 起点）、在哪个坐标系。这页讲这些选择，讲它们之间怎么换算（正运动学、雅可比、逆运动学），再对照常见数据集和策略各用哪一种。</p>
+  <p class="asks-h">读完能回答</p>
+  <ul class="asks">
+    <li>关节空间和末端空间的动作分别由什么执行？7 自由度臂为什么有无穷多组逆解？</li>
+    <li>absolute、step-wise delta、相对 chunk 起点的动作，误差各怎么累积？</li>
+    <li>同一个增量在基座系和工具系下执行，轨迹差在哪？</li>
+    <li>雅可比怎么推？奇异位形附近关节速度为什么会爆？</li>
+    <li>DLS 逆运动学怎么推出来？零空间能用来做什么？</li>
+  </ul>
+</div></header>
+
+<div class="wrap layout">
+<nav class="toc" id="toc" aria-label="本页目录"></nav>
+<main>
+
+<section id="spaces">
+  <h2>关节空间与任务空间</h2>
+  <p class="def"><b>关节空间</b>（configuration / joint space）：所有关节变量 $\mathbf q=(q_1,\dots,q_n)$，$n$ 就是自由度（DoF）。<b>任务空间</b>（task / Cartesian space）：末端执行器（end-effector，EEF）在基座系下的位姿 ${}^{b}T_{e}\in SE(3)$，6 个自由度：3 个平移、3 个旋转。</p>
+
+  <table class="notation">
+    <caption>全页记号</caption>
+    <thead><tr><th>符号</th><th>含义</th><th>形状 / 单位</th></tr></thead>
+    <tbody>
+      <tr><td>$\mathbf q,\ \dot{\mathbf q}$</td><td>关节角（转动关节）、关节速度</td><td>$\mathbb{R}^n$；rad，rad/s</td></tr>
+      <tr><td>$\mathbf x,\ T={}^{b}T_{e}$</td><td>末端位姿；$\mathbf p$ 位置，$R$ 姿态</td><td>$SE(3)$；m</td></tr>
+      <tr><td>$f(\mathbf q)$</td><td>正运动学：关节角 → 末端位姿</td><td>$\mathbb{R}^n\to SE(3)$</td></tr>
+      <tr><td>$\mathcal V=(\mathbf v,\boldsymbol\omega)$</td><td>末端速度（twist）：线速度、角速度</td><td>$\mathbb{R}^6$；m/s，rad/s</td></tr>
+      <tr><td>$J(\mathbf q)$</td><td>雅可比，$\mathcal V=J\dot{\mathbf q}$</td><td>$m\times n$（空间臂 $m=6$）</td></tr>
+      <tr><td>$\mathbf s_t$</td><td>决策时刻 $t$ 观测到的机器人状态</td><td>同 $\mathbf q$ 或 $\mathbf x$</td></tr>
+      <tr><td>$\mathbf a_k,\ H$</td><td>一个 chunk 里第 $k$ 步的动作、chunk 长度</td><td>$k=1..H$</td></tr>
+      <tr><td>$\mathbf x^*_{t+k}$</td><td>第 $t+k$ 步要到达的目标</td><td>同 $\mathbf x$</td></tr>
+      <tr><td>$\Delta t$</td><td>控制周期（控制频率的倒数）</td><td>s</td></tr>
+    </tbody>
+  </table>
+
+  <ul>
+    <li><b>正运动学</b>（FK）$\mathbf x=f(\mathbf q)$ 总有唯一结果；<b>逆运动学</b>（IK）$\mathbf q=f^{-1}(\mathbf x)$ 可能无解（够不着）、有限多解、或无穷多解。</li>
+    <li><b>冗余</b>：关节数 $n$ 大于任务维数 $m$ 时，多出 $n-m$ 维<b>自运动</b>（self-motion）：末端不动、关节还能动。Franka Panda / FR3 有 7 个关节，末端 6 维位姿固定后，肘部还能绕肩–腕连线转。平面 3 连杆只控末端位置（$m=2$）同样冗余 1 维，见 <a href="#ik">逆运动学</a> 一节的图。</li>
+    <li><b>夹爪</b>通常单独占 1 维：开口宽度（连续）或开 / 合（二值）。双臂直接拼接：ALOHA 是 $2\times(6\text{ 关节}+1\text{ 夹爪})=14$ 维。</li>
+    <li>两个空间的「直线」不是一回事：关节角线性插值时末端走曲线；末端走直线时关节角走曲线。</li>
+  </ul>
+
+  <figure class="viz" id="viz-js">
+    <div class="viz-h"><b>同样的起点和终点，在哪个空间插值走出的路径不同</b><span>2 连杆，l₁ = 1.0 m，l₂ = 0.8 m</span></div>
+    <div class="viz-grid">
+      <div class="viz-stage"><p class="pane-t">任务空间（拖动 A、B）</p><canvas id="cv-js-t" aria-label="平面两连杆臂与两条末端路径"></canvas></div>
+      <div class="viz-stage"><p class="pane-t">关节空间 (q₁, q₂)</p><canvas id="cv-js-j" aria-label="关节空间中的两条路径"></canvas></div>
+    </div>
+    <div class="viz-ctrl">
+      <div class="seg" id="sg-js-m" role="group" aria-label="插值方式"><button type="button" data-v="joint" aria-pressed="true">关节插值</button><button type="button" data-v="cart">末端直线</button></div>
+      <div class="seg" id="sg-js-e" role="group" aria-label="肘部构型"><button type="button" data-v="1" aria-pressed="true">q₂ &gt; 0</button><button type="button" data-v="-1">q₂ &lt; 0</button></div>
+      <label for="sl-js-t">t <input type="range" id="sl-js-t" min="0" max="1" step="0.005" value="0.5"><output id="o-js-t">0.50</output></label>
+      <button type="button" class="btn ghost" id="bt-js">播放</button>
+    </div>
+    <div class="viz-read" id="rd-js"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>关节角线性插值</li><li><i style="background:var(--c2)"></i>末端沿直线（逐点解析 IK）</li><li><i style="background:var(--surface-2)"></i>可达区域</li></ul>
+    <figcaption>深色的臂按当前选中的插值方式画，浅色的是另一种。两条路径端点相同，中间不同。把 B 拖到靠近内圈或外圈（臂折叠或伸直，奇异位形），末端直线所需的关节速度峰值迅速变大。q₂ 的正负对应同一末端位置的两组解（肘上 / 肘下）。</figcaption>
+  </figure>
+</section>
+
+<section id="spatial">
+  <h2 data-toc="动作取什么量">空间抽象：动作是什么量</h2>
+  <div class="tbl"><table>
+    <thead><tr><th>动作</th><th>维度（单臂）</th><th>谁来执行</th><th>特点</th></tr></thead>
+    <tbody>
+      <tr><td>关节位置 $\mathbf q^*$</td><td class="num">n（+1 夹爪）</td><td>每个关节的位置伺服（PD / PID）</td><td>不用 IK，直接可执行；换一台机器人含义就变</td></tr>
+      <tr><td>关节速度 $\dot{\mathbf q}^*$</td><td class="num">n</td><td>速度环，或积分成位置目标</td><td>和关节位置的 step-wise delta 只差一个 $\Delta t$</td></tr>
+      <tr><td>关节力矩 $\boldsymbol\tau$</td><td class="num">n</td><td>电机电流环</td><td>要处理动力学；模仿学习里少见，RL 里常见</td></tr>
+      <tr><td>末端位姿 $T^*$</td><td class="num">3 + 旋转表示</td><td>IK 求关节目标，或操作空间控制</td><td>跨机器人含义一致；可能不可达、有多解</td></tr>
+      <tr><td>末端速度 $\mathcal V^*$</td><td class="num">6</td><td>微分 IK $\dot{\mathbf q}=J^{+}\mathcal V$，或操作空间控制</td><td>奇异附近关节速度大</td></tr>
+      <tr><td>夹爪</td><td class="num">1</td><td>夹爪自己的控制器</td><td>宽度（连续）或开 / 合（二值）</td></tr>
+    </tbody>
+  </table></div>
+  <p>末端动作的旋转部分用什么表示（轴角、RPY、四元数、6D）见 <a href="../rotations/">旋转与位姿表示</a>。</p>
+  <div class="note pit"><b>易错</b><p>「末端位姿」还要说清两件事：在哪个坐标系下（基座、世界、相机），以及是哪个点（法兰 flange，还是夹爪指尖之间的 TCP）。同一条轨迹换一个参考点，平移量就不同。</p></div>
+</section>
+
+<section id="temporal">
+  <h2 data-toc="绝对与增量">时序抽象：absolute、delta、chunk 相对</h2>
+  <p>策略在时刻 $t$ 看到状态 $\mathbf s_t$，输出一段 $\mathbf a_{1..H}$，对应目标 $\mathbf x^*_{t+1..t+H}$。四种写法：</p>
+  <ul>
+    <li><b>absolute</b>：$\mathbf a_k=\mathbf x^*_{t+k}$。</li>
+    <li><b>step-wise delta</b>：$\mathbf a_k=\mathbf x^*_{t+k}-\mathbf x^*_{t+k-1}$（$\mathbf x^*_t:=\mathbf s_t$），执行时累加：$\mathbf x^*_{t+k}=\mathbf s_t+\sum_{j\le k}\mathbf a_j$。</li>
+    <li><b>chunk-relative</b>（相对 chunk 起点）：$\mathbf a_k=\mathbf x^*_{t+k}-\mathbf s_t$。位姿写成 $\mathbf a_k={}^{b}T_{e,t}^{-1}\,{}^{b}T^*_{e,t+k}$（UMI 的 relative trajectory）。</li>
+    <li><b>velocity</b>：$\mathbf a_k=(\mathbf x^*_{t+k}-\mathbf x^*_{t+k-1})/\Delta t$，由控制器积分，误差性质和 step-wise delta 相同。</li>
+  </ul>
+  <div class="note"><b>同名不同义</b><p>openpi 的 <code>DeltaActions</code> 是 chunk-relative：把 chunk 里每一步都减去同一个当前状态。LIBERO 和 BridgeData 的 delta 是单步动作、相对当前<b>测量</b>位姿，每步都重新观测，等价于 $H=1$ 的 chunk-relative。</p></div>
+
+  <h3>误差怎么传</h3>
+  <p>设每个动作带独立误差 $\boldsymbol\eta_k$（每维标准差 $\sigma$），执行无误差，策略也不根据图像去纠正已有偏差。记 $\mathbf e_t=\mathbf s_t-\mathbf x^{\text{demo}}_t$。</p>
+  <ol class="derive">
+    <li><p>absolute：目标直接写在某个坐标系里，若该系与机器人基座差一个标定偏差 $\mathbf b$：</p>$$\mathbf e_{t+k}=\mathbf b+\boldsymbol\eta_k$$</li>
+    <li><p>step-wise delta：误差逐步相加，方差随步数线性增长：</p>$$\mathbf e_{t+k}=\mathbf e_t+\sum_{j=1}^{k}\boldsymbol\eta_j,\qquad \mathbb E\|\mathbf e_{t}\|^2\propto\sigma^2\,t$$</li>
+    <li><p>chunk-relative：chunk 内不相加，只有 chunk 末的误差会成为下一个 chunk 的起点：</p>$$\mathbf e_{t+k}=\mathbf e_t+\boldsymbol\eta_k,\qquad \mathbb E\|\mathbf e_{t}\|^2\propto\sigma^2\,t/H$$</li>
+    <li><p>相对表示里 $\mathbf b$ 在相减时抵消：$(\mathbf x^*+\mathbf b)-(\mathbf s+\mathbf b)=\mathbf x^*-\mathbf s$，所以不需要外部坐标系的绝对标定。</p></li>
+  </ol>
+
+  <figure class="viz" id="viz-dr">
+    <div class="viz-h"><b>同一串动作误差，三种表示的漂移</b><span>单位：m / mm</span></div>
+    <div class="viz-grid">
+      <div class="viz-stage"><p class="pane-t">一次执行的末端轨迹</p><canvas id="cv-dr-p" aria-label="示教轨迹和三种表示执行出的轨迹"></canvas></div>
+      <div class="viz-stage"><p class="pane-t">200 次的 RMS 误差 vs 步数</p><canvas id="cv-dr-e" aria-label="误差随步数增长的曲线"></canvas></div>
+    </div>
+    <div class="viz-ctrl">
+      <label for="sl-dr-s">σ <input type="range" id="sl-dr-s" min="0.5" max="8" step="0.5" value="3"><output id="o-dr-s">3 mm</output></label>
+      <label for="sl-dr-b">标定偏差 b <input type="range" id="sl-dr-b" min="0" max="4" step="0.1" value="1.5"><output id="o-dr-b">1.5 cm</output></label>
+      <label for="sl-dr-h">H <input type="range" id="sl-dr-h" min="1" max="30" step="1" value="10"><output id="o-dr-h">10</output></label>
+      <label for="sl-dr-t">步 <input type="range" id="sl-dr-t" min="0" max="150" step="1" value="150"><output id="o-dr-t">150</output></label>
+      <button type="button" class="btn ghost" id="bt-dr">播放</button>
+      <button type="button" class="btn ghost" id="bt-dr-r">重新采样</button>
+    </div>
+    <div class="viz-read" id="rd-dr"></div>
+    <ul class="chips"><li><i style="background:var(--muted)"></i>示教轨迹</li><li><i style="background:var(--c1)"></i>absolute</li><li><i style="background:var(--c2)"></i>step-wise delta</li><li><i style="background:var(--c3)"></i>chunk-relative（圆点是 chunk 起点）</li></ul>
+    <figcaption>示教轨迹是 8 字形（150 步）。三种表示使用同一串动作误差。absolute 不累积，但整体平移了 b；step-wise delta 的误差按 √t 增长；chunk-relative 每 H 步才累积一次，并且与 b 无关。H = 1 时 chunk-relative 退化成「每步重新观测的单步 delta」。真实策略看图像能部分纠正偏差，这里只演示误差怎样经由动作表示传播。</figcaption>
+  </figure>
+
+  <p>实验证据：</p>
+  <ul>
+    <li><b>UMI</b>（杯子摆放，20 次测试）：relative 20/20，step-wise delta 16/20，absolute 5/20；作者把 absolute 的失败归因于 SLAM 坐标系与机器人基座之间的标定误差。</li>
+    <li><b>Feng et al., 2026</b>（13,000+ 次真机 rollout，500+ 个模型）：delta 在所有设置下都优于 absolute；chunk-wise delta 比 step-wise 平均高 10% 以上；关节空间控制更稳，任务空间更利于跨本体迁移。</li>
+    <li><b>ACT</b> 的结论相反：论文报告用 delta 关节位置代替目标关节位置时性能下降。没有放之四海皆准的选择。</li>
+  </ul>
+
+  <h3>Action chunking</h3>
+  <ul>
+    <li>一次预测 $H$ 步，开环执行其中 $h\le H$ 步再重新推理。$h$ 越大，对扰动反应越慢；$h$ 越小，推理越频繁，相邻 chunk 衔接处越容易抖。</li>
+    <li><b>ACT</b>：$k=100$（50 Hz 下 2 s）。每步都推理，同一时刻会有多个 chunk 的预测，按 $w_i=\exp(-m\,i)$ 加权平均（temporal ensembling），$w_0$ 是最早那次预测的权重，$m$ 越小越快吸收新观测。</li>
+    <li><b>π0</b>：$H=50$；50 Hz 的机器人每 0.5 s 推理一次，20 Hz 的 UR5e、Franka 每 0.8 s 一次。</li>
+    <li><b>DROID</b> 论文的 diffusion policy：预测 16 步、执行 8 步。</li>
+  </ul>
+</section>
+
+<section id="frame">
+  <h2 data-toc="增量在哪个坐标系">末端增量在哪个坐标系</h2>
+  <p>末端位姿增量 $(\Delta\mathbf p,\Delta R)$ 有三种执行法，推导见 <a href="../rotations/#se3">旋转与位姿 · 位姿增量</a>：</p>
+  <ol>
+    <li><b>基座系、解耦</b>：$\mathbf p\leftarrow\mathbf p+\Delta\mathbf p$，$R\leftarrow\Delta R\,R$。旋转轴的方向取基座系，但绕末端自身的原点转。robosuite 的 OSC 控制器（LIBERO 用它）就这么执行。</li>
+    <li><b>工具系</b>（右乘）：$T\leftarrow T\,\Delta T$，即 $\mathbf p\leftarrow\mathbf p+R\,\Delta\mathbf p$，$R\leftarrow R\,\Delta R$。</li>
+    <li><b>基座系、整体左乘</b>：$T\leftarrow\Delta T\,T$，即 $\mathbf p\leftarrow\Delta R\,\mathbf p+\Delta\mathbf p$，$R\leftarrow\Delta R\,R$。旋转绕基座原点，末端被甩出去。</li>
+  </ol>
+  <p>同一个增量重复 $N$ 次：方式 1 走直线、同时转动；方式 2 走半径 $\frac{\|\Delta\mathbf p\|}{2\sin(\Delta\psi/2)}$ 的圆（平面情形）；方式 3 绕基座原点画圆。</p>
+
+  <figure class="viz" id="viz-fr">
+    <div class="viz-h"><b>同一个 (Δx, Δy, Δψ) 重复 N 步</b><span>平面示意；单位：cm / 度</span></div>
+    <div class="viz-stage"><canvas id="cv-fr" aria-label="三种增量执行法得到的末端轨迹"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="sl-fr-x">Δx <input type="range" id="sl-fr-x" min="-10" max="10" step="0.5" value="6"><output id="o-fr-x">6</output></label>
+      <label for="sl-fr-y">Δy <input type="range" id="sl-fr-y" min="-10" max="10" step="0.5" value="0"><output id="o-fr-y">0</output></label>
+      <label for="sl-fr-p">Δψ <input type="range" id="sl-fr-p" min="-45" max="45" step="1" value="15"><output id="o-fr-p">15°</output></label>
+      <label for="sl-fr-0">初始朝向 ψ₀ <input type="range" id="sl-fr-0" min="-180" max="180" step="5" value="60"><output id="o-fr-0">60°</output></label>
+      <label for="sl-fr-n">N <input type="range" id="sl-fr-n" min="1" max="24" step="1" value="10"><output id="o-fr-n">10</output></label>
+    </div>
+    <div class="viz-read" id="rd-fr"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>基座系、解耦</li><li><i style="background:var(--c2)"></i>工具系（右乘）</li><li><i style="background:var(--c4)"></i>基座系、整体左乘</li><li><i style="background:var(--bad)"></i>基座 x 轴</li><li><i style="background:var(--ok)"></i>基座 y 轴</li></ul>
+    <figcaption>夹爪图标的手指方向是工具系 x 轴。三条轨迹从同一个位姿出发，执行同一串数字。把 Δψ 设成 0：基座解耦和整体左乘重合，工具系只在 ψ₀ = 0 时与它们重合。</figcaption>
+  </figure>
+  <div class="note pit"><b>易错</b><p>训练数据里的增量是按哪种方式从相邻两帧算出来的，部署时就必须用同一种方式执行。两者不一致时，平移在初始朝向不为零时就已经偏了，旋转越多偏得越远，而且不会报错。</p></div>
+</section>
+
+<section id="fk">
+  <h2 data-toc="正运动学与 DH">正运动学与 DH 参数</h2>
+  <p class="def"><b>正运动学</b>把每个关节的变换按顺序右乘：${}^{0}T_{n}(\mathbf q)={}^{0}T_{1}(q_1)\,{}^{1}T_{2}(q_2)\cdots{}^{n-1}T_{n}(q_n)$。链式记号的读法见 <a href="../rotations/#se3">位姿与 SE(3)</a>。</p>
+  <p><b>DH 参数</b>（Denavit–Hartenberg）给每个关节坐标系定好规则：z 轴沿关节轴，x 轴沿相邻两根关节轴的公垂线，于是每个关节只要 4 个数。</p>
+  <table class="notation">
+    <caption>DH 参数</caption>
+    <thead><tr><th>符号</th><th>含义</th><th>单位</th></tr></thead>
+    <tbody>
+      <tr><td>$a$</td><td>连杆长度：沿 x 轴，两根关节轴之间的公垂线长度</td><td>m</td></tr>
+      <tr><td>$\alpha$</td><td>连杆扭角：绕 x 轴，相邻两根关节轴的夹角</td><td>rad</td></tr>
+      <tr><td>$d$</td><td>连杆偏距：沿 z 轴的距离</td><td>m</td></tr>
+      <tr><td>$\theta$</td><td>关节角：绕 z 轴的转角；转动关节 $\theta_i=q_i+\text{offset}$</td><td>rad</td></tr>
+    </tbody>
+  </table>
+  <ul>
+    <li><b>标准 DH</b>：坐标系 $i$ 固定在连杆 $i$ 的末端，即关节 $i+1$ 的轴上。$${}^{i-1}T_{i}=\mathrm{Rot}_z(\theta_i)\,\mathrm{Trans}_z(d_i)\,\mathrm{Trans}_x(a_i)\,\mathrm{Rot}_x(\alpha_i)=\begin{bmatrix}c\theta_i&-s\theta_i c\alpha_i&s\theta_i s\alpha_i&a_ic\theta_i\\s\theta_i&c\theta_i c\alpha_i&-c\theta_i s\alpha_i&a_is\theta_i\\0&s\alpha_i&c\alpha_i&d_i\\0&0&0&1\end{bmatrix}$$</li>
+    <li><b>改进 DH</b>（modified，Craig 约定）：坐标系 $i$ 固定在关节 $i$ 自己的轴上，$a_{i-1},\alpha_{i-1}$ 描述的是前一根连杆。$${}^{i-1}T_{i}=\mathrm{Rot}_x(\alpha_{i-1})\,\mathrm{Trans}_x(a_{i-1})\,\mathrm{Rot}_z(\theta_i)\,\mathrm{Trans}_z(d_i)=\begin{bmatrix}c\theta_i&-s\theta_i&0&a_{i-1}\\s\theta_i c\alpha_{i-1}&c\theta_i c\alpha_{i-1}&-s\alpha_{i-1}&-d_is\alpha_{i-1}\\s\theta_i s\alpha_{i-1}&c\theta_i s\alpha_{i-1}&c\alpha_{i-1}&d_ic\alpha_{i-1}\\0&0&0&1\end{bmatrix}$$</li>
+    <li>同一台机器人，两种约定给出的参数表不同，套错公式算出的末端位姿就错。读别人的 DH 表先看约定。</li>
+    <li>URDF 和 MJCF 不用 DH：每个关节直接给出父→子坐标系的固定位姿（URDF 的 <code>&lt;origin xyz rpy&gt;</code>）和转轴 <code>axis</code>，${}^{\text{parent}}T_{\text{child}}(q)=T_{\text{origin}}\,\mathrm{Rot}(\text{axis},q)$。Pinocchio、MuJoCo、PyBullet 都按这种树结构算 FK。</li>
+  </ul>
+
+  <figure class="viz" id="viz-fk">
+    <div class="viz-h"><b>平面 3 连杆：逐个乘上 ⁱ⁻¹Tᵢ</b><span>标准 DH，aᵢ = Lᵢ，αᵢ = dᵢ = 0；单位：m / 度</span></div>
+    <div class="viz-stage"><canvas id="cv-fk" aria-label="平面三连杆和各关节坐标系"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="sl-fk1">θ₁ <input type="range" id="sl-fk1" min="-180" max="180" step="1" value="40"><output id="o-fk1">40°</output></label>
+      <label for="sl-fk2">θ₂ <input type="range" id="sl-fk2" min="-180" max="180" step="1" value="-55"><output id="o-fk2">-55°</output></label>
+      <label for="sl-fk3">θ₃ <input type="range" id="sl-fk3" min="-180" max="180" step="1" value="70"><output id="o-fk3">70°</output></label>
+      <div class="seg" id="sg-fk" role="group" aria-label="乘到第几个"><button type="button" data-v="1">⁰T₁</button><button type="button" data-v="2">⁰T₂</button><button type="button" data-v="3" aria-pressed="true">⁰T₃</button></div>
+    </div>
+    <div class="viz-read" id="rd-fk"></div>
+    <ul class="chips"><li><i style="background:var(--bad)"></i>xᵢ</li><li><i style="background:var(--ok)"></i>yᵢ</li><li><i style="background:var(--c4)"></i>θᵢ：在坐标系 i−1 里绕 z 转的角</li></ul>
+    <figcaption>平面情形 ${}^{i-1}T_i=\begin{bmatrix}c\theta_i&-s\theta_i&L_ic\theta_i\\s\theta_i&c\theta_i&L_is\theta_i\\0&0&1\end{bmatrix}$：先在坐标系 $i-1$ 里转 $\theta_i$，再沿新的 x 轴走 $L_i$。选 ⁰Tₖ 时，k 之后的坐标系变淡，读数给出累乘到第 k 个的矩阵；最后一列就是坐标系 k 原点的位置。</figcaption>
+  </figure>
+
+  <h3>例：Franka Panda / FR3</h3>
+  <p>Franka 官方文档给出的运动学参数（Craig 约定，单位 m / rad；FR3 与 Panda 的连杆参数相同，关节限位不同）：</p>
+  <div class="tbl dh"><table>
+    <thead><tr><th>关节</th><th>a (m)</th><th>d (m)</th><th>α (rad)</th><th>θ</th><th>Panda 限位 (rad)</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>0</td><td>0.333</td><td>0</td><td>q₁</td><td>[−2.8973, 2.8973]</td></tr>
+      <tr><td>2</td><td>0</td><td>0</td><td>−π/2</td><td>q₂</td><td>[−1.7628, 1.7628]</td></tr>
+      <tr><td>3</td><td>0</td><td>0.316</td><td>π/2</td><td>q₃</td><td>[−2.8973, 2.8973]</td></tr>
+      <tr><td>4</td><td>0.0825</td><td>0</td><td>π/2</td><td>q₄</td><td>[−3.0718, −0.0698]</td></tr>
+      <tr><td>5</td><td>−0.0825</td><td>0.384</td><td>−π/2</td><td>q₅</td><td>[−2.8973, 2.8973]</td></tr>
+      <tr><td>6</td><td>0</td><td>0</td><td>π/2</td><td>q₆</td><td>[−0.0175, 3.7525]</td></tr>
+      <tr><td>7</td><td>0.088</td><td>0</td><td>π/2</td><td>q₇</td><td>[−2.8973, 2.8973]</td></tr>
+      <tr><td>法兰</td><td>0</td><td>0.107</td><td>0</td><td>0</td><td>—</td></tr>
+    </tbody>
+  </table></div>
+
+  <figure class="viz" id="viz-panda">
+    <div class="viz-h"><b>7 关节 Panda 的正运动学（改进 DH）</b><span>单位：度 / m；拖动画面换视角</span></div>
+    <div class="viz-stage"><canvas id="cv-panda" aria-label="三维 Panda 机械臂骨架和关节坐标系"></canvas></div>
+    <div class="viz-ctrl">
+      <div class="grp" id="gp-panda"></div>
+      <button type="button" class="btn ghost" id="bt-pd-0">零位</button>
+      <button type="button" class="btn ghost" id="bt-pd-r">ready 位姿</button>
+      <div class="seg" id="sg-pd" role="group" aria-label="显示哪些坐标系"><button type="button" data-v="all" aria-pressed="true">全部坐标系</button><button type="button" data-v="ee">只看法兰</button></div>
+    </div>
+    <div class="viz-read" id="rd-panda"></div>
+    <ul class="chips"><li><i style="background:var(--ink-2)"></i>连杆（相邻坐标系原点连线）</li><li><i style="background:var(--c4)"></i>关节转轴 zᵢ</li><li><i style="background:var(--bad)"></i>x</li><li><i style="background:var(--ok)"></i>y</li><li><i style="background:var(--c1)"></i>z</li></ul>
+    <figcaption>滑块范围就是上表的关节限位。核对：q 全为 0 时法兰在 (0.088, 0, 0.926) m（q₄ = 0 超出限位，「零位」按钮把它放在最近的 −4°）；ready 位姿 q = (0, −45°, 0, −135°, 0, 90°, 45°) 时法兰在 (0.307, 0, 0.590) m，z 轴竖直朝下。关节 1、2 的坐标系原点重合，关节 6、7 的也重合，这是 Craig 约定把坐标系放在关节轴上的结果。</figcaption>
+  </figure>
+</section>
+
+<section id="jacobian">
+  <h2 data-toc="雅可比与奇异">雅可比、奇异与可操作度</h2>
+  <p class="def"><b>雅可比</b> $J(\mathbf q)$ 把关节速度映射到末端速度：$\mathcal V=J(\mathbf q)\,\dot{\mathbf q}$。空间臂的几何雅可比是 $6\times n$，转动关节 $i$ 对应的列是 $J_i=\begin{bmatrix}\mathbf z_i\times(\mathbf p_e-\mathbf p_i)\\\mathbf z_i\end{bmatrix}$，$\mathbf z_i,\mathbf p_i$ 是关节 $i$ 的转轴方向和位置（基座系）。</p>
+
+  <h3>推导：平面 2 连杆</h3>
+  <p>记 $c_1=\cos q_1$，$s_{12}=\sin(q_1+q_2)$，依此类推。</p>
+  <ol class="derive">
+    <li><p>正运动学：</p>$$x=l_1c_1+l_2c_{12},\qquad y=l_1s_1+l_2s_{12}$$</li>
+    <li><p>对 $q_1$ 求偏导（两项都含 $q_1$）：</p>$$\frac{\partial x}{\partial q_1}=-l_1s_1-l_2s_{12},\qquad \frac{\partial y}{\partial q_1}=l_1c_1+l_2c_{12}$$</li>
+    <li><p>对 $q_2$ 求偏导（只有第二项含 $q_2$）：</p>$$\frac{\partial x}{\partial q_2}=-l_2s_{12},\qquad \frac{\partial y}{\partial q_2}=l_2c_{12}$$</li>
+    <li><p>按列排成矩阵：</p>$$J=\begin{bmatrix}-l_1s_1-l_2s_{12}&-l_2s_{12}\\l_1c_1+l_2c_{12}&l_2c_{12}\end{bmatrix}$$</li>
+    <li><p>核对几何公式：平面里 $\mathbf z\times(d_x,d_y)=(-d_y,d_x)$；关节 1 在原点，第一列 $=(-y,\ x)$，与上式一致。</p></li>
+    <li><p>行列式，用 $s_{12}c_1-c_{12}s_1=\sin q_2$：</p>$$\det J=(-l_1s_1-l_2s_{12})\,l_2c_{12}+l_2s_{12}\,(l_1c_1+l_2c_{12})=l_1l_2\sin q_2$$</li>
+  </ol>
+  <ul>
+    <li><b>奇异位形</b>：$\det J=0$，即 $q_2=0$（伸直）或 $q_2=\pi$（折叠）。两列平行，末端沿臂的径向动不了；要在这个方向产生很小的速度，$\dot{\mathbf q}=J^{-1}\dot{\mathbf x}$ 会非常大。</li>
+    <li><b>速度椭圆</b>：单位关节速度 $\|\dot{\mathbf q}\|\le1$ 能产生的末端速度集合。做奇异值分解 $J=U\Sigma V^\top$，椭圆的半轴是 $\sigma_i\mathbf u_i$。</li>
+    <li><b>可操作度</b>（Yoshikawa）：$w=\sqrt{\det(JJ^\top)}=\prod_i\sigma_i$；方阵时 $w=|\det J|$，平面 2 连杆 $w=l_1l_2|\sin q_2|$。条件数 $\kappa=\sigma_{\max}/\sigma_{\min}$ 越大越接近奇异。</li>
+    <li><b>力椭圆</b>：虚功 $\mathbf F^\top\dot{\mathbf x}=\boldsymbol\tau^\top\dot{\mathbf q}$ 对任意 $\dot{\mathbf q}$ 成立，代入 $\dot{\mathbf x}=J\dot{\mathbf q}$ 得 $\boldsymbol\tau=J^\top\mathbf F$。单位关节力矩能产生的末端力，半轴是 $\mathbf u_i/\sigma_i$：速度难动的方向，能承受的力最大（伸直的手臂沿径向最能撑）。</li>
+  </ul>
+
+  <figure class="viz" id="viz-jac">
+    <div class="viz-h"><b>雅可比的两列和速度 / 力椭圆</b><span>2 连杆，l₁ = 1.0 m，l₂ = 0.8 m</span></div>
+    <div class="viz-stage"><canvas id="cv-jac" aria-label="两连杆臂、雅可比的列向量和可操作椭圆"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="sl-jq1">q₁ <input type="range" id="sl-jq1" min="-180" max="180" step="1" value="30"><output id="o-jq1">30°</output></label>
+      <label for="sl-jq2">q₂ <input type="range" id="sl-jq2" min="-180" max="180" step="1" value="75"><output id="o-jq2">75°</output></label>
+      <div class="seg" id="sg-jac" role="group" aria-label="椭圆类型"><button type="button" data-v="v" aria-pressed="true">速度椭圆</button><button type="button" data-v="f">力椭圆</button></div>
+      <button type="button" class="btn ghost" id="bt-jac">扫过奇异</button>
+    </div>
+    <div class="viz-read" id="rd-jac"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>J 第 1 列：只转关节 1 时末端的速度</li><li><i style="background:var(--c2)"></i>J 第 2 列：只转关节 2</li><li><i style="background:var(--c3)"></i>椭圆</li></ul>
+    <figcaption>点「扫过奇异」让 q₂ 来回穿过 0：两列逐渐平行，速度椭圆压成一条线段（径向那根半轴趋于 0），力椭圆沿径向拉长。速度箭头和速度椭圆按 0.45 m 每 (m/s) 画，力椭圆按 0.35 m 每 N 画并截断在 2.5 m。</figcaption>
+  </figure>
+</section>
+
+<section id="ik">
+  <h2>逆运动学</h2>
+  <h3>解析解：平面 2 连杆</h3>
+  <ol class="derive">
+    <li><p>末端到基座的距离 $r$ 由余弦定理只取决于 $q_2$（两连杆夹角是 $\pi-q_2$）：</p>$$r^2=x^2+y^2=l_1^2+l_2^2+2l_1l_2\cos q_2$$</li>
+    <li><p>解出 $q_2$，两个符号对应肘上 / 肘下两组解：</p>$$\cos q_2=\frac{x^2+y^2-l_1^2-l_2^2}{2l_1l_2},\qquad q_2=\pm\arccos(\cdot)$$</li>
+    <li><p>$|\cos q_2|\le1$ 等价于 $|l_1-l_2|\le r\le l_1+l_2$：圆环外够不着，圆环内圈也够不着。</p></li>
+    <li><p>$q_1$ 等于末端方位角减去第二根连杆造成的偏角：</p>$$q_1=\operatorname{atan2}(y,x)-\operatorname{atan2}(l_2\sin q_2,\ l_1+l_2\cos q_2)$$</li>
+  </ol>
+  <p>一般的 6 轴臂最多有 16 组解；后三根关节轴交于一点（球形手腕，Pieper 条件）的 6 轴工业臂能写出闭式解，最多 8 组。7 轴臂在可达区域内有无穷多组解。</p>
+
+  <h3>数值解：Newton、伪逆与 DLS</h3>
+  <ol class="derive">
+    <li><p>在当前 $\mathbf q$ 处线性化，误差 $\mathbf e=\mathbf x^*-f(\mathbf q)$（姿态误差用 $\log(R^*R^\top)^\vee$，见 <a href="../rotations/#axis-angle">exp / log</a>）：</p>$$f(\mathbf q+\Delta\mathbf q)\approx f(\mathbf q)+J\,\Delta\mathbf q\ \Rightarrow\ J\,\Delta\mathbf q=\mathbf e$$</li>
+    <li><p>$n\gt m$ 时方程欠定，取范数最小的解：$\min\|\Delta\mathbf q\|^2$ s.t. $J\Delta\mathbf q=\mathbf e$。拉格朗日条件给出 $\Delta\mathbf q=J^\top\boldsymbol\mu$，代回约束 $JJ^\top\boldsymbol\mu=\mathbf e$：</p>$$\Delta\mathbf q=J^{+}\mathbf e,\qquad J^{+}=J^\top(JJ^\top)^{-1}$$</li>
+    <li><p>奇异附近 $JJ^\top$ 几乎不可逆，$\Delta\mathbf q$ 巨大。DLS（damped least squares）改成带惩罚的最小二乘：</p>$$\min_{\Delta\mathbf q}\ \|J\Delta\mathbf q-\mathbf e\|^2+\lambda^2\|\Delta\mathbf q\|^2$$</li>
+    <li><p>对 $\Delta\mathbf q$ 求梯度并令其为 0：</p>$$J^\top(J\Delta\mathbf q-\mathbf e)+\lambda^2\Delta\mathbf q=0\ \Rightarrow\ (J^\top J+\lambda^2I)\,\Delta\mathbf q=J^\top\mathbf e$$</li>
+    <li><p>由恒等式 $J^\top(JJ^\top+\lambda^2I)=(J^\top J+\lambda^2I)J^\top$ 换成只需求 $m\times m$ 逆的形式：</p>$$\Delta\mathbf q=J^\top(JJ^\top+\lambda^2I)^{-1}\mathbf e$$</li>
+    <li><p>用 SVD $J=\sum_i\sigma_i\mathbf u_i\mathbf v_i^\top$ 看两者区别：伪逆的增益 $1/\sigma_i$ 在 $\sigma_i\to0$ 时发散；DLS 的增益 $\sigma_i/(\sigma_i^2+\lambda^2)$ 最大只有 $1/(2\lambda)$（在 $\sigma_i=\lambda$ 处）：</p>$$\Delta\mathbf q_{\text{DLS}}=\sum_i\frac{\sigma_i}{\sigma_i^2+\lambda^2}\,\mathbf v_i\mathbf u_i^\top\mathbf e$$</li>
+    <li><p>代价：$\lambda\gt0$ 时每步都不是精确的 Newton 步，远离奇异时收敛比伪逆慢；目标够不着时，DLS 停在最近点附近，伪逆来回跳。</p></li>
+  </ol>
+
+  <h3>零空间与关节限位</h3>
+  <ul>
+    <li>冗余臂的通解：$$\Delta\mathbf q=J^{+}\mathbf e+(I-J^{+}J)\,\mathbf z$$ 第二项满足 $J(I-J^{+}J)=J-JJ^\top(JJ^\top)^{-1}J=0$，不动末端。</li>
+    <li>$\mathbf z$ 用来做次要目标：$\mathbf z=-k\nabla h(\mathbf q)$，$h$ 可以是离关节限位的距离、离某个舒适姿态的距离、或离障碍物的距离。</li>
+    <li>关节限位最简单的处理：每步迭代后把 $\mathbf q$ 截到限位内；更好的做法是把限位写进 $h$ 或写成二次规划（QP）的不等式约束。</li>
+  </ul>
+
+  <figure class="viz" id="viz-ik">
+    <div class="viz-h"><b>拖动目标：看 IK 迭代一步步收敛，再沿零空间动</b><span>平面 3 连杆，L = (0.9, 0.7, 0.5) m</span></div>
+    <div class="viz-grid">
+      <div class="viz-stage"><p class="pane-t">臂（浅色是各次迭代）</p><canvas id="cv-ik" aria-label="三连杆臂的迭代过程"></canvas></div>
+      <div class="viz-stage"><p class="pane-t">末端误差 ‖e‖ vs 迭代次数（对数坐标）</p><canvas id="cv-ik-p" aria-label="误差随迭代次数的曲线"></canvas></div>
+    </div>
+    <div class="viz-ctrl">
+      <div class="seg" id="sg-ik" role="group" aria-label="方法"><button type="button" data-v="pinv">伪逆 J⁺</button><button type="button" data-v="dls" aria-pressed="true">DLS</button></div>
+      <label for="sl-ik-l">λ <input type="range" id="sl-ik-l" min="0.02" max="1" step="0.02" value="0.3"><output id="o-ik-l">0.30</output></label>
+      <label for="sl-ik-k">迭代 <input type="range" id="sl-ik-k" min="0" max="40" step="1" value="40"><output id="o-ik-k">40</output></label>
+      <button type="button" class="btn ghost" id="bt-ik">逐步播放</button>
+      <button type="button" class="btn ghost" id="bt-ik-r">换初始姿态</button>
+      <label for="sl-ik-n">零空间 <input type="range" id="sl-ik-n" min="-1" max="1" step="0.01" value="0"><output id="o-ik-n">0.00</output></label>
+    </div>
+    <div class="viz-read" id="rd-ik"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>伪逆</li><li><i style="background:var(--c2)"></i>DLS</li><li><i style="background:var(--c3)"></i>零空间自运动的臂和关节轨迹</li><li><i style="background:var(--bad)"></i>目标</li><li><i style="background:var(--surface-2)"></i>可达区域（半径 2.1 m）</li></ul>
+    <figcaption>在左图任意位置按下或拖动即可放置目标。默认目标可达：伪逆约 8 步收敛到机器精度，DLS（λ = 0.3）稍慢。把目标拖到灰色圆外：伪逆的误差曲线来回跳，DLS 停在最近点（误差 = 到圆的距离）。收敛后拖「零空间」滑块：末端钉在目标上，三个关节角一起变，浅绿虚线是肘和腕能走的轨迹。</figcaption>
+  </figure>
+</section>
+
+<section id="exec">
+  <h2 data-toc="动作怎么执行">动作怎么被执行</h2>
+  <ul>
+    <li><b>关节位置控制</b>：每个关节跟踪目标角，$\boldsymbol\tau=K_p(\mathbf q^*-\mathbf q)+K_d(\dot{\mathbf q}^*-\dot{\mathbf q})+\hat{\mathbf g}(\mathbf q)$，$\hat{\mathbf g}$ 是重力补偿。策略 5–50 Hz 给目标，内环快得多（Franka 的实时接口 1 kHz；ALOHA 的 Dynamixel 舵机在电机内部跑 PID）。两次策略输出之间，内环保持或线性插值目标。</li>
+    <li><b>末端指令</b>有两条路：先用 IK 换成关节目标再走上面的位置控制；或用<b>操作空间控制</b>（OSC，Khatib 1987）直接在末端施加一个虚拟弹簧阻尼：$$\mathbf F=K_p(\mathbf x^*-\mathbf x)-K_d\dot{\mathbf x},\qquad \boldsymbol\tau=J^\top\Lambda(\mathbf q)\,\mathbf F+\boldsymbol\tau_{\text{null}}+\hat{\mathbf g},\qquad \Lambda=(JM^{-1}J^\top)^{-1}$$ $M$ 是关节空间惯性矩阵，$\Lambda$ 是末端的等效质量，$\boldsymbol\tau_{\text{null}}$ 是零空间里的姿态保持项。</li>
+    <li><b>robosuite 的 <code>OSC_POSE</code></b>（LIBERO 用的控制器）：默认 $k_p=150$、阻尼比 1；输入每维在 $[-1,1]$，映射到每步最多 0.05 m 平移、0.5 rad 旋转；增量执行为 <code>goal_pos = current_pos + delta</code>、<code>goal_ori = R_err · R_current</code>，即上一节的「基座系、解耦」。</li>
+    <li><b>阻抗的含义</b>：位置目标加上刚度，就等于在指定力。目标设在物体表面内 $d$ 处，稳态接触力约为 $K\,d$。ACT 用 leader 臂的关节位置做动作而不用 follower 的，原因正在这里：两者之差经过低层 PID 隐式决定了施加多大的力。</li>
+  </ul>
+
+  <figure class="viz" id="viz-imp">
+    <div class="viz-h"><b>把目标设进墙里：刚度决定接触力</b><span>1 维，质量 1 kg，临界阻尼，1 kHz 仿真</span></div>
+    <div class="viz-stage"><canvas id="cv-imp" aria-label="末端、虚拟弹簧和墙的示意以及位置和接触力曲线"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="sl-im-k">刚度 K <input type="range" id="sl-im-k" min="0" max="1" step="0.01" value="0.55"><output id="o-im-k"></output></label>
+      <label for="sl-im-d">目标越过墙面 d <input type="range" id="sl-im-d" min="0" max="10" step="0.5" value="3"><output id="o-im-d">3 cm</output></label>
+      <label for="sl-im-t">时间 <input type="range" id="sl-im-t" min="0" max="1.5" step="0.005" value="1.5"><output id="o-im-t">1.50 s</output></label>
+      <button type="button" class="btn ghost" id="bt-im">播放</button>
+    </div>
+    <div class="viz-read" id="rd-im"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>末端位置 x</li><li><i style="background:var(--c3)"></i>目标 x*（虚线）与虚拟弹簧</li><li><i style="background:var(--c2)"></i>接触力</li><li><i style="background:var(--muted)"></i>墙面（刚度 2×10⁴ N/m）</li></ul>
+    <figcaption>目标在 0.8 s 内从 0 平滑移动到墙后 d 处。末端被墙挡住，弹簧被拉长约 d，稳态力 ≈ K·d。K 小时同样的位置误差只产生很小的力（柔顺），K 大时接近纯位置控制、接触力大。</figcaption>
+  </figure>
+</section>
+
+<section id="datasets">
+  <h2 data-toc="数据集对照">常见数据集与策略用的动作</h2>
+  <p>以下各条都对照过论文或官方代码（截至 2026-11）。</p>
+  <div class="tbl"><table>
+    <thead><tr><th>数据集 / 策略</th><th>机器人</th><th>频率</th><th>动作</th><th>时序</th><th>chunk</th></tr></thead>
+    <tbody>
+      <tr><td>ALOHA / ACT</td><td>2 × ViperX 6-DoF + 夹爪</td><td class="num">50 Hz</td><td>14 维目标关节位置，取自 leader 臂</td><td>absolute</td><td>k = 100，temporal ensembling</td></tr>
+      <tr><td>DROID（数据）</td><td>Franka Panda 7-DoF</td><td class="num">15 Hz</td><td>同时记录关节位置 / 速度、基座系下末端位姿 / 速度、夹爪位置</td><td>—</td><td>—</td></tr>
+      <tr><td>DROID 论文的 diffusion policy</td><td>同上</td><td class="num">15 Hz</td><td>末端平移、旋转 + 夹爪</td><td>absolute</td><td>预测 16，执行 8</td></tr>
+      <tr><td>openpi π0 / π0.5-DROID</td><td>同上</td><td class="num">15 Hz</td><td>7 维关节速度 + 夹爪位置</td><td>velocity</td><td>推理时开环执行 8 步</td></tr>
+      <tr><td>BridgeData V2 / OpenVLA</td><td>WidowX 250</td><td class="num">5 Hz</td><td>6 维末端位姿相对变化 + 夹爪，共 7 维；OpenVLA 每维离散成 256 个 bin</td><td>单步 delta</td><td>单步</td></tr>
+      <tr><td>LIBERO</td><td>Panda（robosuite 仿真）</td><td class="num">20 Hz</td><td>OSC_POSE：Δp（3）+ Δ 轴角（3）+ 夹爪（1）</td><td>单步 delta，相对当前测量位姿</td><td>原始单步；openpi π0.5-LIBERO 用 10 步</td></tr>
+      <tr><td>UMI</td><td>手持夹爪采集，部署到 UR5 / Franka</td><td class="num">10 Hz</td><td>末端位姿（平移 3 + 6D 旋转）+ 夹爪宽度 = 10 维</td><td>chunk-relative</td><td>16 步</td></tr>
+      <tr><td>RoboTwin 2.0</td><td>5 种双臂本体</td><td class="num">—</td><td><code>take_action</code> 默认 <code>qpos</code>：[左臂关节, 左夹爪, 右臂关节, 右夹爪]，维度随本体；可选 <code>ee</code>：[左末端 xyz + 四元数, 左夹爪, 右末端 …, 右夹爪]</td><td>absolute</td><td>由策略决定</td></tr>
+      <tr><td>π0 / π0.5（openpi）</td><td>多本体，补零到统一维度（π0 论文 18 维，openpi 代码 32 维）</td><td class="num">最高 50 Hz</td><td>关节位置 + 夹爪；ALOHA 配置默认把关节维减去当前状态，夹爪保持绝对</td><td>chunk-relative（关节）</td><td>π0：H = 50</td></tr>
+    </tbody>
+  </table></div>
+  <ul>
+    <li>openpi 的 LIBERO 配置：LIBERO 数据本身已是 delta，π0-LIBERO 额外又做了一次 <code>DeltaActions</code>（为兼容旧 checkpoint），π0.5-LIBERO 不做。</li>
+    <li>openpi 的 <code>pi05_full_droid_finetune</code> 改用 DROID 的绝对关节位置，再转成相对当前状态的 chunk-relative。</li>
+  </ul>
+</section>
+
+<section id="norm">
+  <h2>动作归一化</h2>
+  <ul>
+    <li><b>z-score</b>：$(\mathbf a-\boldsymbol\mu)/(\boldsymbol\sigma+10^{-6})$，openpi 里 π0 用它。</li>
+    <li><b>分位数</b>：$(\mathbf a-q_{01})/(q_{99}-q_{01}+10^{-6})\cdot2-1$，把 1% 和 99% 分位数映射到 $\pm1$，对离群值稳健；openpi 里 π0.5 和 π0-FAST 用它。OpenVLA 在同样的 1%–99% 区间里均分 256 个 bin。</li>
+    <li>统计量按数据集、按维度算，而且要在 delta / chunk-relative 变换<b>之后</b>算：相对量的范围比绝对量小得多。推理时顺序反过来：先反归一化，再加回当前状态（openpi 的 <code>AbsoluteActions</code>）。</li>
+    <li>二值夹爪、补零的维度不参与统计或单独处理；不同机器人混训时，统计量和补零方式要随数据一起存。</li>
+  </ul>
+</section>
+
+<section id="quiz">
+  <h2>自测</h2>
+  <details class="q"><summary>给定 Panda 末端的 6 维位姿，有多少组关节解？</summary><div><p>可达时有无穷多组：7 个关节减 6 维约束，剩 1 维自运动（肘部绕肩–腕连线转）。关节限位会把这条一维曲线截成若干段。</p></div></details>
+  <details class="q"><summary>LIBERO 的单步 delta 会像漂移图里的 step-wise delta 那样漂吗？</summary><div><p>不会经由表示本身累积：每一步都相对当前<b>测量</b>位姿，等价于 H = 1 的 chunk-relative。累积只发生在不重新观测、把多个 delta 首尾相加的时候，例如一个 chunk 内开环执行的 step-wise delta。</p></div></details>
+  <details class="q"><summary>openpi 的 <code>DeltaActions</code> 是 step-wise 还是 chunk-wise？</summary><div><p>chunk-wise：<code>actions[..., :dims] -= state</code>，chunk 里每一步都减去同一个当前状态；<code>mask</code> 决定哪些维参与（ALOHA 是 6 个关节维，夹爪维除外）。</p></div></details>
+  <details class="q"><summary>平面 2 连杆伸直（q₂ = 0）时，末端哪个方向动不了？</summary><div><p>沿臂的径向。此时 $J$ 的两列都垂直于臂，彼此平行，$\det J=l_1l_2\sin q_2=0$，速度椭圆退化成一条垂直于臂的线段。</p></div></details>
+  <details class="q"><summary>为什么 DLS 在奇异附近不会给出巨大的关节增量？</summary><div><p>它在每个奇异方向上的增益是 $\sigma/(\sigma^2+\lambda^2)\le1/(2\lambda)$，有上界；伪逆的增益 $1/\sigma$ 在 $\sigma\to0$ 时发散。</p></div></details>
+  <details class="q"><summary>同一个 (Δx, Δy, 0) 在基座系和工具系下执行，什么时候结果相同？</summary><div><p>当末端姿态 $R=I$（工具系与基座系方向一致）时。工具系平移是 $R\,\Delta\mathbf p$，其他情况下方向不同。</p></div></details>
+  <details class="q"><summary>阻抗控制下把目标设在桌面下 1 cm，K = 500 N/m，稳态压力约多少？</summary><div><p>约 $K\,d=500\times0.01=5$ N（桌面刚度远大于 K 时）。</p></div></details>
+  <details class="q"><summary>ACT 为什么用 leader 臂的关节位置做动作，而不用 follower 的？</summary><div><p>follower 被物体挡住时与 leader 有偏差，这个偏差经过低层 PID 就是施加的力。用 leader 的读数做目标，动作里保留了力的信息；用 follower 的实际位置则丢掉了。</p></div></details>
+</section>
+
+<section id="refs">
+  <h2>延伸阅读</h2>
+  <ol class="refs">
+    <li><b>Lynch, Park. Modern Robotics: Mechanics, Planning, and Control</b>, Cambridge University Press 2017，第 4–6 章（正运动学、速度运动学与雅可比、逆运动学）。<a href="https://hades.mech.northwestern.edu/index.php/Modern_Robotics">书籍主页</a></li>
+    <li><b>Buss. Introduction to Inverse Kinematics with Jacobian Transpose, Pseudoinverse and Damped Least Squares Methods</b>, UCSD 技术报告, 2004.</li>
+    <li><b>Khatib. A Unified Approach for Motion and Force Control of Robot Manipulators: The Operational Space Formulation</b>, IEEE Journal on Robotics and Automation, 1987.</li>
+    <li><b>Zhao, Kumar, Levine, Finn. Learning Fine-Grained Bimanual Manipulation with Low-Cost Hardware</b>（ALOHA / ACT）, RSS 2023. <a href="https://arxiv.org/abs/2304.13705">arXiv:2304.13705</a></li>
+    <li><b>Khazatsky et al. DROID: A Large-Scale In-The-Wild Robot Manipulation Dataset</b>, RSS 2024. <a href="https://arxiv.org/abs/2403.12945">arXiv:2403.12945</a></li>
+    <li><b>Walke et al. BridgeData V2: A Dataset for Robot Learning at Scale</b>, CoRL 2023. <a href="https://arxiv.org/abs/2308.12952">arXiv:2308.12952</a></li>
+    <li><b>Kim et al. OpenVLA: An Open-Source Vision-Language-Action Model</b>, CoRL 2024. <a href="https://arxiv.org/abs/2406.09246">arXiv:2406.09246</a></li>
+    <li><b>Liu et al. LIBERO: Benchmarking Knowledge Transfer for Lifelong Robot Learning</b>, NeurIPS 2023 Datasets and Benchmarks. <a href="https://arxiv.org/abs/2306.03310">arXiv:2306.03310</a></li>
+    <li><b>Chi et al. Universal Manipulation Interface: In-The-Wild Robot Teaching Without In-The-Wild Robots</b>, RSS 2024. <a href="https://arxiv.org/abs/2402.10329">arXiv:2402.10329</a></li>
+    <li><b>Black et al. π0: A Vision-Language-Action Flow Model for General Robot Control</b>, 2024. <a href="https://arxiv.org/abs/2410.24164">arXiv:2410.24164</a></li>
+    <li><b>Physical Intelligence. π0.5: a Vision-Language-Action Model with Open-World Generalization</b>, 2025. <a href="https://arxiv.org/abs/2504.16054">arXiv:2504.16054</a>；代码 <a href="https://github.com/Physical-Intelligence/openpi">openpi</a>（<code>src/openpi/transforms.py</code>、<code>training/config.py</code>）</li>
+    <li><b>Chen et al. RoboTwin 2.0: A Scalable Data Generator and Benchmark with Strong Domain Randomization for Robust Bimanual Robotic Manipulation</b>, 2025. <a href="https://arxiv.org/abs/2506.18088">arXiv:2506.18088</a></li>
+    <li><b>Feng et al. Demystifying Action Space Design for Robotic Manipulation Policies</b>, 2026. <a href="https://arxiv.org/abs/2602.23408">arXiv:2602.23408</a></li>
+    <li><b>robosuite</b> 控制器实现（<code>controllers/osc.py</code>、<code>utils/control_utils.py</code>）。<a href="https://github.com/ARISE-Initiative/robosuite">GitHub</a></li>
+  </ol>
+</section>
+
+</main>
+</div>
+
+<!-- v4u:foot -->
+<footer class="v4u-foot"><div class="v4u-foot-in"><a class="pv" href="../rotations/"><span>上一篇</span>旋转与位姿表示</a><a class="nx" href="../camera/"><span>下一篇</span>相机模型与标定</a></div></footer>
+<!-- /v4u:foot -->
+
+<script>
+V4U.ready(() => {
+  const $ = (id) => document.getElementById(id);
+  const C = (n) => V4U.css(n);
+  const { PI, cos, sin, atan2, acos, hypot, sqrt, abs, min, max } = Math;
+  const D = PI / 180;
+  const f2 = (x, d = 2) => V4U.fmt(x, d);
+  const fv = (v, d = 2) => '(' + v.map((x) => f2(abs(x) < 0.5 * 10 ** -d ? 0 : x, d)).join(', ') + ')';
+  const mono = (px = 11) => px + 'px ' + C('--f-mono');
+  const dashed = (ctx, fn, pat = [5, 4]) => { ctx.save(); ctx.setLineDash(pat); fn(); ctx.restore(); };
+  const head = (ctx, A, B, col, s = 9) => {
+    const dx = B.x - A.x, dy = B.y - A.y, L = hypot(dx, dy); if (L < 3) return;
+    const ux = dx / L, uy = dy / L; s = min(s, L * 0.45);
+    ctx.fillStyle = col; ctx.beginPath(); ctx.moveTo(B.x, B.y);
+    ctx.lineTo(B.x - s * ux - s * 0.42 * uy, B.y - s * uy + s * 0.42 * ux);
+    ctx.lineTo(B.x - s * ux + s * 0.42 * uy, B.y - s * uy - s * 0.42 * ux); ctx.closePath(); ctx.fill();
+  };
+  const arrow2 = (ctx, ax, ay, bx, by, col, w = 2.5, dash) => {
+    ctx.save(); if (dash) ctx.setLineDash(dash);
+    ctx.strokeStyle = col; ctx.lineWidth = w; ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.stroke(); ctx.restore();
+    head(ctx, { x: ax, y: ay }, { x: bx, y: by }, col);
+  };
+  const rng = (seed) => () => { seed = (seed + 0x6D2B79F5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  const gaussOf = (r) => () => sqrt(-2 * Math.log(r() || 1e-9)) * cos(2 * PI * r());
+  // fit a world rectangle into the canvas with equal aspect
+  const fit = (w, h, xr, yr, pad = 12) => {
+    const s = min((w - 2 * pad) / (xr[1] - xr[0]), (h - 2 * pad) / (yr[1] - yr[0]));
+    const ox = (w - s * (xr[1] - xr[0])) / 2 - s * xr[0], oy = (h + s * (yr[1] - yr[0])) / 2 + s * yr[0];
+    return { s, X: (x) => ox + s * x, Y: (y) => oy - s * y, ix: (X) => (X - ox) / s, iy: (Y) => (oy - Y) / s };
+  };
+  const plotFrame = (ctx, x0, y0, w, h, xr, yr, xt, yt, fmtx = (v) => v, fmty = (v) => v) => {
+    const X = (v) => x0 + ((v - xr[0]) / (xr[1] - xr[0])) * w, Y = (v) => y0 + h - ((v - yr[0]) / (yr[1] - yr[0])) * h;
+    ctx.strokeStyle = C('--line'); ctx.lineWidth = 1; ctx.font = mono(11); ctx.fillStyle = C('--muted');
+    yt.forEach((v) => { ctx.beginPath(); ctx.moveTo(x0, Y(v)); ctx.lineTo(x0 + w, Y(v)); ctx.stroke(); ctx.textAlign = 'right'; ctx.textBaseline = 'middle'; ctx.fillText(fmty(v), x0 - 5, Y(v)); });
+    xt.forEach((v) => { ctx.textAlign = 'center'; ctx.textBaseline = 'top'; ctx.fillText(fmtx(v), X(v), y0 + h + 5); });
+    ctx.strokeStyle = C('--line-2'); ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x0, y0 + h); ctx.lineTo(x0 + w, y0 + h); ctx.stroke();
+    ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+    return { X, Y };
+  };
+  const polyline = (ctx, pts, col, w = 2) => {
+    ctx.strokeStyle = col; ctx.lineWidth = w; ctx.beginPath(); let pen = false;
+    pts.forEach((p) => { if (!p) { pen = false; return; } if (pen) ctx.lineTo(p[0], p[1]); else { ctx.moveTo(p[0], p[1]); pen = true; } });
+    ctx.stroke();
+  };
+  const dot = (ctx, x, y, r, col) => { ctx.fillStyle = col; ctx.beginPath(); ctx.arc(x, y, r, 0, 2 * PI); ctx.fill(); };
+  const ring = (ctx, x, y, r, col, w = 2) => { ctx.fillStyle = C('--surface'); ctx.strokeStyle = col; ctx.lineWidth = w; ctx.beginPath(); ctx.arc(x, y, r, 0, 2 * PI); ctx.fill(); ctx.stroke(); };
+  const label = (ctx, x, y, s, col, font) => { ctx.fillStyle = col || C('--ink-2'); ctx.font = font || mono(12); ctx.fillText(s, x, y); };
+  // planar serial arm
+  const chain = (L, q) => { const P = [[0, 0]]; let a = 0, x = 0, y = 0; for (let i = 0; i < L.length; i++) { a += q[i]; x += L[i] * cos(a); y += L[i] * sin(a); P.push([x, y]); } return P; };
+  const jacP = (L, q) => { const P = chain(L, q), e = P[P.length - 1]; return [L.map((_, i) => -(e[1] - P[i][1])), L.map((_, i) => e[0] - P[i][0])]; };
+  const drawBase = (ctx, M) => { const x = M.X(0), y = M.Y(0); ctx.fillStyle = C('--line-2'); ctx.beginPath(); ctx.moveTo(x - 13, y + 13); ctx.lineTo(x + 13, y + 13); ctx.lineTo(x, y); ctx.closePath(); ctx.fill(); };
+  const drawArm = (ctx, M, P, col, w = 6) => {
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    polyline(ctx, P.map((p) => [M.X(p[0]), M.Y(p[1])]), col, w);
+    P.slice(0, -1).forEach((p) => ring(ctx, M.X(p[0]), M.Y(p[1]), max(3, w * 0.7), col, 2));
+    dot(ctx, M.X(P[P.length - 1][0]), M.Y(P[P.length - 1][1]), max(3, w * 0.6), col);
+    ctx.lineCap = 'butt';
+  };
+  const unwrapTo = (a, ref) => a + 2 * PI * Math.round((ref - a) / (2 * PI));
+  const piFmt = (v) => (abs(v) < 1e-9 ? '0' : v > 0 ? 'π' : '−π');
+
+  // ================= 1. joint vs Cartesian interpolation =================
+  {
+    const L = [1.0, 0.8], N = 160;
+    const st = $('sl-js-t'), rd = $('rd-js');
+    let A = [1.35, 0.35], B = [-0.9, 1.1], elbow = 1, mode = 'joint', MT = null;
+    const ik2 = (p, s) => {
+      const c2 = (p[0] * p[0] + p[1] * p[1] - L[0] ** 2 - L[1] ** 2) / (2 * L[0] * L[1]);
+      if (c2 < -1 || c2 > 1) return null;
+      const q2 = s * acos(c2);
+      return [atan2(p[1], p[0]) - atan2(L[1] * sin(q2), L[0] + L[1] * cos(q2)), q2];
+    };
+    const compute = () => {
+      const qA = ik2(A, elbow); const cart = []; let ok = true, prev = qA;
+      for (let i = 0; i <= N; i++) {
+        const t = i / N, q = ik2([A[0] + (B[0] - A[0]) * t, A[1] + (B[1] - A[1]) * t], elbow);
+        if (!q) { ok = false; cart.push(null); continue; }
+        if (prev) q[0] = unwrapTo(q[0], prev[0]);
+        cart.push(q); prev = q;
+      }
+      let qB = ik2(B, elbow);
+      if (ok) qB = cart[N].slice(); else qB[0] = unwrapTo(qB[0], qA[0]);
+      const joint = []; for (let i = 0; i <= N; i++) { const t = i / N; joint.push([qA[0] + (qB[0] - qA[0]) * t, qA[1] + (qB[1] - qA[1]) * t]); }
+      return { qA, qB, cart, joint, ok };
+    };
+    const H = (w) => (w < 420 ? 270 : 300);
+    const drawT = V4U.canvas($('cv-js-t'), H, (ctx, w, h) => {
+      const M = fit(w, h, [-1.9, 1.9], [-0.75, 1.9]); MT = M;
+      const S = compute(), t = +st.value, i = Math.round(t * N);
+      $('o-js-t').textContent = f2(t);
+      ctx.fillStyle = C('--surface-2'); ctx.beginPath(); ctx.arc(M.X(0), M.Y(0), M.s * (L[0] + L[1]), 0, 2 * PI); ctx.fill();
+      ctx.fillStyle = C('--surface'); ctx.beginPath(); ctx.arc(M.X(0), M.Y(0), M.s * abs(L[0] - L[1]), 0, 2 * PI); ctx.fill();
+      drawBase(ctx, M);
+      polyline(ctx, S.joint.map((q) => { const e = chain(L, q)[2]; return [M.X(e[0]), M.Y(e[1])]; }), C('--c1'), 2.5);
+      polyline(ctx, S.cart.map((q, k) => (q ? [M.X(A[0] + (B[0] - A[0]) * k / N), M.Y(A[1] + (B[1] - A[1]) * k / N)] : null)), C('--c2'), 2.5);
+      if (!S.ok) dashed(ctx, () => polyline(ctx, [[M.X(A[0]), M.Y(A[1])], [M.X(B[0]), M.Y(B[1])]], C('--c2'), 1));
+      const qj = S.joint[i], qc = S.cart[i];
+      const other = mode === 'joint' ? qc : qj, mine = mode === 'joint' ? qj : qc;
+      if (other) { ctx.globalAlpha = 0.3; drawArm(ctx, M, chain(L, other), mode === 'joint' ? C('--c2') : C('--c1'), 5); ctx.globalAlpha = 1; }
+      if (mine) drawArm(ctx, M, chain(L, mine), mode === 'joint' ? C('--c1') : C('--c2'), 6);
+      [[A, 'A'], [B, 'B']].forEach(([p, s]) => { ring(ctx, M.X(p[0]), M.Y(p[1]), 8, C('--ink-2'), 2); label(ctx, M.X(p[0]) + 10, M.Y(p[1]) - 10, s, C('--ink'), '700 13px ' + C('--f-body')); });
+      // readout
+      let lenJ = 0; for (let k = 1; k <= N; k++) { const a = chain(L, S.joint[k - 1])[2], b = chain(L, S.joint[k])[2]; lenJ += hypot(b[0] - a[0], b[1] - a[1]); }
+      const lenC = hypot(B[0] - A[0], B[1] - A[1]);
+      const vJ = hypot(S.qB[0] - S.qA[0], S.qB[1] - S.qA[1]);
+      let vC = 0; if (S.ok) for (let k = 1; k <= N; k++) vC = max(vC, hypot(S.cart[k][0] - S.cart[k - 1][0], S.cart[k][1] - S.cart[k - 1][1]) * N);
+      rd.innerHTML = `<span>末端路径长：关节插值 <b>${f2(lenJ)} m</b>，直线 <b>${f2(lenC)} m</b></span><span>关节速度（每单位 t）：关节插值恒为 <b>${f2(vJ)}</b> rad</span><span>${S.ok ? `直线插值峰值 <b>${f2(vC)}</b> rad，是关节插值的 <b>${f2(vC / vJ, 1)}</b> 倍` : '<b>直线穿过内圈，中途不可达</b>'}</span>`;
+    });
+    const drawJ = V4U.canvas($('cv-js-j'), H, (ctx, w, h) => {
+      const S = compute(), i = Math.round(+st.value * N);
+      const x0 = 40, y0 = 8, pw = w - 52, ph = h - 36;
+      const F = plotFrame(ctx, x0, y0, pw, ph, [-PI, PI], [-PI, PI], [-PI, 0, PI], [-PI, 0, PI], piFmt, piFmt);
+      label(ctx, x0 + pw - 14, y0 + ph - 6, 'q₁', C('--muted')); label(ctx, x0 + 6, y0 + 12, 'q₂', C('--muted'));
+      ctx.save(); ctx.beginPath(); ctx.rect(x0, y0, pw, ph); ctx.clip();
+      polyline(ctx, S.joint.map((q) => [F.X(q[0]), F.Y(q[1])]), C('--c1'), 2.5);
+      polyline(ctx, S.cart.map((q) => (q ? [F.X(q[0]), F.Y(q[1])] : null)), C('--c2'), 2.5);
+      if (S.joint[i]) dot(ctx, F.X(S.joint[i][0]), F.Y(S.joint[i][1]), 6, C('--c1'));
+      if (S.cart[i]) dot(ctx, F.X(S.cart[i][0]), F.Y(S.cart[i][1]), 6, C('--c2'));
+      [[S.qA, 'A'], [S.qB, 'B']].forEach(([q, s]) => { ring(ctx, F.X(q[0]), F.Y(q[1]), 6, C('--ink-2'), 2); label(ctx, F.X(q[0]) + 8, F.Y(q[1]) - 8, s, C('--ink'), '700 13px ' + C('--f-body')); });
+      ctx.restore();
+    });
+    const both = () => { drawT(); drawJ(); };
+    st.addEventListener('input', both);
+    V4U.seg($('sg-js-m'), (v) => { mode = v; both(); });
+    V4U.seg($('sg-js-e'), (v) => { elbow = +v; both(); });
+    let drag = null;
+    V4U.drag($('cv-js-t'), (x, y, ph) => {
+      if (!MT) return;
+      if (ph === 'down') { drag = null; for (const [p, k] of [[A, 'A'], [B, 'B']]) if (hypot(MT.X(p[0]) - x, MT.Y(p[1]) - y) < 18) drag = k; }
+      if (ph === 'up') { drag = null; return; }
+      if (!drag) return;
+      let wx = MT.ix(x), wy = MT.iy(y); const r = hypot(wx, wy) || 1e-6, rc = V4U.clamp(r, 0.26, 1.77);
+      wx *= rc / r; wy *= rc / r;
+      if (drag === 'A') A = [wx, wy]; else B = [wx, wy];
+      both();
+    });
+    let anim = null;
+    $('bt-js').addEventListener('click', (e) => {
+      if (anim) { anim.stop(); anim = null; e.target.textContent = '播放'; return; }
+      e.target.textContent = '暂停';
+      anim = V4U.loop($('cv-js-t'), (t, dt) => { let v = +st.value + dt * 0.35; if (v > 1) v -= 1; st.value = v; both(); });
+    });
+  }
+
+  // ================= 2. drift of absolute / delta / chunk-relative =================
+  {
+    const T = 150, RUNS = 200;
+    const demo = []; for (let t = 0; t <= T; t++) { const u = t / T; demo.push([0.2 * sin(2 * PI * u), 0.1 * sin(4 * PI * u)]); }
+    const ss = $('sl-dr-s'), sb = $('sl-dr-b'), sh = $('sl-dr-h'), stc = $('sl-dr-t'), rd = $('rd-dr');
+    const bdir = [0.8, 0.6];
+    let seed = 11, one = null, rms = null;
+    const sim = (g, sig, b, H) => {
+      const A = [demo[0].slice()], Dl = [demo[0].slice()], Rl = [demo[0].slice()], anchors = [0];
+      let anchor = demo[0], aT = 0;
+      for (let t = 1; t <= T; t++) {
+        const n = [g() * sig, g() * sig];
+        A.push([demo[t][0] + b * bdir[0] + n[0], demo[t][1] + b * bdir[1] + n[1]]);
+        const p = Dl[t - 1]; Dl.push([p[0] + demo[t][0] - demo[t - 1][0] + n[0], p[1] + demo[t][1] - demo[t - 1][1] + n[1]]);
+        if ((t - 1) % H === 0) { anchor = Rl[t - 1]; aT = t - 1; if (t > 1) anchors.push(t - 1); }
+        Rl.push([anchor[0] + demo[t][0] - demo[aT][0] + n[0], anchor[1] + demo[t][1] - demo[aT][1] + n[1]]);
+      }
+      return { A, Dl, Rl, anchors };
+    };
+    const recompute = () => {
+      const sig = +ss.value / 1000, b = +sb.value / 100, H = +sh.value;
+      one = sim(gaussOf(rng(seed)), sig, b, H);
+      const acc = [new Float64Array(T + 1), new Float64Array(T + 1), new Float64Array(T + 1)];
+      const g = gaussOf(rng(seed * 7919 + 1));
+      for (let r = 0; r < RUNS; r++) {
+        const s = sim(g, sig, b, H);
+        [s.A, s.Dl, s.Rl].forEach((P, m) => { for (let t = 0; t <= T; t++) acc[m][t] += (P[t][0] - demo[t][0]) ** 2 + (P[t][1] - demo[t][1]) ** 2; });
+      }
+      rms = acc.map((a) => Array.from(a, (v) => sqrt(v / RUNS) * 1000));
+    };
+    const cols = () => [C('--c1'), C('--c2'), C('--c3')];
+    recompute();
+    const drawP = V4U.canvas($('cv-dr-p'), (w) => (w < 420 ? 240 : 280), (ctx, w, h) => {
+      const tc = +stc.value;
+      let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+      [demo, one.A, one.Dl, one.Rl].forEach((P) => P.forEach((p) => { x0 = min(x0, p[0]); x1 = max(x1, p[0]); y0 = min(y0, p[1]); y1 = max(y1, p[1]); }));
+      const M = fit(w, h, [x0 - 0.02, x1 + 0.02], [y0 - 0.02, y1 + 0.02], 10);
+      ctx.strokeStyle = C('--line'); ctx.lineWidth = 1;
+      for (let gx = Math.ceil(x0 / 0.1) * 0.1; gx <= x1; gx += 0.1) { ctx.beginPath(); ctx.moveTo(M.X(gx), 0); ctx.lineTo(M.X(gx), h); ctx.stroke(); }
+      for (let gy = Math.ceil(y0 / 0.1) * 0.1; gy <= y1; gy += 0.1) { ctx.beginPath(); ctx.moveTo(0, M.Y(gy)); ctx.lineTo(w, M.Y(gy)); ctx.stroke(); }
+      const map = (P) => P.slice(0, tc + 1).map((p) => [M.X(p[0]), M.Y(p[1])]);
+      dashed(ctx, () => polyline(ctx, demo.map((p) => [M.X(p[0]), M.Y(p[1])]), C('--muted'), 2));
+      const cs = cols();
+      [one.A, one.Dl, one.Rl].forEach((P, m) => polyline(ctx, map(P), cs[m], 1.8));
+      one.anchors.filter((t) => t <= tc).forEach((t) => dot(ctx, M.X(one.Rl[t][0]), M.Y(one.Rl[t][1]), 3, cs[2]));
+      [one.A, one.Dl, one.Rl].forEach((P, m) => dot(ctx, M.X(P[tc][0]), M.Y(P[tc][1]), 5.5, cs[m]));
+      ring(ctx, M.X(demo[tc][0]), M.Y(demo[tc][1]), 5, C('--ink-2'), 2);
+      label(ctx, 8, h - 8, '格子 10 cm', C('--muted'), mono(11));
+    });
+    const drawE = V4U.canvas($('cv-dr-e'), (w) => (w < 420 ? 240 : 280), (ctx, w, h) => {
+      const tc = +stc.value; $('o-dr-t').textContent = tc;
+      const ymax = max(5, ...rms.map((r) => max(...r))) * 1.08;
+      const step = ymax > 60 ? 20 : ymax > 30 ? 10 : 5, yt = []; for (let v = 0; v <= ymax; v += step) yt.push(v);
+      const F = plotFrame(ctx, 40, 8, w - 52, h - 36, [0, T], [0, ymax], [0, 50, 100, 150], yt, (v) => v, (v) => v);
+      label(ctx, 44, 20, 'mm', C('--muted'), mono(11));
+      const cs = cols();
+      rms.forEach((r, m) => polyline(ctx, r.map((v, t) => [F.X(t), F.Y(v)]), cs[m], 2.5));
+      dashed(ctx, () => { ctx.strokeStyle = C('--ink-2'); ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(F.X(tc), 8); ctx.lineTo(F.X(tc), h - 28); ctx.stroke(); });
+      rd.innerHTML = `<span>第 ${tc} 步 RMS 误差：absolute <b>${f2(rms[0][tc], 1)} mm</b></span><span>step-wise delta <b>${f2(rms[1][tc], 1)} mm</b></span><span>chunk-relative <b>${f2(rms[2][tc], 1)} mm</b></span>`;
+    });
+    const update = () => {
+      $('o-dr-s').textContent = ss.value + ' mm'; $('o-dr-b').textContent = (+sb.value).toFixed(1) + ' cm'; $('o-dr-h').textContent = sh.value;
+      recompute(); drawP(); drawE();
+    };
+    [ss, sb, sh].forEach((s) => s.addEventListener('input', update));
+    stc.addEventListener('input', () => { drawP(); drawE(); });
+    $('bt-dr-r').addEventListener('click', () => { seed += 1; update(); });
+    let anim = null;
+    $('bt-dr').addEventListener('click', (e) => {
+      if (anim) { anim.stop(); anim = null; e.target.textContent = '播放'; return; }
+      e.target.textContent = '暂停'; if (+stc.value >= T) stc.value = 0;
+      anim = V4U.loop($('cv-dr-p'), (t, dt) => { let v = +stc.value + dt * 40; if (v >= T) { v = T; anim.stop(); anim = null; e.target.textContent = '播放'; } stc.value = Math.round(v); drawP(); drawE(); });
+    });
+    update();
+  }
+
+  // ================= 3. delta in base frame vs tool frame =================
+  {
+    const sx = $('sl-fr-x'), sy = $('sl-fr-y'), sp = $('sl-fr-p'), s0 = $('sl-fr-0'), sn = $('sl-fr-n'), rd = $('rd-fr');
+    const p0 = [0.45, 0.2];
+    const run = (kind, d, dp, psi0, N) => {
+      let x = p0[0], y = p0[1], psi = psi0; const out = [[x, y, psi]];
+      for (let i = 0; i < N; i++) {
+        if (kind === 'base') { x += d[0]; y += d[1]; }
+        else if (kind === 'tool') { const c = cos(psi), s = sin(psi); x += c * d[0] - s * d[1]; y += s * d[0] + c * d[1]; }
+        else { const c = cos(dp), s = sin(dp), nx = c * x - s * y + d[0], ny = s * x + c * y + d[1]; x = nx; y = ny; }
+        psi += dp; out.push([x, y, psi]);
+      }
+      return out;
+    };
+    const G = 0.045;
+    const gripper = (ctx, M, p, col, w) => {
+      const c = cos(p[2]), s = sin(p[2]);
+      const T = (u, v) => [M.X(p[0] + c * u - s * v), M.Y(p[1] + s * u + c * v)];
+      ctx.strokeStyle = col; ctx.lineWidth = w; ctx.lineCap = 'round'; ctx.beginPath();
+      const a = T(-G * 0.7, 0), b = T(0, 0); ctx.moveTo(...a); ctx.lineTo(...b);
+      const l1 = T(0, -G * 0.55), l2 = T(G * 0.8, -G * 0.55), r1 = T(0, G * 0.55), r2 = T(G * 0.8, G * 0.55);
+      ctx.moveTo(...l2); ctx.lineTo(...l1); ctx.lineTo(...r1); ctx.lineTo(...r2); ctx.stroke(); ctx.lineCap = 'butt';
+    };
+    const redraw = V4U.canvas($('cv-fr'), (w) => (w < 560 ? 340 : 380), (ctx, w, h) => {
+      const d = [+sx.value / 100, +sy.value / 100], dp = +sp.value * D, psi0 = +s0.value * D, N = +sn.value;
+      $('o-fr-x').textContent = sx.value; $('o-fr-y').textContent = sy.value; $('o-fr-p').textContent = sp.value + '°'; $('o-fr-0').textContent = s0.value + '°'; $('o-fr-n').textContent = N;
+      const kinds = ['base', 'tool', 'world'], cs = [C('--c1'), C('--c2'), C('--c4')];
+      const R = kinds.map((k) => run(k, d, dp, psi0, N));
+      let x0 = -0.05, x1 = 0.12, y0 = -0.05, y1 = 0.12;
+      R.forEach((P) => P.forEach((p) => { x0 = min(x0, p[0] - G); x1 = max(x1, p[0] + G); y0 = min(y0, p[1] - G); y1 = max(y1, p[1] + G); }));
+      const M = fit(w, h, [x0, x1], [y0, y1], 14);
+      const step = (x1 - x0) > 1.2 ? 0.2 : 0.1;
+      ctx.strokeStyle = C('--line'); ctx.lineWidth = 1;
+      for (let gx = Math.ceil(x0 / step) * step; gx <= x1; gx += step) { ctx.beginPath(); ctx.moveTo(M.X(gx), 0); ctx.lineTo(M.X(gx), h); ctx.stroke(); }
+      for (let gy = Math.ceil(y0 / step) * step; gy <= y1; gy += step) { ctx.beginPath(); ctx.moveTo(0, M.Y(gy)); ctx.lineTo(w, M.Y(gy)); ctx.stroke(); }
+      arrow2(ctx, M.X(0), M.Y(0), M.X(0.1), M.Y(0), C('--bad'), 2.5);
+      arrow2(ctx, M.X(0), M.Y(0), M.X(0), M.Y(0.1), C('--ok'), 2.5);
+      label(ctx, M.X(0) - 14, M.Y(0) + 18, '基座', C('--ink-2'), '12px ' + C('--f-body'));
+      R.forEach((P, m) => {
+        polyline(ctx, P.map((p) => [M.X(p[0]), M.Y(p[1])]), cs[m], 2);
+        ctx.globalAlpha = 0.35; P.slice(1, -1).forEach((p) => gripper(ctx, M, p, cs[m], 2)); ctx.globalAlpha = 1;
+        gripper(ctx, M, P[P.length - 1], cs[m], 3.5);
+      });
+      gripper(ctx, M, R[0][0], C('--ink'), 3.5);
+      label(ctx, M.X(p0[0]) + 10, M.Y(p0[1]) + 18, '起点', C('--ink-2'), '12px ' + C('--f-body'));
+      label(ctx, 8, h - 8, `格子 ${Math.round(step * 100)} cm`, C('--muted'), mono(11));
+      const fin = (P) => { const p = P[P.length - 1]; return `(${f2(p[0])}, ${f2(p[1])}) m, ${f2(((p[2] / D) % 360 + 540) % 360 - 180, 0)}°`; };
+      rd.innerHTML = `<span>基座解耦 <b>${fin(R[0])}</b></span><span>工具系 <b>${fin(R[1])}</b></span><span>整体左乘 <b>${fin(R[2])}</b></span>`;
+    });
+    [sx, sy, sp, s0, sn].forEach((s) => s.addEventListener('input', redraw));
+  }
+
+  // ================= 4. planar FK chain (standard DH) =================
+  {
+    const L = [0.9, 0.7, 0.5], sl = [1, 2, 3].map((i) => $('sl-fk' + i)), rd = $('rd-fk');
+    let K = 3;
+    const redraw = V4U.canvas($('cv-fk'), (w) => (w < 560 ? 320 : 400), (ctx, w, h) => {
+      const th = sl.map((s) => +s.value * D);
+      sl.forEach((s, i) => { $('o-fk' + (i + 1)).textContent = s.value + '°'; });
+      const Fr = [[[1, 0, 0], [0, 1, 0], [0, 0, 1]]];
+      for (let i = 0; i < 3; i++) {
+        const P = Fr[i], c = cos(th[i]), s = sin(th[i]), A = [[c, -s, L[i] * c], [s, c, L[i] * s], [0, 0, 1]];
+        Fr.push(P.map((r) => [0, 1, 2].map((j) => r[0] * A[0][j] + r[1] * A[1][j] + r[2] * A[2][j])));
+      }
+      // fit the view to the arm (scale changes smoothly with the joints; grid stays 0.5 m)
+      let bx0 = Infinity, bx1 = -Infinity, by0 = Infinity, by1 = -Infinity;
+      Fr.forEach((F) => { bx0 = min(bx0, F[0][2]); bx1 = max(bx1, F[0][2]); by0 = min(by0, F[1][2]); by1 = max(by1, F[1][2]); });
+      bx0 -= 0.45; bx1 += 0.45; by0 -= 0.45; by1 += 0.45;
+      const cx = (bx0 + bx1) / 2, cy = (by0 + by1) / 2, hw = max(1.1, (bx1 - bx0) / 2), hh = max(0.9, (by1 - by0) / 2);
+      const M = fit(w, h, [cx - hw, cx + hw], [cy - hh, cy + hh]);
+      const vx0 = M.ix(0), vx1 = M.ix(w), vy0 = M.iy(h), vy1 = M.iy(0);
+      ctx.strokeStyle = C('--line'); ctx.lineWidth = 1;
+      for (let g = Math.ceil(vx0 * 2) / 2; g <= vx1; g += 0.5) { ctx.beginPath(); ctx.moveTo(M.X(g), 0); ctx.lineTo(M.X(g), h); ctx.stroke(); }
+      for (let g = Math.ceil(vy0 * 2) / 2; g <= vy1; g += 0.5) { ctx.beginPath(); ctx.moveTo(0, M.Y(g)); ctx.lineTo(w, M.Y(g)); ctx.stroke(); }
+      label(ctx, 8, h - 8, '格子 0.5 m', C('--muted'), mono(11));
+      drawBase(ctx, M);
+      const pts = Fr.map((F) => [F[0][2], F[1][2]]);
+      drawArm(ctx, M, pts, C('--line-2'), 9);
+      const ax = 0.32;
+      Fr.forEach((F, i) => {
+        ctx.globalAlpha = i <= K ? 1 : 0.22;
+        const o = [F[0][2], F[1][2]];
+        arrow2(ctx, M.X(o[0]), M.Y(o[1]), M.X(o[0] + ax * F[0][0]), M.Y(o[1] + ax * F[1][0]), C('--bad'), i === K ? 3.5 : 2.2);
+        arrow2(ctx, M.X(o[0]), M.Y(o[1]), M.X(o[0] + ax * F[0][1]), M.Y(o[1] + ax * F[1][1]), C('--ok'), i === K ? 3.5 : 2.2);
+        label(ctx, M.X(o[0]) - 26, M.Y(o[1]) + 18, '{' + i + '}', C('--ink'), (i === K ? '700 ' : '') + '13px ' + C('--f-mono'));
+        if (i < 3) {
+          const a0 = atan2(F[1][0], F[0][0]), r = 0.22 * M.s;
+          ctx.strokeStyle = C('--c4'); ctx.lineWidth = 2; ctx.beginPath();
+          ctx.arc(M.X(o[0]), M.Y(o[1]), r, -a0, -(a0 + th[i]), th[i] > 0); ctx.stroke();
+          const am = a0 + th[i] / 2;
+          label(ctx, M.X(o[0] + 0.3 * cos(am)) - 6, M.Y(o[1] + 0.3 * sin(am)) + 4, 'θ' + '₁₂₃'[i], C('--c4'), mono(12));
+        }
+        ctx.globalAlpha = 1;
+      });
+      const T = Fr[K], row = (r) => `[${r.map((v) => f2(v)).join(', ')}]`;
+      rd.innerHTML = `<span>⁰T<sub>${K}</sub> 第 1 行 <b>${row(T[0])}</b></span><span>第 2 行 <b>${row(T[1])}</b></span><span>第 3 行 [0, 0, 1]</span><span>坐标系 ${K} 原点 <b>(${f2(T[0][2])}, ${f2(T[1][2])})</b> m</span><span>朝向 θ₁+…+θ${'₁₂₃'[K - 1]} = <b>${f2(atan2(T[1][0], T[0][0]) / D, 0)}°</b></span>`;
+    });
+    sl.forEach((s) => s.addEventListener('input', redraw));
+    V4U.seg($('sg-fk'), (v) => { K = +v; redraw(); });
+  }
+
+  // ================= 5. Panda FK (modified DH) =================
+  {
+    const DH = [[0, 0.333, 0], [0, 0, -PI / 2], [0, 0.316, PI / 2], [0.0825, 0, PI / 2], [-0.0825, 0.384, -PI / 2], [0, 0, PI / 2], [0.088, 0, PI / 2]];
+    const LIM = [[-2.8973, 2.8973], [-1.7628, 1.7628], [-2.8973, 2.8973], [-3.0718, -0.0698], [-2.8973, 2.8973], [-0.0175, 3.7525], [-2.8973, 2.8973]];
+    const READY = [0, -45, 0, -135, 0, 90, 45], ZERO = [0, 0, 0, -4, 0, 0, 0];
+    const gp = $('gp-panda'), rd = $('rd-panda');
+    let show = 'all';
+    const sls = LIM.map((l, i) => {
+      const lab = document.createElement('label'); lab.htmlFor = 'sl-pd' + i;
+      const lo = Math.ceil(l[0] / D), hi = Math.floor(l[1] / D);
+      lab.innerHTML = `q${'₁₂₃₄₅₆₇'[i]} <input type="range" id="sl-pd${i}" min="${lo}" max="${hi}" step="1" value="${READY[i]}"><output id="o-pd${i}">${READY[i]}°</output>`;
+      gp.appendChild(lab);
+      return lab.querySelector('input');
+    });
+    const m4 = (A, B) => A.map((r) => [0, 1, 2, 3].map((j) => r[0] * B[0][j] + r[1] * B[1][j] + r[2] * B[2][j] + r[3] * B[3][j]));
+    const mdh = (a, d, al, t) => { const ct = cos(t), st = sin(t), ca = cos(al), sa = sin(al); return [[ct, -st, 0, a], [st * ca, ct * ca, -sa, -d * sa], [st * sa, ct * sa, ca, d * ca], [0, 0, 0, 1]]; };
+    const fk = (q) => { let T = [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]; const Ts = [T]; for (let i = 0; i < 7; i++) { T = m4(T, mdh(DH[i][0], DH[i][1], DH[i][2], q[i])); Ts.push(T); } Ts.push(m4(T, mdh(0, 0.107, 0, 0))); return Ts; };
+    const pos = (T) => [T[0][3], T[1][3], T[2][3]];
+    const rot = (T) => T.slice(0, 3).map((r) => r.slice(0, 3));
+    const V = V4U.orbit3d($('cv-panda'), { height: 420, dist: 1.75, yaw: -1.3, pitch: 0.26, target: [0.2, 0, 0.42] }, (ctx, P) => {
+      const q = sls.map((s) => +s.value * D);
+      sls.forEach((s, i) => { $('o-pd' + i).textContent = s.value + '°'; });
+      for (let g = -0.4; g <= 0.81; g += 0.2) { P.line([g, -0.5, 0], [g, 0.5, 0], C('--line'), 1); }
+      for (let g = -0.4; g <= 0.41; g += 0.2) { P.line([-0.4, g, 0], [0.8, g, 0], C('--line'), 1); }
+      const Ts = fk(q), O = Ts.map(pos);
+      P.frame([0, 0, 0], [[1, 0, 0], [0, 1, 0], [0, 0, 1]], 0.15, 2);
+      ctx.lineCap = 'round';
+      for (let i = 1; i < O.length; i++) { const a = O[i - 1], b = O[i]; if (hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]) > 1e-6) P.line(a, b, C('--ink-2'), 7); }
+      ctx.lineCap = 'butt';
+      for (let i = 1; i <= 7; i++) {
+        const T = Ts[i], o = O[i], z = [T[0][2], T[1][2], T[2][2]];
+        P.line([o[0] - 0.07 * z[0], o[1] - 0.07 * z[1], o[2] - 0.07 * z[2]], [o[0] + 0.07 * z[0], o[1] + 0.07 * z[1], o[2] + 0.07 * z[2]], C('--c4'), 4);
+        if (show === 'all') P.frame(o, rot(T), 0.09, 1.5);
+      }
+      for (let i = 1; i <= 7; i++) P.point(O[i], 4, C('--c4'));
+      P.frame(O[8], rot(Ts[8]), 0.16, 3);
+      if (show === 'all') for (let i = 1; i <= 7; i++) P.text(O[i], String(i), C('--muted'), mono(11));
+      const R = rot(Ts[8]);
+      rd.innerHTML = `<span>法兰位置 <b>${fv(O[8], 3)}</b> m</span><span>法兰 x 轴 <b>${fv([R[0][0], R[1][0], R[2][0]])}</b></span><span>法兰 z 轴 <b>${fv([R[0][2], R[1][2], R[2][2]])}</b></span>`;
+    });
+    sls.forEach((s) => s.addEventListener('input', V.redraw));
+    $('bt-pd-0').addEventListener('click', () => { sls.forEach((s, i) => { s.value = ZERO[i]; }); V.redraw(); });
+    $('bt-pd-r').addEventListener('click', () => { sls.forEach((s, i) => { s.value = READY[i]; }); V.redraw(); });
+    V4U.seg($('sg-pd'), (v) => { show = v; V.redraw(); });
+  }
+
+  // ================= 6. Jacobian and manipulability ellipse =================
+  {
+    const L = [1.0, 0.8], s1 = $('sl-jq1'), s2 = $('sl-jq2'), rd = $('rd-jac');
+    let mode = 'v';
+    const redraw = V4U.canvas($('cv-jac'), (w) => (w < 560 ? 330 : 380), (ctx, w, h) => {
+      const q = [+s1.value * D, +s2.value * D];
+      $('o-jq1').textContent = Math.round(+s1.value) + '°'; $('o-jq2').textContent = Math.round(+s2.value) + '°';
+      const M = fit(w, h, [-1.9, 2.3], [-1.0, 2.0]);
+      ctx.fillStyle = C('--surface-2'); ctx.beginPath(); ctx.arc(M.X(0), M.Y(0), M.s * 1.8, 0, 2 * PI); ctx.fill();
+      ctx.fillStyle = C('--surface'); ctx.beginPath(); ctx.arc(M.X(0), M.Y(0), M.s * 0.2, 0, 2 * PI); ctx.fill();
+      drawBase(ctx, M);
+      const P = chain(L, q), e = P[2], J = jacP(L, q);
+      drawArm(ctx, M, P, C('--ink-2'), 6);
+      // J J^T eigen
+      const a = J[0][0] ** 2 + J[0][1] ** 2, b = J[0][0] * J[1][0] + J[0][1] * J[1][1], d = J[1][0] ** 2 + J[1][1] ** 2;
+      const tr = a + d, det = a * d - b * b, disc = sqrt(max(0, tr * tr / 4 - det));
+      const l1 = tr / 2 + disc, l2 = max(0, tr / 2 - disc);
+      let u1 = abs(b) > 1e-12 ? [b, l1 - a] : (a >= d ? [1, 0] : [0, 1]); const n1 = hypot(...u1); u1 = [u1[0] / n1, u1[1] / n1];
+      const u2 = [-u1[1], u1[0]], sg1 = sqrt(l1), sg2 = sqrt(l2);
+      const sv = 0.45, sf = 0.35;
+      const ax = mode === 'v' ? [sv * sg1, sv * sg2] : [min(2.5, sf / max(sg1, 1e-9)), min(2.5, sf / max(sg2, 1e-9))];
+      ctx.fillStyle = C('--c3s'); ctx.strokeStyle = C('--c3'); ctx.lineWidth = 2.5; ctx.beginPath();
+      for (let k = 0; k <= 96; k++) { const t = (k / 96) * 2 * PI; const x = e[0] + ax[0] * u1[0] * cos(t) + ax[1] * u2[0] * sin(t), y = e[1] + ax[0] * u1[1] * cos(t) + ax[1] * u2[1] * sin(t); k ? ctx.lineTo(M.X(x), M.Y(y)) : ctx.moveTo(M.X(x), M.Y(y)); }
+      ctx.closePath(); ctx.globalAlpha = 0.6; ctx.fill(); ctx.globalAlpha = 1; ctx.stroke();
+      drawArm(ctx, M, P, C('--ink-2'), 6);
+      if (mode === 'v') {
+        arrow2(ctx, M.X(e[0]), M.Y(e[1]), M.X(e[0] + sv * J[0][0]), M.Y(e[1] + sv * J[1][0]), C('--c1'), 3);
+        arrow2(ctx, M.X(e[0]), M.Y(e[1]), M.X(e[0] + sv * J[0][1]), M.Y(e[1] + sv * J[1][1]), C('--c2'), 3);
+      }
+      const dj = J[0][0] * J[1][1] - J[0][1] * J[1][0];
+      rd.innerHTML = `<span>det J = <b>${f2(dj, 3)}</b>（l₁l₂ sin q₂ = <b>${f2(L[0] * L[1] * sin(q[1]), 3)}</b>）</span><span>σ₁ = <b>${f2(sg1)}</b>, σ₂ = <b>${f2(sg2, 3)}</b></span><span>w = σ₁σ₂ = <b>${f2(sg1 * sg2, 3)}</b></span><span>κ = <b>${sg2 > 1e-6 ? f2(sg1 / sg2, 1) : '∞'}</b></span>`;
+    });
+    [s1, s2].forEach((s) => s.addEventListener('input', redraw));
+    V4U.seg($('sg-jac'), (v) => { mode = v; redraw(); });
+    let anim = null, ph = 0;
+    $('bt-jac').addEventListener('click', (e) => {
+      if (anim) { anim.stop(); anim = null; e.target.textContent = '扫过奇异'; return; }
+      e.target.textContent = '停止'; ph = Math.acos(V4U.clamp(+s2.value / 100, -1, 1));
+      anim = V4U.loop($('cv-jac'), (t, dt) => { ph += dt * 0.9; s2.value = Math.round(100 * cos(ph)); redraw(); });
+    });
+  }
+
+  // ================= 7. numerical IK: pinv vs DLS, null space =================
+  {
+    const L = [0.9, 0.7, 0.5], ITER = 40;
+    const sl = $('sl-ik-l'), sk = $('sl-ik-k'), sn = $('sl-ik-n'), rd = $('rd-ik');
+    let target = [1.25, 0.95], method = 'dls', qStart = [1.6, 1.2, 0.8], res = null, nulls = null, MI = null, seedQ = 5;
+    const step = (J, e, lam) => {
+      const a = J[0].reduce((s, v) => s + v * v, 0) + lam * lam, b = J[0].reduce((s, v, i) => s + v * J[1][i], 0), d = J[1].reduce((s, v) => s + v * v, 0) + lam * lam;
+      let det = a * d - b * b; if (abs(det) < 1e-14) det = det < 0 ? -1e-14 : 1e-14;
+      const y0 = (d * e[0] - b * e[1]) / det, y1 = (-b * e[0] + a * e[1]) / det;
+      return [0, 1, 2].map((i) => V4U.clamp(J[0][i] * y0 + J[1][i] * y1, -50, 50));
+    };
+    const err = (q) => { const P = chain(L, q)[3]; return [target[0] - P[0], target[1] - P[1]]; };
+    const solve = (lam) => {
+      let q = qStart.slice(); const H = [q.slice()], E = [];
+      for (let k = 0; k < ITER; k++) { const e = err(q); E.push(hypot(...e)); const dq = step(jacP(L, q), e, lam); q = q.map((v, i) => v + dq[i]); H.push(q.slice()); }
+      E.push(hypot(...err(q)));
+      return { H, E };
+    };
+    const selfMotion = (qf) => { // walk along the 1-D null space in both directions, re-projecting onto the target
+      const walk = (sgn) => {
+        let q = qf.slice(), prevN = null; const out = [];
+        for (let k = 0; k < 100; k++) {
+          const J = jacP(L, q); let n = [J[0][1] * J[1][2] - J[0][2] * J[1][1], J[0][2] * J[1][0] - J[0][0] * J[1][2], J[0][0] * J[1][1] - J[0][1] * J[1][0]];
+          const nn = hypot(...n) || 1; n = n.map((v) => (v / nn) * sgn);
+          if (prevN && n[0] * prevN[0] + n[1] * prevN[1] + n[2] * prevN[2] < 0) n = n.map((v) => -v);
+          prevN = n; q = q.map((v, i) => v + 0.015 * n[i]);
+          for (let r = 0; r < 2; r++) { const dq = step(jacP(L, q), err(q), 1e-3); q = q.map((v, i) => v + dq[i]); }
+          out.push(q.slice());
+        }
+        return out;
+      };
+      const neg = walk(-1).reverse(), pos = walk(1);
+      return [...neg, qf.slice(), ...pos];
+    };
+    const recompute = () => {
+      const lam = +sl.value;
+      res = { pinv: solve(0), dls: solve(lam) };
+      const r = res[method], qf = r.H[ITER];
+      nulls = r.E[ITER] < 1e-5 ? selfMotion(qf) : null;
+    };
+    recompute();
+    const Hh = (w) => (w < 420 ? 300 : 330);
+    const drawA = V4U.canvas($('cv-ik'), Hh, (ctx, w, h) => {
+      const M = fit(w, h, [-1.5, 2.6], [-1.2, 2.3]); MI = M;
+      const k = +sk.value, r = res[method], col = method === 'pinv' ? C('--c1') : C('--c2');
+      ctx.fillStyle = C('--surface-2'); ctx.beginPath(); ctx.arc(M.X(0), M.Y(0), M.s * 2.1, 0, 2 * PI); ctx.fill();
+      drawBase(ctx, M);
+      const sN = +sn.value;
+      const ghost = sN !== 0 && nulls ? 0.12 : 1;
+      for (let i = 0; i < k; i++) { ctx.globalAlpha = ghost * (0.12 + 0.3 * (i / max(1, k))); drawArm(ctx, M, chain(L, r.H[i]), col, 3); }
+      ctx.globalAlpha = ghost; drawArm(ctx, M, chain(L, r.H[k]), col, 6); ctx.globalAlpha = 1;
+      if (nulls) {
+        const elb = nulls.map((q) => chain(L, q)), c3 = C('--c3');
+        dashed(ctx, () => { polyline(ctx, elb.map((P) => [M.X(P[1][0]), M.Y(P[1][1])]), c3, 1.5); polyline(ctx, elb.map((P) => [M.X(P[2][0]), M.Y(P[2][1])]), c3, 1.5); }, [3, 3]);
+        if (sN !== 0) { const idx = Math.round((sN + 1) / 2 * (nulls.length - 1)); drawArm(ctx, M, chain(L, nulls[idx]), c3, 6); }
+      }
+      const tx = M.X(target[0]), ty = M.Y(target[1]);
+      ctx.strokeStyle = C('--bad'); ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(tx - 8, ty - 8); ctx.lineTo(tx + 8, ty + 8); ctx.moveTo(tx + 8, ty - 8); ctx.lineTo(tx - 8, ty + 8); ctx.stroke();
+      // readout
+      const conv = (E) => { const i = E.findIndex((v) => v < 1e-6); return i < 0 ? '未收敛' : i + ' 步'; };
+      let ns = '';
+      if (nulls && sN !== 0) { const idx = Math.round((sN + 1) / 2 * (nulls.length - 1)), q = nulls[idx]; ns = `<span>零空间：q = <b>${fv(q.map((v) => v / D), 0)}</b>°，末端误差 <b>${hypot(...err(q)).toExponential(0)}</b> m</span>`; }
+      else if (!nulls) ns = '<span>未收敛到目标，零空间滑块不起作用</span>';
+      rd.innerHTML = `<span>到 ‖e‖ &lt; 10⁻⁶：伪逆 <b>${conv(res.pinv.E)}</b>，DLS <b>${conv(res.dls.E)}</b></span><span>第 ${k} 次迭代 ‖e‖ = <b>${r.E[k].toExponential(1)}</b> m</span><span>目标到基座 <b>${f2(hypot(...target))}</b> m（可达半径 2.10）</span>${ns}`;
+    });
+    const drawE = V4U.canvas($('cv-ik-p'), Hh, (ctx, w, h) => {
+      const k = +sk.value, lo = -10, hi = 1;
+      const F = plotFrame(ctx, 46, 8, w - 58, h - 36, [0, ITER], [lo, hi], [0, 10, 20, 30, 40], [-10, -8, -6, -4, -2, 0], (v) => v, (v) => '1e' + v);
+      const lg = (v) => V4U.clamp(Math.log10(max(v, 1e-12)), lo, hi);
+      polyline(ctx, res.pinv.E.map((v, i) => [F.X(i), F.Y(lg(v))]), C('--c1'), method === 'pinv' ? 3 : 1.5);
+      polyline(ctx, res.dls.E.map((v, i) => [F.X(i), F.Y(lg(v))]), C('--c2'), method === 'dls' ? 3 : 1.5);
+      dashed(ctx, () => { ctx.strokeStyle = C('--ink-2'); ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(F.X(k), 8); ctx.lineTo(F.X(k), h - 28); ctx.stroke(); });
+    });
+    const all = () => { $('o-ik-l').textContent = f2(+sl.value); $('o-ik-k').textContent = sk.value; $('o-ik-n').textContent = f2(+sn.value); drawA(); drawE(); };
+    const full = () => { recompute(); all(); };
+    sl.addEventListener('input', full);
+    sk.addEventListener('input', all);
+    sn.addEventListener('input', all);
+    V4U.seg($('sg-ik'), (v) => { method = v; full(); });
+    V4U.drag($('cv-ik'), (x, y, ph) => {
+      if (!MI || ph === 'up') return;
+      target = [V4U.clamp(MI.ix(x), -1.5, 2.6), V4U.clamp(MI.iy(y), -1.2, 2.3)];
+      sk.value = ITER; sn.value = 0; full();
+    });
+    let anim = null;
+    $('bt-ik').addEventListener('click', (e) => {
+      if (anim) { anim.stop(); anim = null; e.target.textContent = '逐步播放'; return; }
+      e.target.textContent = '暂停'; sk.value = 0; sn.value = 0; let acc = 0;
+      anim = V4U.loop($('cv-ik'), (t, dt) => { acc += dt * 4; if (acc >= 1) { acc = 0; sk.value = +sk.value + 1; all(); if (+sk.value >= ITER) { anim.stop(); anim = null; e.target.textContent = '逐步播放'; } } });
+      all();
+    });
+    $('bt-ik-r').addEventListener('click', () => { const r = rng(seedQ++); qStart = [0, 1, 2].map(() => (r() * 2 - 1) * PI); sk.value = ITER; sn.value = 0; full(); });
+    full();
+  }
+
+  // ================= 8. impedance: target behind a wall =================
+  {
+    const sk = $('sl-im-k'), sd = $('sl-im-d'), st = $('sl-im-t'), rd = $('rd-im');
+    const XW = 0.25, TEND = 1.5, DT = 1e-3, KW = 2e4, CW = 60, MASS = 1;
+    const Kof = () => Math.round(50 * Math.pow(60, +sk.value));
+    let sim = null;
+    const run = () => {
+      const K = Kof(), d = +sd.value / 100, Dm = 2 * sqrt(MASS * K), xe = XW + d;
+      let x = 0, v = 0; const S = [];
+      for (let i = 0; i <= TEND / DT; i++) {
+        const t = i * DT, u = min(1, t / 0.8), xs = xe * u * u * (3 - 2 * u);
+        const fw = x > XW ? KW * (x - XW) + CW * max(0, v) : 0;
+        if (i % 5 === 0) S.push([t, x, xs, fw]);
+        const F = K * (xs - x) - Dm * v - fw; v += (F / MASS) * DT; x += v * DT;
+      }
+      sim = { K, d, S };
+    };
+    run();
+    const redraw = V4U.canvas($('cv-imp'), (w) => (w < 560 ? 340 : 330), (ctx, w, h) => {
+      const tc = +st.value; $('o-im-t').textContent = f2(tc) + ' s';
+      const { K, d, S } = sim, idx = min(S.length - 1, Math.round(tc / (5 * DT))), cur = S[idx];
+      // schematic strip
+      const sx0 = 16, sx1 = w - 16, SX = (x) => sx0 + ((x + 0.03) / 0.45) * (sx1 - sx0), sy = 40;
+      ctx.fillStyle = C('--surface-2'); ctx.fillRect(SX(XW), 8, sx1 - SX(XW), 64);
+      ctx.strokeStyle = C('--muted'); ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(SX(XW), 8); ctx.lineTo(SX(XW), 72); ctx.stroke();
+      for (let yy = 12; yy < 72; yy += 9) { ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(SX(XW), yy + 7); ctx.lineTo(SX(XW) + 7, yy); ctx.stroke(); }
+      const bx = SX(cur[1]), tx = SX(cur[2]);
+      // spring from block to target ghost
+      ctx.strokeStyle = C('--c3'); ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(bx, sy);
+      const n = 12; for (let i = 1; i < n; i++) ctx.lineTo(bx + ((tx - bx) * i) / n, sy + (i % 2 ? -7 : 7)); ctx.lineTo(tx, sy); ctx.stroke();
+      dashed(ctx, () => { ctx.strokeStyle = C('--c3'); ctx.lineWidth = 2; ctx.strokeRect(tx - 10, sy - 14, 20, 28); }, [3, 3]);
+      ctx.fillStyle = C('--c1'); ctx.fillRect(bx - 20, sy - 16, 20, 32);
+      label(ctx, tx - 6, sy + 30, 'x*', C('--c3'), mono(12)); label(ctx, bx - 14, sy + 30, 'x', C('--c1'), mono(12));
+      // plots
+      const top = 92, gap = 26, ph = (h - top - gap - 30) / 2, x0 = 50, pw = w - 76;
+      const ymax = XW + 0.11;
+      const Fp = plotFrame(ctx, x0, top, pw, ph, [0, TEND], [0, ymax], [], [0, 0.1, 0.2, 0.3], (v) => v, (v) => f2(v, 1));
+      dashed(ctx, () => { ctx.strokeStyle = C('--muted'); ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(x0, Fp.Y(XW)); ctx.lineTo(x0 + pw, Fp.Y(XW)); ctx.stroke(); }, [2, 3]);
+      dashed(ctx, () => polyline(ctx, S.map((s) => [Fp.X(s[0]), Fp.Y(s[2])]), C('--c3'), 2));
+      polyline(ctx, S.map((s) => [Fp.X(s[0]), Fp.Y(s[1])]), C('--c1'), 2.5);
+      label(ctx, x0 + 4, top + 12, 'm', C('--muted'), mono(11));
+      const fmax = max(1, ...S.map((s) => s[3])) * 1.15, fstep = fmax > 150 ? 50 : fmax > 60 ? 20 : fmax > 25 ? 10 : 5, ft = []; for (let v = 0; v <= fmax; v += fstep) ft.push(v);
+      const Ff = plotFrame(ctx, x0, top + ph + gap, pw, ph, [0, TEND], [0, fmax], [0, 0.5, 1, 1.5], ft, (v) => v + ' s', (v) => v);
+      polyline(ctx, S.map((s) => [Ff.X(s[0]), Ff.Y(s[3])]), C('--c2'), 2.5);
+      label(ctx, x0 + 4, top + ph + gap + 12, 'N', C('--muted'), mono(11));
+      [Fp, Ff].forEach((F, j) => dashed(ctx, () => { ctx.strokeStyle = C('--ink-2'); ctx.lineWidth = 1; const yy = j ? top + ph + gap : top; ctx.beginPath(); ctx.moveTo(F.X(tc), yy); ctx.lineTo(F.X(tc), yy + ph); ctx.stroke(); }));
+      const last = S[S.length - 1];
+      $('o-im-k').textContent = K + ' N/m'; $('o-im-d').textContent = sd.value + ' cm';
+      rd.innerHTML = `<span>当前接触力 <b>${f2(cur[3], 1)} N</b></span><span>稳态力（仿真）<b>${f2(last[3], 1)} N</b></span><span>K·d = <b>${f2(K * d, 1)} N</b></span><span>压入墙面 <b>${f2(max(0, last[1] - XW) * 1000, 1)} mm</b></span>`;
+    });
+    const upd = () => { run(); redraw(); };
+    [sk, sd].forEach((s) => s.addEventListener('input', upd));
+    st.addEventListener('input', redraw);
+    let anim = null;
+    $('bt-im').addEventListener('click', (e) => {
+      if (anim) { anim.stop(); anim = null; e.target.textContent = '播放'; return; }
+      e.target.textContent = '暂停'; if (+st.value >= TEND) st.value = 0;
+      anim = V4U.loop($('cv-imp'), (t, dt) => { let v = +st.value + dt * 0.5; if (v >= TEND) { v = TEND; anim.stop(); anim = null; e.target.textContent = '播放'; } st.value = v; redraw(); });
+    });
+    upd();
+  }
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,1443 @@
+<!doctype html>
+<html lang="zh-CN" data-sec="robotics">
+<head>
+<!-- v4u:head -->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="icon" href="data:,">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700&family=Inter+Tight:wght@700&family=JetBrains+Mono:wght@400;700&family=Noto+Sans+SC:wght@400;700&display=swap">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<link rel="stylesheet" href="../../assets/v4u.css?v=4288b6c4">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
+<script src="../../assets/v4u.js?v=d6640e00"></script>
+<!-- /v4u:head -->
+<title>相机模型与标定 · Vis4Und</title>
+<meta name="description" content="针孔模型、内参与畸变、外参、各家坐标系约定、深度反投影、张正友标定和手眼标定，每一步配可交互的图。">
+<style>
+.grp{display:contents}
+.viz .tbl{margin:0 16px 14px}
+.zt td,.zt th{min-width:0;padding:6px 10px;font-size:13px}
+.zt td{font-family:var(--f-mono);font-variant-numeric:tabular-nums;white-space:nowrap}
+.viz-read .katex{font-size:1em}
+</style>
+</head>
+<body>
+<!-- v4u:nav -->
+<nav class="v4u-nav" aria-label="站点导航"><div class="v4u-nav-in"><span class="v4u-crumb"><a href="../../"><b>Vis4Und</b></a><span class="v4u-sep">/</span><a href="../../#robotics">(1) 机器人学</a></span><span class="v4u-links"><a href="../rotations/">补充 旋转与位姿</a><a href="../action-space/">(i) 运动空间</a><a href="../camera/" aria-current="page">(ii) 相机</a><button type="button" class="v4u-theme" aria-label="切换深浅色">深色</button></span></div></nav>
+<!-- /v4u:nav -->
+
+<header class="hero"><div class="wrap">
+  <p class="kicker">(1) 机器人学 · (ii)</p>
+  <h1>相机模型与标定</h1>
+  <p class="lede">一个三维点怎样经过外参、透视除法、畸变和内参变成像素；各家软件的相机坐标系差在哪；怎样用标定板和机械臂把内参、畸变和手眼外参标出来。</p>
+  <p class="asks-h">读完能回答</p>
+  <ul class="asks">
+    <li>图像从 640×480 中心裁成 480×480 再缩放到 224×224，$K$ 的四个数各变成多少？</li>
+    <li><code>solvePnP</code> 返回的 <code>rvec, tvec</code> 是相机在世界里的位姿吗？相机中心在哪？</li>
+    <li>OpenCV、OpenGL/Blender、ROS 的相机坐标系各朝哪，互转乘什么矩阵？</li>
+    <li>张正友标定为什么要多张不同朝向的板子？重投影误差多少算好？</li>
+    <li>手眼标定的 $AX=XB$ 从哪来，采样时为什么不能只绕一个轴转？</li>
+  </ul>
+</div></header>
+
+<div class="wrap layout">
+<nav class="toc" id="toc" aria-label="本页目录"></nav>
+<main>
+
+<section id="frames">
+  <h2 data-toc="坐标链">从世界到像素：四个坐标系</h2>
+  <p class="def"><b>相机模型</b>是一个函数 $\pi$，把世界系下的三维点 $\mathbf{X}_w$ 映到像素 $(u,v)$。它拆成四步：刚体变换（外参）、透视除法、畸变、仿射到像素（内参）。</p>
+  <div class="eq">$$\mathbf{X}_w\ \xrightarrow{\ T_{cw}\ }\ \mathbf{X}_c\ \xrightarrow{\ \div Z_c\ }\ (x,y)\ \xrightarrow{\ \text{畸变}\ }\ (x_d,y_d)\ \xrightarrow{\ K\ }\ (u,v)$$</div>
+
+  <div class="tbl"><table>
+    <thead><tr><th>坐标系</th><th>原点与轴</th><th>单位</th><th>记号</th></tr></thead>
+    <tbody>
+      <tr><td>世界 w</td><td>任选；机械臂常取底座（base b），z 朝上</td><td>m</td><td>$\mathbf{X}_w$</td></tr>
+      <tr><td>相机 c</td><td>光心；OpenCV 约定 x 右、y 下、z 沿光轴朝前</td><td>m</td><td>$\mathbf{X}_c=(X_c,Y_c,Z_c)$</td></tr>
+      <tr><td>归一化像平面</td><td>相机系里 $Z_c=1$ 的平面，原点在光轴上</td><td>无量纲（光线方向的正切）</td><td>$(x,y)=(X_c/Z_c,\ Y_c/Z_c)$</td></tr>
+      <tr><td>像素</td><td>图像左上角，u 向右、v 向下；OpenCV 里整数坐标是像素中心</td><td>px</td><td>$(u,v)$</td></tr>
+    </tbody>
+  </table></div>
+
+  <figure class="viz" id="viz-chain">
+    <div class="viz-h"><b>同一个点在四个坐标系里的坐标</b><span>左图拖动旋转视角 · 单位 m / px</span></div>
+    <div class="viz-grid">
+      <div class="viz-stage"><canvas id="cv-chain3d" aria-label="三维场景：世界坐标轴、桌面上的盒子、相机视锥和三条投影光线"></canvas></div>
+      <div class="viz-stage"><canvas id="cv-chainimg" aria-label="相机拍到的 640×480 图像，盒子和三个点的投影"></canvas></div>
+    </div>
+    <div class="viz-ctrl">
+      <div class="seg" id="seg-chainpt"><button type="button" data-v="0" aria-pressed="true">点 A</button><button type="button" data-v="1">点 B</button><button type="button" data-v="2">点 C</button></div>
+      <label for="sl-az">方位角 <input type="range" id="sl-az" min="-180" max="180" step="1" value="-150"><output id="o-az"></output></label>
+      <label for="sl-el">仰角 <input type="range" id="sl-el" min="10" max="80" step="1" value="35"><output id="o-el"></output></label>
+      <label for="sl-dist">距离 <input type="range" id="sl-dist" min="0.45" max="1.6" step="0.01" value="0.9"><output id="o-dist"></output></label>
+      <label for="sl-fx">$f_x=f_y$ <input type="range" id="sl-fx" min="250" max="900" step="5" value="520"><output id="o-fx"></output></label>
+    </div>
+    <div class="viz-read" id="rd-chain"></div>
+    <ul class="chips"><li><i style="background:var(--bad)"></i>x 轴</li><li><i style="background:var(--ok)"></i>y 轴</li><li><i style="background:var(--c1)"></i>z 轴</li><li><i style="background:var(--c4)"></i>视锥，粗边是图像第一行（v = 0）</li><li><i style="background:var(--c2)"></i>A</li><li><i style="background:var(--c5)"></i>B</li><li><i style="background:var(--c6)"></i>C</li></ul>
+    <figcaption>相机始终对着盒子，图像 640×480。虚线是点到光心的光线，它和视锥底面的交点就是该点在（缩小画的）像平面上的位置。相机系里 $Z_c\le 0$ 的点在相机后方，不成像。</figcaption>
+  </figure>
+
+  <table class="notation">
+    <caption>全页记号</caption>
+    <thead><tr><th>符号</th><th>含义</th><th>形状</th></tr></thead>
+    <tbody>
+      <tr><td>$T_{ab}$</td><td>$T_{ab}=\begin{bmatrix}R_{ab}&\mathbf{t}_{ab}\\ \mathbf{0}^\top&1\end{bmatrix}$，把 b 系坐标变成 a 系坐标：$\mathbf{X}_a=T_{ab}\mathbf{X}_b$（齐次）。它也是 b 系在 a 系里的位姿。OpenCV 文档写作 ${}^{a}T_{b}$</td><td>4×4</td></tr>
+      <tr><td>$T_{cw}$</td><td>外参 $[R\,|\,\mathbf{t}]$：世界 → 相机</td><td>3×4 或 4×4</td></tr>
+      <tr><td>$T_{wc}$</td><td>$T_{cw}^{-1}$，相机位姿：相机 → 世界（NeRF 等叫 c2w）</td><td>4×4</td></tr>
+      <tr><td>$K$</td><td>内参矩阵</td><td>3×3</td></tr>
+      <tr><td>$\tilde{\mathbf{u}},\ \tilde{\mathbf{X}}$</td><td>齐次坐标 $[u,v,1]^\top$、$[X,Y,Z,1]^\top$</td><td>3 / 4</td></tr>
+      <tr><td>$W,\ H$</td><td>图像宽、高</td><td>px</td></tr>
+    </tbody>
+  </table>
+  <p>下标规则：$T_{ac}=T_{ab}T_{bc}$，相邻下标抵消。旋转矩阵、轴角、四元数和齐次变换的细节见<a href="../rotations/">旋转与位姿表示</a>。</p>
+</section>
+
+<section id="pinhole">
+  <h2 data-toc="针孔与内参">针孔模型与内参 K</h2>
+  <p class="def"><b>针孔模型</b>：所有成像光线都过同一点（光心），像点位置只由光线方向决定。</p>
+  <table class="notation">
+    <caption>记号</caption>
+    <thead><tr><th>符号</th><th>含义</th><th>单位</th></tr></thead>
+    <tbody>
+      <tr><td>$f$</td><td>物理焦距（光心到成像面）</td><td>mm</td></tr>
+      <tr><td>$\rho_x,\ \rho_y$</td><td>像元尺寸</td><td>mm/px</td></tr>
+      <tr><td>$f_x,\ f_y$</td><td>以像素计的焦距</td><td>px</td></tr>
+      <tr><td>$c_x,\ c_y$</td><td>主点：光轴和成像面的交点在图像里的位置</td><td>px</td></tr>
+      <tr><td>$s$</td><td>skew，像素两轴不垂直时的耦合项</td><td>px</td></tr>
+    </tbody>
+  </table>
+  <h3>推导</h3>
+  <ol class="derive">
+    <li><p>把成像面放在光心前方距离 $f$ 处（虚像面，省掉倒像）。相似三角形：</p>$$\frac{x_{\text{img}}}{f}=\frac{X_c}{Z_c},\qquad \frac{y_{\text{img}}}{f}=\frac{Y_c}{Z_c}$$</li>
+    <li><p>成像面上的毫米换成像素：除以像元尺寸，再加主点：</p>$$u=\frac{x_{\text{img}}}{\rho_x}+c_x=\frac{f}{\rho_x}\cdot\frac{X_c}{Z_c}+c_x$$</li>
+    <li><p>记 $f_x=f/\rho_x$、$f_y=f/\rho_y$，用归一化坐标 $x=X_c/Z_c,\ y=Y_c/Z_c$ 写：</p>$$u=f_x\,x+c_x,\qquad v=f_y\,y+c_y$$</li>
+    <li><p>像素网格两轴不垂直时多一项 $s\,y$。现代传感器 $s\approx 0$，OpenCV 的模型里没有这一项：</p>$$u=f_x\,x+s\,y+c_x$$</li>
+    <li><p>写成矩阵。左边乘的 $Z_c$ 就是投影丢掉的深度：</p>$$Z_c\begin{bmatrix}u\\v\\1\end{bmatrix}=\underbrace{\begin{bmatrix}f_x&s&c_x\\0&f_y&c_y\\0&0&1\end{bmatrix}}_{K}\begin{bmatrix}X_c\\Y_c\\Z_c\end{bmatrix}$$</li>
+    <li><p>接上外参得到 3×4 投影矩阵 $P$。12 个元素去掉整体尺度，11 个自由度（内参 5 + 外参 6）：</p>$$\lambda\,\tilde{\mathbf{u}}=K\,[R\,|\,\mathbf{t}]\,\tilde{\mathbf{X}}_w=P\,\tilde{\mathbf{X}}_w,\qquad \lambda=Z_c$$</li>
+  </ol>
+
+  <h3>视场角和焦距</h3>
+  <p>主点在图像中心时，图像左右边缘的光线和光轴夹角是 $\mathrm{FOV}_x/2$，正切等于半宽除以焦距：</p>
+  <div class="eq">$$f_x=\frac{W}{2\tan(\mathrm{FOV}_x/2)},\qquad f_y=\frac{H}{2\tan(\mathrm{FOV}_y/2)}$$</div>
+  <p>例：$W=640$、$\mathrm{FOV}_x=90^\circ$ 时 $f_x=320$ px；$\mathrm{FOV}_x=60^\circ$ 时 $f_x=554.3$ px。FOV 不变而分辨率翻倍，$f_x$ 也翻倍。</p>
+
+  <figure class="viz" id="viz-fov">
+    <div class="viz-h"><b>相似三角形：拖动场景里的点</b><span>俯视 x–z 平面 · 场景 m，像平面 px</span></div>
+    <div class="viz-stage"><canvas id="cv-fov" aria-label="俯视的相机视场：光心、像平面和一个场景点，两组相似三角形"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="sl-fov">$\mathrm{FOV}_x$ <input type="range" id="sl-fov" min="40" max="120" step="1" value="70"><output id="o-fov"></output></label>
+      <div class="seg" id="seg-fovw"><button type="button" data-v="320">W = 320</button><button type="button" data-v="640" aria-pressed="true">640</button><button type="button" data-v="1280">1280</button></div>
+    </div>
+    <div class="viz-read" id="rd-fov"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>像平面（0 … W px）和像点</li><li><i style="background:var(--c2)"></i>场景点和它的光线</li></ul>
+    <figcaption>两个阴影三角形相似：$\dfrac{u-c_x}{f_x}=\dfrac{X_c}{Z_c}$。FOV 变宽，像平面离光心变近（$f_x$ 变小）；切换分辨率只改像素刻度，几何不变。</figcaption>
+  </figure>
+
+  <div class="note"><b>K 从哪来</b>
+    <p><b>仿真</b>：MuJoCo 相机的 <code>fovy</code> 是竖直视场角（默认 45°），水平视场由图像宽高比自动算出，所以 $f_x=f_y=\dfrac{H}{2\tan(\text{fovy}/2)}$，主点在图像正中，按 OpenCV 像素中心约定是 $c_x=(W-1)/2,\ c_y=(H-1)/2$（很多代码写 $W/2$，差半个像素）。</p>
+    <p><b>真机</b>：RealSense 出厂带内参，<code>rs2_intrinsics</code> 里是 <code>fx, fy, ppx, ppy</code>（ppx/ppy 即 $c_x,c_y$）和 <code>coeffs[5]</code>。要更准就自己标定（见下文）。</p>
+    <p><b>镜头参数</b>：$f_x=f\cdot W/\text{传感器宽度}$，$f$ 和传感器宽度同用 mm。</p>
+  </div>
+</section>
+
+<section id="resize">
+  <h2 data-toc="裁剪与缩放">裁剪、缩放之后的 K</h2>
+  <p class="def"><b>图像预处理会改内参</b>：裁剪平移主点；缩放同时缩放焦距和主点；畸变系数作用在归一化坐标上，不变。</p>
+  <ol class="derive">
+    <li><p>从 $(x_0,y_0)$ 开始裁剪，新坐标 $u'=u-x_0$，焦距不变：</p>$$c_x'=c_x-x_0,\qquad c_y'=c_y-y_0$$</li>
+    <li><p>宽从 $W$ 缩放到 $W'$，$s_x=W'/W$。整数坐标是像素中心，被等比缩放的是像素边缘坐标 $u+\tfrac12$：</p>$$u'+\tfrac12=s_x\,(u+\tfrac12)$$</li>
+    <li><p>代入 $u=f_x x+c_x$，对比系数：</p>$$f_x'=s_x f_x,\qquad c_x'=s_x\,(c_x+\tfrac12)-\tfrac12$$<p>很多代码写 $c_x'=s_x c_x$，差 $\tfrac12(s_x-1)$ 像素。$y$ 方向同理。</p></li>
+    <li><p>先裁后缩，两个仿射依次左乘：</p>$$K'=\begin{bmatrix}s_x&0&\tfrac12(s_x-1)\\0&s_y&\tfrac12(s_y-1)\\0&0&1\end{bmatrix}\begin{bmatrix}1&0&-x_0\\0&1&-y_0\\0&0&1\end{bmatrix}K$$</li>
+  </ol>
+
+  <figure class="viz" id="viz-resize">
+    <div class="viz-h"><b>裁剪框和输出尺寸改了，K 跟着改</b><span>原图 640×480 px</span></div>
+    <div class="viz-grid">
+      <div class="viz-stage"><canvas id="cv-rs-a" aria-label="原图和裁剪框"></canvas></div>
+      <div class="viz-stage"><canvas id="cv-rs-b" aria-label="裁剪缩放后的输出图像，用新 K 投影的线框与实际像素对齐"></canvas></div>
+    </div>
+    <div class="viz-ctrl">
+      <div class="seg" id="seg-crop"><button type="button" data-v="none">不裁</button><button type="button" data-v="sq" aria-pressed="true">裁 480×480</button><button type="button" data-v="small">裁 320×240</button></div>
+      <label for="sl-cx0">裁剪框水平位置 <input type="range" id="sl-cx0" min="0" max="1" step="0.01" value="0.5"><output id="o-cx0"></output></label>
+      <label for="sl-cy0">竖直位置 <input type="range" id="sl-cy0" min="0" max="1" step="0.01" value="0.5"><output id="o-cy0"></output></label>
+      <div class="seg" id="seg-out"><button type="button" data-v="224" aria-pressed="true">缩放到 224×224</button><button type="button" data-v="keep">不缩放</button></div>
+      <div class="seg" id="seg-cmp"><button type="button" data-v="nooff" aria-pressed="true">对照：忘了减裁剪偏移</button><button type="button" data-v="K">对照：K 不改</button><button type="button" data-v="none">无对照</button></div>
+    </div>
+    <div class="viz-read" id="rd-resize"></div>
+    <ul class="chips"><li><i style="background:var(--c1s)"></i>原图像素裁剪缩放后的位置（粗）</li><li><i style="background:var(--c1)"></i>用 K′ 重新投影（细）</li><li><i style="background:var(--bad)"></i>对照的错误投影</li><li><i style="background:var(--c4)"></i>裁剪框</li></ul>
+    <figcaption>右图细线和粗线重合，说明 $K'$ 对了；红色虚线画到了图像框外面，「K 不改」时它常常整个落在画外。「不裁 + 缩放到 224×224」是非等比缩放，$f_x'\neq f_y'$，模型照样成立。</figcaption>
+  </figure>
+
+  <div class="note pit"><b>易错</b><p>水平翻转增强 $u'=W-1-u$ 等价于 $f_x'=-f_x,\ c_x'=W-1-c_x$：图像变成镜像世界，左右手性反了。用到相机几何（深度反投影、外参、末端投影）的模型不要做水平翻转，否则要同时镜像动作和位姿。</p></div>
+</section>
+
+<section id="conventions">
+  <h2 data-toc="坐标系约定">相机坐标系的几种约定</h2>
+  <p class="def"><b>相机坐标系约定</b>只规定三根轴的朝向：光轴是 $+z$、$-z$ 还是 $+x$，图像上方是哪根轴。投影公式不变，换约定只是乘一个元素为 0、±1 的旋转矩阵。</p>
+
+  <figure class="viz" id="viz-conv">
+    <div class="viz-h"><b>同一台相机，四种轴的画法</b><span>拖动旋转视角</span></div>
+    <div class="viz-stage"><canvas id="cv-conv" aria-label="一台相机和它在所选约定下的三根坐标轴"></canvas></div>
+    <div class="viz-ctrl">
+      <div class="seg" id="seg-conv"><button type="button" data-v="cv" aria-pressed="true">OpenCV</button><button type="button" data-v="gl">OpenGL / Blender</button><button type="button" data-v="ros">ROS camera_link</button><button type="button" data-v="p3d">PyTorch3D</button></div>
+    </div>
+    <div class="viz-read" id="rd-conv"></div>
+    <ul class="chips"><li><i style="background:var(--bad)"></i>x</li><li><i style="background:var(--ok)"></i>y</li><li><i style="background:var(--c1)"></i>z</li><li><i style="background:var(--c4)"></i>视锥，粗边是图像上沿</li><li><i style="background:var(--c2)"></i>点 A</li></ul>
+    <figcaption>矩阵 $R_{\text{cv}\leftarrow\text{sel}}$ 的三列是所选约定的 x、y、z 轴在 OpenCV 相机系里的方向，$\mathbf{X}_{\text{cv}}=R_{\text{cv}\leftarrow\text{sel}}\mathbf{X}_{\text{sel}}$。</figcaption>
+  </figure>
+
+  <div class="tbl"><table>
+    <thead><tr><th>约定</th><th>x</th><th>y</th><th>光轴</th><th>谁在用</th></tr></thead>
+    <tbody>
+      <tr><td>OpenCV</td><td>右</td><td>下</td><td>$+z$</td><td>OpenCV、COLMAP、ROS 的 <code>*_optical_frame</code>（REP 103）、RealSense SDK</td></tr>
+      <tr><td>OpenGL</td><td>右</td><td>上</td><td>$-z$</td><td>OpenGL、Blender、NeRF / nerfstudio、MuJoCo 相机、USD / Isaac Sim 相机 prim</td></tr>
+      <tr><td>ROS 机体系</td><td>前</td><td>左</td><td>$+x$</td><td>REP 103 机体系（<code>camera_link</code>）、SAPIEN 相机实体的位姿</td></tr>
+      <tr><td>PyTorch3D</td><td>左</td><td>上</td><td>$+z$</td><td>PyTorch3D（行向量：$X_{\text{cam}}=X_{\text{world}}R+T$）</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>互转</h3>
+  <ul>
+    <li><b>OpenGL ↔ OpenCV</b>：$R_{\text{cv}\leftarrow\text{gl}}=\mathrm{diag}(1,-1,-1)$，即绕 x 轴转 180°，逆就是它自己。相机位姿（c2w）右乘：$T_{wc}^{\text{cv}}=T_{wc}^{\text{gl}}\,\mathrm{diag}(1,-1,-1,1)$，把旋转部分第 2、3 列取负；外参（w2c）左乘：$T_{cw}^{\text{cv}}=\mathrm{diag}(1,-1,-1,1)\,T_{cw}^{\text{gl}}$。</li>
+    <li><b>一般形式</b>：$T_{wc}^{\text{cv}}=T_{wc}^{\text{sel}}\begin{bmatrix}R_{\text{sel}\leftarrow\text{cv}}&\mathbf{0}\\ \mathbf{0}^\top&1\end{bmatrix}$，$R_{\text{sel}\leftarrow\text{cv}}=R_{\text{cv}\leftarrow\text{sel}}^\top$。相机中心不变，只换轴。</li>
+    <li><b>ROS</b>：<code>camera_link → camera_optical_frame</code> 的静态变换在 URDF 里写 <code>rpy="-1.5708 0 -1.5708"</code>，即 $R_z(-\tfrac{\pi}{2})R_x(-\tfrac{\pi}{2})$：$$R_{\text{link}\leftarrow\text{opt}}=\begin{bmatrix}0&0&1\\-1&0&0\\0&-1&0\end{bmatrix}$$ 三列依次是光学系的右、下、前在机体系里的方向：$-y,\ -z,\ +x$。</li>
+    <li><b>Isaac Sim</b>：相机 API 的 <code>camera_axes</code> 可选 <code>"world"</code>（+X 前、+Z 上）、<code>"ros"</code>（+Z 前、−Y 上）、<code>"usd"</code>（−Z 前、+Y 上）；USD 到 ROS 是绕 x 转 180°。</li>
+  </ul>
+  <div class="note pit"><b>判断一份数据用哪种约定</b><p>取一个肯定在相机前方的点（桌面中心、标定板），变到相机系：$Z_c>0$ 是 OpenCV 类，$Z_c<0$ 是 OpenGL 类，最大分量在 x 上是机体系。再看画面上方物体的 y 坐标符号，区分 y 朝上还是朝下。</p></div>
+</section>
+
+<section id="distortion">
+  <h2 data-toc="畸变">镜头畸变与去畸变</h2>
+  <p class="def"><b>畸变</b>作用在归一化像平面上：$(x,y)\mapsto(x_d,y_d)$，再乘 $K$ 得像素。它把直线拍弯，离光轴越远越明显。</p>
+  <table class="notation">
+    <caption>记号</caption>
+    <thead><tr><th>符号</th><th>含义</th><th>形状</th></tr></thead>
+    <tbody>
+      <tr><td>$r^2=x^2+y^2$</td><td>归一化平面上到光轴的距离平方</td><td>标量</td></tr>
+      <tr><td>$k_1,k_2,k_3$</td><td>径向畸变系数（Brown–Conrady）</td><td>标量</td></tr>
+      <tr><td>$p_1,p_2$</td><td>切向畸变系数</td><td>标量</td></tr>
+      <tr><td>$\theta=\arctan r$</td><td>入射光线和光轴的夹角</td><td>rad</td></tr>
+      <tr><td>$\theta_d,\ k_1..k_4$</td><td>鱼眼模型里畸变后的角度和它的多项式系数</td><td>rad；标量</td></tr>
+    </tbody>
+  </table>
+  <h3>Brown–Conrady（OpenCV 默认模型）</h3>
+  <div class="eq">$$\begin{aligned}x_d&=x\,(1+k_1r^2+k_2r^4+k_3r^6)+2p_1xy+p_2(r^2+2x^2)\\ y_d&=y\,(1+k_1r^2+k_2r^4+k_3r^6)+p_1(r^2+2y^2)+2p_2xy\end{aligned}$$</div>
+  <ul>
+    <li>径向项：径向因子随 $r$ 减小是桶形（$k_1<0$，边缘往里收），增大是枕形。切向项来自镜片和传感器不平行。</li>
+    <li>OpenCV <code>distCoeffs</code> 的顺序是 <code>(k1, k2, p1, p2[, k3[, k4, k5, k6[, s1, s2, s3, s4[, τx, τy]]]])</code>，长度 4、5、8、12 或 14。$k_4..k_6$ 是有理模型的分母项，$s_i$ 是薄棱镜项。RealSense 的 <code>coeffs</code> 按 $[k_1,k_2,p_1,p_2,k_3]$ 排，和 OpenCV 前五个一致。</li>
+    <li>OpenCV 文档：真实镜头的径向畸变是单调的；标定出非单调的结果应视为失败，它在图像中心附近看着准，边缘会很差。</li>
+  </ul>
+  <h3>鱼眼：Kannala–Brandt / 等距模型</h3>
+  <div class="eq">$$\theta=\arctan r,\qquad \theta_d=\theta\,(1+k_1\theta^2+k_2\theta^4+k_3\theta^6+k_4\theta^8),\qquad (x_d,y_d)=\frac{\theta_d}{r}\,(x,y)$$</div>
+  <ul>
+    <li>系数全为 0 时像点到中心的距离 $r_d=\theta$，正比于入射角，这是等距投影；针孔是 $r=\tan\theta$，在 90° 发散。所以鱼眼图能装下 180° 左右的视场。</li>
+    <li>OpenCV 的 <code>cv::fisheye</code> 就是这个模型（文档引 Kannala–Brandt 2006）。它先算 $a=x/z$，所以输入点必须在相机前方（$z>0$）。</li>
+  </ul>
+  <h3>去畸变</h3>
+  <ul>
+    <li><b>点</b>：从 $(x_d,y_d)$ 反解 $(x,y)$ 没有闭式解。<code>cv::undistortPoints</code> 做不动点迭代 $x\leftarrow\big(x_d-\Delta x(x,y)\big)/(1+k_1r^2+k_2r^4+k_3r^6)$，默认 5 次（文档写明），畸变强时用 <code>undistortPointsIter</code> 加次数。鱼眼的 <code>fisheye::undistortPoints</code> 对 $\theta$ 做牛顿迭代。</li>
+    <li><b>整幅图</b>：<code>initUndistortRectifyMap</code> 对每个输出像素做一次正向畸变，算出该去原图哪里取样，再 <code>remap</code>，不需要反解。输出视野由新内参决定：<code>getOptimalNewCameraMatrix(alpha)</code> 的 alpha=0 只留全有效像素，alpha=1 保留全部原像素（带黑边）；鱼眼对应 <code>fisheye::estimateNewCameraMatrixForUndistortRectify(balance)</code>。</li>
+  </ul>
+
+  <figure class="viz" id="viz-dist">
+    <div class="viz-h"><b>一张直线网格被镜头拍成什么样</b><span>640×480 px，外框外面是图像以外</span></div>
+    <div class="viz-stage"><canvas id="cv-dist" aria-label="畸变后的网格和图像边框"></canvas></div>
+    <div class="viz-ctrl">
+      <div class="seg" id="seg-dmodel"><button type="button" data-v="bc" aria-pressed="true">Brown–Conrady</button><button type="button" data-v="kb">鱼眼 KB</button></div>
+      <div class="seg" id="seg-dview"><button type="button" data-v="dist" aria-pressed="true">相机拍到的</button><button type="button" data-v="undist">去畸变后</button></div>
+      <span class="grp" id="g-bc">
+        <label for="sl-k1">$k_1$ <input type="range" id="sl-k1" min="-0.6" max="0.4" step="0.01" value="-0.28"><output id="o-k1"></output></label>
+        <label for="sl-k2">$k_2$ <input type="range" id="sl-k2" min="-0.2" max="0.2" step="0.01" value="0.07"><output id="o-k2"></output></label>
+        <label for="sl-p1">$p_1$ <input type="range" id="sl-p1" min="-0.02" max="0.02" step="0.001" value="0"><output id="o-p1"></output></label>
+        <label for="sl-p2">$p_2$ <input type="range" id="sl-p2" min="-0.02" max="0.02" step="0.001" value="0"><output id="o-p2"></output></label>
+      </span>
+      <span class="grp" id="g-kb" hidden>
+        <label for="sl-q1">$k_1$ <input type="range" id="sl-q1" min="-0.1" max="0.1" step="0.005" value="0"><output id="o-q1"></output></label>
+        <label for="sl-q2">$k_2$ <input type="range" id="sl-q2" min="-0.05" max="0.05" step="0.0025" value="0"><output id="o-q2"></output></label>
+      </span>
+    </div>
+    <div class="viz-read" id="rd-dist"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>场景里的直线网格</li><li><i style="background:var(--line-2)"></i>无畸变时的位置</li><li><i style="background:var(--c3)"></i>去畸变后原图像素覆盖的区域</li><li><i style="background:var(--ink-2)"></i>图像边框</li></ul>
+    <figcaption>Brown–Conrady：$f=480$ px。去畸变后若保持原 $K$，绿色区域伸出边框的部分被裁掉，框内绿色以外是黑边。鱼眼：$f=200$ px，网格画在 $Z=1$ 的大墙上，虚线圆是入射角 30°、60°、90°。把 $k_1$ 拖到 −0.6 看非单调警告。</figcaption>
+  </figure>
+</section>
+
+<section id="extrinsics">
+  <h2 data-toc="外参">外参：T_cw 还是 T_wc</h2>
+  <p class="def"><b>外参</b>是把世界坐标变到相机坐标的刚体变换 $T_{cw}=[R\,|\,\mathbf{t}]$：$\mathbf{X}_c=R\,\mathbf{X}_w+\mathbf{t}$。它的逆 $T_{wc}$ 才是相机在世界里的位姿。</p>
+  <ol class="derive">
+    <li><p>相机中心在相机系里是原点：</p>$$R\,\mathbf{C}_w+\mathbf{t}=\mathbf{0}\ \Rightarrow\ \mathbf{C}_w=-R^\top\mathbf{t}$$</li>
+    <li><p>相机三根轴在世界系里的方向是 $R^\top$ 的三列（即 $R$ 的三行），所以：</p>$$T_{wc}=T_{cw}^{-1}=\begin{bmatrix}R^\top&-R^\top\mathbf{t}\\ \mathbf{0}^\top&1\end{bmatrix}$$</li>
+    <li><p>$\mathbf{t}$ 不是相机位置，它是世界原点在相机系里的坐标。把 $T_{cw}$ 当位姿画出来，相机会出现在一个无关的位置、朝一个无关的方向。</p>$$\mathbf{t}=-R\,\mathbf{C}_w\neq\mathbf{C}_w$$</li>
+  </ol>
+
+  <figure class="viz" id="viz-ext">
+    <div class="viz-h"><b>拖动相机：正确的位姿和「把 T_cw 当位姿」</b><span>左：俯视桌面，单位 m · 右：相机图像</span></div>
+    <div class="viz-grid">
+      <div class="viz-stage"><canvas id="cv-ext" aria-label="俯视图：世界坐标轴、桌上五个点、正确的相机和误用外参得到的相机"></canvas></div>
+      <div class="viz-stage"><canvas id="cv-ext-img" aria-label="相机图像：正确投影和误用外参的投影"></canvas></div>
+    </div>
+    <div class="viz-ctrl">
+      <label for="sl-yaw">相机朝向 <input type="range" id="sl-yaw" min="-180" max="180" step="1" value="35"><output id="o-yaw"></output></label>
+    </div>
+    <div class="viz-read" id="rd-ext"></div>
+    <ul class="chips"><li><i style="background:var(--c4)"></i>正确的相机（$T_{wc}$）</li><li><i style="background:var(--bad)"></i>把 $T_{cw}$ 当位姿 / 把 $T_{wc}$ 当外参</li><li><i style="background:var(--ink-2)"></i>右图实心点：正确投影</li></ul>
+    <figcaption>相机高 0.45 m、俯视 35°，在左图里拖动它。右图空心圈是把 $T_{wc}$ 当外参算出的投影，多数点跑到相机后方或画外。</figcaption>
+  </figure>
+
+  <ul>
+    <li>OpenCV <code>solvePnP</code>、<code>calibrateCamera</code> 返回的 <code>rvec, tvec</code> 是 $T_{cw}$（物体或标定板 → 相机），<code>rvec</code> 是轴角，用 <code>cv::Rodrigues</code> 转矩阵。</li>
+    <li>COLMAP <code>images.txt</code> 的 <code>QW QX QY QZ TX TY TZ</code> 是 $T_{cw}$，文档写明相机中心是 $-R^\top\mathbf{t}$。</li>
+    <li>NeRF / nerfstudio <code>transforms.json</code> 的 <code>transform_matrix</code> 是 $T_{wc}$（c2w），并且是 OpenGL 约定。</li>
+    <li>OpenCV 的 <code>R_gripper2base</code> 读作「把 gripper 系坐标变到 base 系」，即 $R_{bg}$。看到 <code>a2b</code> 就写成 $T_{ba}$。</li>
+  </ul>
+  <div class="note pit"><b>拿到外参先问两件事</b><p>它是 w2c 还是 c2w；相机系是哪种约定。验证：取相机前方一个已知点，变换后 $Z_c$ 必须为正（OpenCV 约定），投影要落在图里该落的位置。末端执行器和 base 系的定义见<a href="../action-space/">运动空间</a>。</p></div>
+</section>
+
+<section id="depth">
+  <h2 data-toc="深度反投影">深度图反投影成点云</h2>
+  <p class="def"><b>反投影</b>是投影的逆：已知像素 $(u,v)$ 和它的深度，求相机系下的三维点。投影丢掉的 $Z_c$ 由深度图补回来。</p>
+  <ol class="derive">
+    <li><p>投影式 $Z_c\tilde{\mathbf{u}}=K\mathbf{X}_c$ 两边左乘 $K^{-1}$：</p>$$\mathbf{X}_c=Z_c\,K^{-1}\tilde{\mathbf{u}}=Z_c\,(x,\ y,\ 1)^\top$$</li>
+    <li><p>展开（$s=0$）：</p>$$X_c=Z_c\,\frac{u-c_x}{f_x},\qquad Y_c=Z_c\,\frac{v-c_y}{f_y}$$</li>
+    <li><p>如果深度存的是光心到点的距离 $\rho$（射线长度）而不是 $Z_c$，先归一化方向：</p>$$\mathbf{X}_c=\rho\,\frac{K^{-1}\tilde{\mathbf{u}}}{\|K^{-1}\tilde{\mathbf{u}}\|},\qquad Z_c=\frac{\rho}{\sqrt{1+x^2+y^2}}$$</li>
+    <li><p>变到世界或 base 系；有畸变时先用 <code>undistortPoints</code> 把 $(u,v)$ 变成无畸变的 $(x,y)$ 再乘深度：</p>$$\mathbf{X}_w=T_{wc}\,\mathbf{X}_c$$</li>
+  </ol>
+
+  <figure class="viz" id="viz-depth">
+    <div class="viz-h"><b>深度的含义用错，平墙会弯</b><span>相机系 x–z 截面，墙在 Z = 1 m</span></div>
+    <div class="viz-stage"><canvas id="cv-depth" aria-label="相机截面：墙和盒子的真实表面、像素光线、反投影出的点"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="sl-dfov">$\mathrm{FOV}_x$ <input type="range" id="sl-dfov" min="40" max="120" step="1" value="90"><output id="o-dfov"></output></label>
+      <div class="seg" id="seg-dstore"><button type="button" data-v="z">深度图存的是 $Z_c$</button><button type="button" data-v="ray" aria-pressed="true">存的是射线距离 ρ</button></div>
+      <div class="seg" id="seg-dassume"><button type="button" data-v="z" aria-pressed="true">代码按 $Z_c$ 反投影</button><button type="button" data-v="ray">按 ρ 反投影</button></div>
+    </div>
+    <div class="viz-read" id="rd-depth"></div>
+    <ul class="chips"><li><i style="background:var(--ink-2)"></i>真实表面</li><li><i style="background:var(--line-2)"></i>25 个像素的光线</li><li><i style="background:var(--ok)"></i>反投影点（含义一致）</li><li><i style="background:var(--bad)"></i>反投影点（含义不一致）</li></ul>
+    <figcaption>两者之比 $\rho/Z_c=\sqrt{1+x^2+y^2}$，光轴上为 1，向边缘增大。视场越宽，用错的后果越大。</figcaption>
+  </figure>
+
+  <div class="tbl"><table>
+    <thead><tr><th>深度来源</th><th>存的是</th><th>单位 / 格式</th></tr></thead>
+    <tbody>
+      <tr><td>RealSense D415 / D435 / D455 等</td><td>$Z_c$（<code>rs2_deproject_pixel_to_point</code> 直接算 depth·(x, y, 1)）</td><td>uint16，默认 1 单位 = 1 mm；以 <code>get_depth_scale()</code> 为准，0 表示无效</td></tr>
+      <tr><td>RealSense D405</td><td>$Z_c$</td><td>默认 1 单位 = 0.1 mm（librealsense 源码里 D405 的默认 depth units 是 0.0001 m）</td></tr>
+      <tr><td>TUM RGB-D 数据集</td><td>$Z_c$</td><td>16 位 PNG，5000 = 1 m，0 表示缺失</td></tr>
+      <tr><td>MuJoCo <code>mujoco.Renderer</code> 深度模式</td><td>$Z_c$（已把 OpenGL 非线性深度缓冲换算回线性距离）</td><td>float32，模型长度单位（通常 m）</td></tr>
+      <tr><td>Isaac Sim / Isaac Lab</td><td><code>distance_to_image_plane</code> 是 $Z_c$；<code>distance_to_camera</code> 是射线距离 ρ</td><td>float32，m</td></tr>
+    </tbody>
+  </table></div>
+  <div class="note pit"><b>易错</b><p>RealSense 的深度来自红外双目，和 RGB 相机的内参、外参都不同。要按像素对齐 RGB，用对齐到 color 的深度（<code>rs2::align</code>），并用 color 的内参反投影。</p></div>
+</section>
+
+<section id="stereo">
+  <h2 data-toc="双目">双目深度</h2>
+  <p class="def"><b>校正后的双目</b>：两台内参相同、光轴平行、只沿 x 方向相隔基线 $B$ 的相机。同一个点在两图里只差水平视差 $d=u_L-u_R$。</p>
+  <ol class="derive">
+    <li><p>点在左相机系是 $(X,Y,Z)$，在右相机系是 $(X-B,\ Y,\ Z)$：</p>$$u_L=f\frac{X}{Z}+c_x,\qquad u_R=f\frac{X-B}{Z}+c_x$$</li>
+    <li><p>相减，$X$ 和 $c_x$ 消掉：</p>$$d=u_L-u_R=\frac{fB}{Z}\ \Rightarrow\ Z=\frac{fB}{d}$$</li>
+    <li><p>对 $d$ 求导：视差误差 $\delta d$ 放大成深度误差，随距离平方增长：</p>$$\delta Z=\frac{Z^2}{fB}\,\delta d$$</li>
+  </ol>
+  <div class="tbl"><table>
+    <thead><tr><th>Z</th><th>0.5 m</th><th>1 m</th><th>2 m</th><th>4 m</th></tr></thead>
+    <tbody><tr><td>$\delta Z$（示例参数：$f=400$ px，$B=50$ mm，$\delta d=0.1$ px）</td><td class="num">1.25 mm</td><td class="num">5 mm</td><td class="num">20 mm</td><td class="num">80 mm</td></tr></tbody>
+  </table></div>
+  <p>OpenCV 流程：<code>stereoCalibrate</code> 求两相机的相对位姿 → <code>stereoRectify</code> 输出两边的校正旋转 $R_1,R_2$、新投影矩阵 $P_1,P_2$ 和 4×4 的 $Q$ → 立体匹配得视差图 → <code>reprojectImageTo3D(disparity, Q)</code> 得点云。</p>
+</section>
+
+<section id="zhang">
+  <h2 data-toc="张正友标定">张正友标定</h2>
+  <p class="def"><b>张正友标定</b>（Zhang 2000）：拍一块已知尺寸的平面标定板在若干不同朝向下的照片，先用闭式解求 $K$ 和每张图的外参，再连同畸变一起做非线性最小二乘。</p>
+  <table class="notation">
+    <caption>记号</caption>
+    <thead><tr><th>符号</th><th>含义</th><th>形状</th></tr></thead>
+    <tbody>
+      <tr><td>$\mathbf{M}_j$</td><td>板上第 $j$ 个角点 $(X_j,Y_j,0)$，板坐标系里 $Z=0$</td><td>$m$ 个</td></tr>
+      <tr><td>$\mathbf{m}_{ij}$</td><td>第 $i$ 张图里检测到的第 $j$ 个角点</td><td>px，$n\times m$ 个</td></tr>
+      <tr><td>$R_i,\ \mathbf{t}_i$</td><td>第 $i$ 张图的外参（板 → 相机），$R_i=[\mathbf{r}_1\ \mathbf{r}_2\ \mathbf{r}_3]$</td><td>3×3，3</td></tr>
+      <tr><td>$H_i$</td><td>板平面到图像的单应，列为 $\mathbf{h}_1,\mathbf{h}_2,\mathbf{h}_3$，$h_{ik}$ 是 $\mathbf{h}_i$ 的第 $k$ 个元素</td><td>3×3</td></tr>
+      <tr><td>$B$</td><td>$K^{-\top}K^{-1}$，对称矩阵，6 个独立元素 $\mathbf{b}$</td><td>3×3</td></tr>
+      <tr><td>$\mathbf{k}$</td><td>畸变系数</td><td>2–5</td></tr>
+    </tbody>
+  </table>
+  <h3>推导</h3>
+  <ol class="derive">
+    <li><p>板上点 $Z=0$，投影里 $\mathbf{r}_3$ 那一列乘 0 消失，平面到图像是一个单应 $H$：</p>$$\lambda\begin{bmatrix}u\\v\\1\end{bmatrix}=K[\mathbf{r}_1\ \mathbf{r}_2\ \mathbf{r}_3\ \mathbf{t}]\begin{bmatrix}X\\Y\\0\\1\end{bmatrix}=\underbrace{K[\mathbf{r}_1\ \mathbf{r}_2\ \mathbf{t}]}_{H\ \text{（差一个尺度）}}\begin{bmatrix}X\\Y\\1\end{bmatrix}$$</li>
+    <li><p>每张图单独估 $H$：每个角点给两条关于 $H$ 的 9 个元素 $\mathbf{h}$ 的线性方程（DLT），4 个点以上用 SVD 取最小奇异值对应的向量：</p>$$\begin{bmatrix}X&Y&1&0&0&0&-uX&-uY&-u\\0&0&0&X&Y&1&-vX&-vY&-v\end{bmatrix}\mathbf{h}=\mathbf{0}$$</li>
+    <li><p>由 $[\mathbf{h}_1\ \mathbf{h}_2\ \mathbf{h}_3]=\mu K[\mathbf{r}_1\ \mathbf{r}_2\ \mathbf{t}]$ 得 $\mathbf{r}_1=\mu^{-1}K^{-1}\mathbf{h}_1$、$\mathbf{r}_2=\mu^{-1}K^{-1}\mathbf{h}_2$。旋转矩阵的列正交且等长，给出两条只含 $K$ 的约束：</p>$$\mathbf{h}_1^\top B\,\mathbf{h}_2=0,\qquad \mathbf{h}_1^\top B\,\mathbf{h}_1=\mathbf{h}_2^\top B\,\mathbf{h}_2$$</li>
+    <li><p>$B$ 对称，6 个未知数 $\mathbf{b}=[B_{11},B_{12},B_{22},B_{13},B_{23},B_{33}]^\top$。把 $\mathbf{h}_i^\top B\mathbf{h}_j$ 写成 $\mathbf{v}_{ij}^\top\mathbf{b}$：</p>$$\mathbf{v}_{ij}=\big[h_{i1}h_{j1},\ h_{i1}h_{j2}+h_{i2}h_{j1},\ h_{i2}h_{j2},\ h_{i3}h_{j1}+h_{i1}h_{j3},\ h_{i3}h_{j2}+h_{i2}h_{j3},\ h_{i3}h_{j3}\big]^\top$$</li>
+    <li><p>每张图贡献两行，$n$ 张叠成 $2n\times 6$ 的 $V$。$\mathbf{b}$ 只定到一个尺度，需要 $n\ge 3$（假设 $s=0$ 时 $n\ge 2$），取 $V$ 最小奇异值的右奇异向量：</p>$$\begin{bmatrix}\mathbf{v}_{12}^\top\\(\mathbf{v}_{11}-\mathbf{v}_{22})^\top\end{bmatrix}\mathbf{b}=\mathbf{0}\quad\Longrightarrow\quad V\mathbf{b}=\mathbf{0}$$<p>板子只平移、朝向都一样时，新图给不出新约束，$V$ 退化。</p></li>
+    <li><p>从 $B$ 解出 $K$（Zhang 附录 B，$\kappa$ 是 $B$ 的未知尺度）：</p>$$\begin{aligned}c_y&=\frac{B_{12}B_{13}-B_{11}B_{23}}{B_{11}B_{22}-B_{12}^2},\qquad \kappa=B_{33}-\frac{B_{13}^2+c_y(B_{12}B_{13}-B_{11}B_{23})}{B_{11}}\\ f_x&=\sqrt{\kappa/B_{11}},\qquad f_y=\sqrt{\frac{\kappa B_{11}}{B_{11}B_{22}-B_{12}^2}},\qquad s=-\frac{B_{12}f_x^2f_y}{\kappa},\qquad c_x=\frac{s\,c_y}{f_y}-\frac{B_{13}f_x^2}{\kappa}\end{aligned}$$</li>
+    <li><p>每张图的外参，$\eta=1/\|K^{-1}\mathbf{h}_1\|$，符号取使 $t_z>0$；有噪声时 $[\mathbf{r}_1\ \mathbf{r}_2\ \mathbf{r}_3]$ 不严格正交，用 SVD 投影到最近的旋转矩阵：</p>$$\mathbf{r}_1=\eta K^{-1}\mathbf{h}_1,\quad \mathbf{r}_2=\eta K^{-1}\mathbf{h}_2,\quad \mathbf{r}_3=\mathbf{r}_1\times\mathbf{r}_2,\quad \mathbf{t}=\eta K^{-1}\mathbf{h}_3$$</li>
+    <li><p>以上作初值（畸变初值 0），用 Levenberg–Marquardt 最小化全部角点的重投影误差，参数 $4+|\mathbf{k}|+6n$ 个：</p>$$\min_{K,\ \mathbf{k},\ \{R_i,\mathbf{t}_i\}}\ \sum_{i=1}^{n}\sum_{j=1}^{m}\big\|\mathbf{m}_{ij}-\pi(K,\mathbf{k},R_i,\mathbf{t}_i,\mathbf{M}_j)\big\|^2$$<p>OpenCV <code>calibrateCamera</code> 的返回值就是 RMS 重投影误差 $\sqrt{\tfrac{1}{nm}\sum\|\cdot\|^2}$，单位 px。</p></li>
+  </ol>
+
+  <figure class="viz" id="viz-zhang">
+    <div class="viz-h"><b>在合成数据上跑一遍：闭式解，再 LM 精化</b><span>8×6 角点、方格 30 mm · 残差放大 25 倍</span></div>
+    <div class="viz-stage"><canvas id="cv-zhang" aria-label="所有视图的标定板角点叠在一张图上，以及放大的重投影残差"></canvas></div>
+    <div class="viz-ctrl">
+      <div class="seg" id="seg-zn"><button type="button" data-v="3">3 张</button><button type="button" data-v="6" aria-pressed="true">6 张</button><button type="button" data-v="12">12 张</button></div>
+      <label for="sl-ztilt">最大倾角 <input type="range" id="sl-ztilt" min="1" max="50" step="1" value="35"><output id="o-ztilt"></output></label>
+      <label for="sl-znoise">角点噪声 σ <input type="range" id="sl-znoise" min="0" max="1.5" step="0.05" value="0.3"><output id="o-znoise"></output></label>
+      <div class="seg" id="seg-zstage"><button type="button" data-v="cf">看闭式解残差</button><button type="button" data-v="lm" aria-pressed="true">看 LM 残差</button></div>
+      <button type="button" class="btn ghost" id="bt-zre">重新采样</button>
+    </div>
+    <div class="tbl" id="tb-zhang"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>每种颜色是一张图里的板子</li><li><i style="background:var(--bad)"></i>重投影残差 ×25</li></ul>
+    <figcaption>真值 $f_x=620,\ f_y=615,\ c_x=322,\ c_y=238$，桶形畸变 $k_1=-0.12,\ k_2=0.03$。闭式解没有畸变项，所以有偏；LM 加上 $k_1,k_2$（skew 固定为 0，和 OpenCV 一样）后 RMS 降到接近噪声 σ。$k_2$ 和 $k_1$ 强相关，图少时 $k_2$ 定得不准，所以要看参数标准差。把倾角拖到 2° 以下看退化。</figcaption>
+  </figure>
+
+  <h3>标定板</h3>
+  <ul>
+    <li><b>棋盘格</b>：角点是黑白方格的鞍点，亚像素精度高；要求整块板可见。<code>findChessboardCorners</code> + <code>cornerSubPix</code>，或 <code>findChessboardCornersSB</code>。</li>
+    <li><b>ChArUco</b>：棋盘格白格里嵌 ArUco 码，每个角点有编号，板子部分出画、部分遮挡也能用，方便覆盖图像边角（畸变最大的地方）和手眼标定。OpenCV 4.7 起用 <code>cv::aruco::CharucoDetector</code>。</li>
+    <li><b>AprilTag / ArUco 阵列</b>：每个码有 ID，可单独检测并估位姿，常用来定外参或做多相机标定。</li>
+  </ul>
+  <h3>重投影误差多少算好</h3>
+  <ul>
+    <li>常见经验值：清晰图像、棋盘或 ChArUco 角点、合适的畸变模型下 RMS 在 0.1–0.5 px；超过 1 px 多半是角点检测、模型阶数或数据有问题。RMS 和分辨率成正比，图像缩放一半它也减半。</li>
+    <li>RMS 低是必要不充分条件：它只反映有角点的区域。用 <code>calibrateCameraExtended</code> 的 <code>perViewErrors</code> 剔除坏图，看 <code>stdDeviationsIntrinsics</code> 判断参数是否被数据约束住。</li>
+    <li>采集：板子覆盖图像四角和边缘，有明显倾斜，远近都有；板子要平，方格边长要量准（它决定外参平移的尺度）；固定对焦和变焦。</li>
+  </ul>
+</section>
+
+<section id="handeye">
+  <h2 data-toc="手眼标定">手眼标定</h2>
+  <p class="def"><b>手眼标定</b>求相机和机械臂之间那个固定不变的变换 $X$。眼在手上（eye-in-hand，腕部相机）求 $X=T_{gc}$；眼在手外（eye-to-hand，固定相机）求 $X=T_{bc}$。</p>
+  <table class="notation">
+    <caption>记号</caption>
+    <thead><tr><th>符号</th><th>含义</th><th>从哪来</th></tr></thead>
+    <tbody>
+      <tr><td>b, g, c, t</td><td>机器人 base、末端（gripper/法兰）、相机、标定板</td><td>—</td></tr>
+      <tr><td>$T_{bg}^{(i)}$</td><td>第 $i$ 个位姿下末端在 base 里的位姿</td><td>正运动学（关节读数）</td></tr>
+      <tr><td>$T_{ct}^{(i)}$</td><td>第 $i$ 个位姿下标定板在相机里的位姿</td><td>PnP（<code>solvePnP</code>）</td></tr>
+      <tr><td>$X$</td><td>待求的固定变换</td><td>—</td></tr>
+      <tr><td>$A_{ij},\ B_{ij}$</td><td>两个位姿之间末端、相机的相对运动</td><td>由上面两组算出</td></tr>
+    </tbody>
+  </table>
+  <h3>推导（眼在手上）</h3>
+  <ol class="derive">
+    <li><p>标定板相对 base 不动，每个位姿沿 base → 末端 → 相机 → 板这条链都得到同一个 $T_{bt}$：</p>$$T_{bt}=T_{bg}^{(i)}\,X\,T_{ct}^{(i)}\qquad\text{对所有 } i$$</li>
+    <li><p>取两个位姿 $i,j$，令两式相等：</p>$$T_{bg}^{(i)}\,X\,T_{ct}^{(i)}=T_{bg}^{(j)}\,X\,T_{ct}^{(j)}$$</li>
+    <li><p>左乘 $(T_{bg}^{(j)})^{-1}$，右乘 $(T_{ct}^{(i)})^{-1}$：</p>$$\underbrace{(T_{bg}^{(j)})^{-1}T_{bg}^{(i)}}_{A_{ij}\ \text{末端的相对运动}}\ X=X\ \underbrace{T_{ct}^{(j)}(T_{ct}^{(i)})^{-1}}_{B_{ij}\ \text{相机看到的相对运动}}$$</li>
+    <li><p>旋转部分 $R_AR_X=R_XR_B$，即 $R_A=R_XR_BR_X^\top$：$A$ 和 $B$ 是同一个旋转在两个坐标系里的写法，转角相等，转轴满足（$\boldsymbol\alpha=\log R_A,\ \boldsymbol\beta=\log R_B$ 是轴角向量）：</p>$$\boldsymbol\alpha=R_X\,\boldsymbol\beta$$</li>
+    <li><p>Park–Martin：$\min_{R_X}\sum_k\|R_X\boldsymbol\beta_k-\boldsymbol\alpha_k\|^2$ 有闭式解。至少要两组转轴不平行的运动（三个位姿），否则 $M$ 秩不够：</p>$$R_X=(M^\top M)^{-1/2}M^\top,\qquad M=\sum_k\boldsymbol\beta_k\boldsymbol\alpha_k^\top$$</li>
+    <li><p>平移部分 $R_A\mathbf{t}_X+\mathbf{t}_A=R_X\mathbf{t}_B+\mathbf{t}_X$，整理成线性最小二乘，每组运动 3 行：</p>$$(R_A-I)\,\mathbf{t}_X=R_X\mathbf{t}_B-\mathbf{t}_A$$</li>
+    <li><p>眼在手外：相机固定，板子装在末端上，$T_{gt}$ 不变。链变成末端 → base → 相机 → 板，形式和第 1 步相同，只是 $T_{bg}$ 换成 $T_{gb}=T_{bg}^{-1}$：</p>$$T_{gt}=(T_{bg}^{(i)})^{-1}\,X\,T_{ct}^{(i)},\qquad X=T_{bc}$$</li>
+  </ol>
+
+  <figure class="viz" id="viz-handeye">
+    <div class="viz-h"><b>变换回路：用估出的 X 把每个位姿的链接起来</b><span>左图拖动旋转视角</span></div>
+    <div class="viz-grid">
+      <div class="viz-stage"><canvas id="cv-he3d" aria-label="机械臂、相机、标定板和变换链"></canvas></div>
+      <div class="viz-stage"><canvas id="cv-heimg" aria-label="相机图像：观测到的点和按估计结果预测的点"></canvas></div>
+    </div>
+    <div class="viz-ctrl">
+      <div class="seg" id="seg-hmode"><button type="button" data-v="in" aria-pressed="true">眼在手上</button><button type="button" data-v="out">眼在手外</button></div>
+      <div class="seg" id="seg-hsamp"><button type="button" data-v="multi" aria-pressed="true">多轴旋转采样</button><button type="button" data-v="single">只绕竖直轴转</button></div>
+      <div class="seg" id="seg-hinv"><button type="button" data-v="ok" aria-pressed="true">用 X̂</button><button type="button" data-v="inv">误用 X̂⁻¹</button></div>
+      <label for="sl-hpose">位姿 <input type="range" id="sl-hpose" min="0" max="7" step="1" value="0"><output id="o-hpose"></output></label>
+      <label for="sl-hnoise">PnP 噪声 <input type="range" id="sl-hnoise" min="0" max="3" step="0.1" value="0.5"><output id="o-hnoise"></output></label>
+      <button type="button" class="btn ghost" id="bt-hre">重新采样</button>
+      <button type="button" class="btn ghost" id="bt-hplay">播放</button>
+    </div>
+    <div class="viz-read" id="rd-he"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>$A$：正运动学</li><li><i style="background:var(--c2)"></i>$X$：待求</li><li><i style="background:var(--c3)"></i>$B$：PnP</li><li><i style="background:var(--c4)"></i>不变的那一段</li><li><i style="background:var(--c5)"></i>用 X̂ 闭合回路的预测</li><li><i style="background:var(--ink-2)"></i>右图实心点：观测</li></ul>
+    <figcaption>8 个位姿，Park–Martin 求解。PnP 噪声 σ 表示平移 σ mm、旋转 0.1σ°。黄点是每个位姿各自算出的「不变量」（眼在手上是板子在 base 里的位置，眼在手外是板子相对末端的位置）：X̂ 对时 8 个点聚成一团；用反了就散开，右图预测的点也偏离观测。</figcaption>
+  </figure>
+
+  <h3>AX = ZB：同时求两个未知量</h3>
+  <p>不两两作差，直接对每个位姿写一条方程，同时求两个固定变换。OpenCV <code>calibrateRobotWorldHandEye</code> 解的是 $T_{cw}^{(i)}\,T_{wb}=T_{cg}\,T_{gb}^{(i)}$，即 $A=T_{cw}$（PnP，w 是标定板）、$X=T_{wb}$、$Z=T_{cg}$、$B=T_{gb}$（正运动学取逆），方法有 Shah 2013（Kronecker 积）和 Li 等 2010（对偶四元数）。这类形式最早见 Zhuang 等 1994 的 $AX=YB$。</p>
+
+  <div class="tbl"><table>
+    <thead><tr><th>方法</th><th>思路</th><th>出处</th><th>OpenCV 标志</th></tr></thead>
+    <tbody>
+      <tr><td>Tsai–Lenz</td><td>先旋转后平移，旋转用修正 Rodrigues 参数线性求解</td><td>IEEE TRA 1989</td><td><code>CALIB_HAND_EYE_TSAI</code>（默认）</td></tr>
+      <tr><td>Park–Martin</td><td>先旋转后平移，旋转在李群上闭式求解（上面的推导）</td><td>IEEE TRA 1994</td><td><code>CALIB_HAND_EYE_PARK</code></td></tr>
+      <tr><td>Horaud–Dornaika</td><td>先旋转后平移，四元数形式</td><td>IJRR 1995</td><td><code>CALIB_HAND_EYE_HORAUD</code></td></tr>
+      <tr><td>Andreff 等</td><td>旋转平移同时求，Kronecker 积线性形式</td><td>3DIM 1999</td><td><code>CALIB_HAND_EYE_ANDREFF</code></td></tr>
+      <tr><td>Daniilidis</td><td>旋转平移同时求，对偶四元数</td><td>IJRR 1999</td><td><code>CALIB_HAND_EYE_DANIILIDIS</code></td></tr>
+    </tbody>
+  </table></div>
+  <div class="note pit"><b>OpenCV 用法</b>
+    <p><code>calibrateHandEye(R_gripper2base, t_gripper2base, R_target2cam, t_target2cam)</code> 输入 $T_{bg}$ 和 $T_{ct}$，输出 <code>R_cam2gripper, t_cam2gripper</code> 即 $T_{gc}$。眼在手外时第一组改传 base2gripper（$T_{gb}$），输出就变成 cam2base（$T_{bc}$），文档里给了这两种写法。</p>
+    <p>至少 3 个位姿、两组转轴不平行，实际取 10–20 个。位姿之间转角要大、转轴方向要多样；只在一个平面里平移加绕竖直轴转，沿该轴的平移分量解不出来。</p>
+  </div>
+</section>
+
+<section id="checks">
+  <h2 data-toc="实用检查">上线前的检查</h2>
+  <ol>
+    <li><b>把末端投到图像上</b>。眼在手外：$\tilde{\mathbf{u}}\propto K\,[I\,|\,\mathbf{0}]\,T_{bc}^{-1}T_{bg}\,\tilde{\mathbf{p}}_{\text{tip}}$，各个姿态下都应落在指尖上。常值偏移多半是 TCP 偏移或平移错；随姿态变化的偏差是旋转错；落到完全不相干的地方，先查是不是 $T$ 用反了或约定错了。</li>
+    <li><b>点云看平面</b>。深度反投影后用 $T_{bc}$ 变到 base 系：桌面点的 $z$ 应该一致并等于桌面高度；夹爪的点云应该和按正运动学摆放的夹爪网格重合。</li>
+    <li><b>看残差的分布</b>。每张图的误差、残差在图像上的位置；集中在边角说明畸变模型阶数不够或边角没采到。</li>
+    <li><b>时间同步</b>。采标定数据时机械臂静止；运动中采集要按时间戳把关节状态和图像曝光时刻对齐；卷帘快门相机运动时每一行的曝光时刻不同。</li>
+    <li><b>分辨率</b>。训练和推理用的 resize / crop 与标定时的分辨率不同，按<a href="#resize">裁剪与缩放</a>一节改 $K$。</li>
+    <li><b>动作坐标系</b>。VLA 输出末端位姿动作时，外参决定了「图像里看到的方向」和「动作坐标系」之间的关系，相机挪动后同一个画面对应的动作就变了。动作空间的定义见<a href="../action-space/">运动空间</a>。</li>
+  </ol>
+</section>
+
+<section id="summary">
+  <h2 data-toc="矩阵速查">速查：哪个矩阵把哪个系映到哪个系</h2>
+  <div class="tbl"><table>
+    <thead><tr><th>矩阵</th><th>输入 → 输出</th><th>常见名字</th><th>从哪得到</th></tr></thead>
+    <tbody>
+      <tr><td>$K$</td><td>归一化坐标 $(x,y,1)$ → 像素 $(u,v,1)$</td><td><code>cameraMatrix</code>，<code>fx fy cx cy</code> / <code>ppx ppy</code></td><td>标定、厂商、FOV 公式</td></tr>
+      <tr><td>$K^{-1}$</td><td>像素 → 归一化坐标（光线方向）</td><td>—</td><td>$K$ 求逆</td></tr>
+      <tr><td>$T_{cw}=[R\,|\,\mathbf{t}]$</td><td>世界 → 相机</td><td><code>rvec, tvec</code>，world2cam，w2c，COLMAP 的 qvec/tvec</td><td>PnP、<code>calibrateCamera</code></td></tr>
+      <tr><td>$T_{wc}$</td><td>相机 → 世界（相机位姿）</td><td>cam2world，c2w，NeRF <code>transform_matrix</code></td><td>$T_{cw}^{-1}$</td></tr>
+      <tr><td>$P=K[R\,|\,\mathbf{t}]$</td><td>世界齐次坐标 → 像素齐次坐标</td><td>projection matrix</td><td>$K$ 乘外参</td></tr>
+      <tr><td>$T_{bg}$</td><td>末端 → base</td><td><code>gripper2base</code>，EEF pose</td><td>正运动学</td></tr>
+      <tr><td>$T_{gc}$</td><td>相机 → 末端（眼在手上的 $X$）</td><td><code>cam2gripper</code></td><td><code>calibrateHandEye</code></td></tr>
+      <tr><td>$T_{bc}$</td><td>相机 → base（眼在手外的 $X$）</td><td><code>cam2base</code></td><td><code>calibrateHandEye</code>，第一组输入取逆</td></tr>
+      <tr><td>$T_{ct}$</td><td>标定板 → 相机</td><td><code>target2cam</code></td><td>PnP</td></tr>
+      <tr><td>$\mathrm{diag}(1,-1,-1)$</td><td>OpenGL 相机系 → OpenCV 相机系（反之亦然）</td><td>—</td><td>约定</td></tr>
+      <tr><td>$R_{\text{link}\leftarrow\text{opt}}$</td><td>ROS 光学系 → <code>camera_link</code></td><td>rpy (−π/2, 0, −π/2)</td><td>约定</td></tr>
+      <tr><td>$Q$</td><td>$(u,v,d,1)$ → 齐次三维点</td><td><code>Q</code></td><td><code>stereoRectify</code></td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="quiz">
+  <h2>自测</h2>
+  <details class="q"><summary>640×480、$f_x=f_y=600,\ c_x=319.5,\ c_y=239.5$ 的图中心裁成 480×480 再缩放到 224×224，新 $K$ 是多少？</summary><div><p>裁剪 $x_0=80,\ y_0=0$，$s=224/480$。$f'=600s=280$；$c_x'=s(319.5-80+0.5)-0.5=111.5$，$c_y'=s(239.5+0.5)-0.5=111.5$，正好是新图中心 $(224-1)/2$。</p></div></details>
+  <details class="q"><summary><code>solvePnP</code> 给出 $R,\ \mathbf{t}$，相机在世界（板子）坐标系里的位置是 $\mathbf{t}$ 吗？</summary><div><p>不是。返回的是 $T_{cw}$，$\mathbf{t}$ 是世界原点在相机系里的坐标。相机中心是 $-R^\top\mathbf{t}$，相机位姿是 $T_{cw}^{-1}$。</p></div></details>
+  <details class="q"><summary>nerfstudio 的 <code>transform_matrix</code> 怎么变成 OpenCV 外参？</summary><div><p>它是 OpenGL 约定的 c2w。先右乘 $\mathrm{diag}(1,-1,-1,1)$（旋转部分第 2、3 列取负）变成 OpenCV 约定的 c2w，再求逆得 $T_{cw}$。</p></div></details>
+  <details class="q"><summary>张正友标定时 6 张图的板子都正对相机，只是远近不同，会怎样？</summary><div><p>只平移的板子给出的约束线性相关，$V\mathbf{b}=\mathbf{0}$ 的解不唯一或噪声主导，$K$ 解不出或很不准。需要板子有不同的倾斜方向。</p></div></details>
+  <details class="q"><summary>仿真里取了 <code>distance_to_camera</code> 当深度，按 $\mathbf{X}_c=Z\,K^{-1}\tilde{\mathbf{u}}$ 反投影，平面会变成什么？</summary><div><p>射线距离 $\rho\ge Z_c$，边缘被放大 $\sqrt{1+x^2+y^2}$ 倍，平墙会向外鼓成一个曲面，越靠图像边缘越远。应该用 <code>distance_to_image_plane</code>，或先除以 $\|K^{-1}\tilde{\mathbf{u}}\|$。</p></div></details>
+  <details class="q"><summary>双目 $f=400$ px、$B=5$ cm、视差误差 0.25 px，2 m 处深度误差多大？</summary><div><p>$\delta Z=Z^2\delta d/(fB)=4\times0.25/(400\times0.05)=0.05$ m，即 5 cm。</p></div></details>
+  <details class="q"><summary>手眼标定的样本全是「平移 + 绕竖直轴转」，会怎样？</summary><div><p>所有相对旋转的转轴都平行，$M$ 秩为 1，$R_X$ 绕该轴的分量不定，沿该轴的平移也解不出。必须让末端绕至少两个不平行的轴转。</p></div></details>
+  <details class="q"><summary>标定 RMS 0.15 px，就可以放心用了吗？</summary><div><p>不一定。RMS 只反映有角点的区域；角点没覆盖边角时边缘的畸变可能很差，参数也可能没被约束住。看每张图的误差、残差分布和参数标准差，并用投影末端、点云看平面等方法独立检验。</p></div></details>
+</section>
+
+<section id="refs">
+  <h2>延伸阅读</h2>
+  <ol class="refs">
+    <li><b>Zhang, A Flexible New Technique for Camera Calibration</b>, IEEE TPAMI 22(11):1330–1334, 2000. <a href="https://doi.org/10.1109/34.888718">doi:10.1109/34.888718</a></li>
+    <li><b>Hartley &amp; Zisserman, Multiple View Geometry in Computer Vision</b>, 2nd ed., Cambridge University Press, 2004. 第 6 章相机模型、第 7 章标定。</li>
+    <li><b>Kannala &amp; Brandt, A Generic Camera Model and Calibration Method for Conventional, Wide-Angle, and Fish-Eye Lenses</b>, IEEE TPAMI 28(8):1335–1340, 2006. <a href="https://doi.org/10.1109/TPAMI.2006.153">doi:10.1109/TPAMI.2006.153</a></li>
+    <li><b>Usenko, Demmel &amp; Cremers, The Double Sphere Camera Model</b>, 3DV 2018. <a href="https://arxiv.org/abs/1807.08957">arXiv:1807.08957</a></li>
+    <li><b>Tsai &amp; Lenz, A New Technique for Fully Autonomous and Efficient 3D Robotics Hand/Eye Calibration</b>, IEEE TRA 5(3):345–358, 1989. <a href="https://doi.org/10.1109/70.34770">doi:10.1109/70.34770</a></li>
+    <li><b>Park &amp; Martin, Robot Sensor Calibration: Solving AX = XB on the Euclidean Group</b>, IEEE TRA 10(5):717–721, 1994. <a href="https://doi.org/10.1109/70.326576">doi:10.1109/70.326576</a></li>
+    <li><b>Horaud &amp; Dornaika, Hand-Eye Calibration</b>, IJRR 14(3):195–210, 1995. <a href="https://doi.org/10.1177/027836499501400301">doi:10.1177/027836499501400301</a></li>
+    <li><b>Andreff, Horaud &amp; Espiau, On-line Hand-Eye Calibration</b>, 3DIM 1999, pp. 430–436.</li>
+    <li><b>Daniilidis, Hand-Eye Calibration Using Dual Quaternions</b>, IJRR 18(3):286–298, 1999. <a href="https://doi.org/10.1177/02783649922066213">doi:10.1177/02783649922066213</a></li>
+    <li><b>Zhuang, Roth &amp; Sudhakar, Simultaneous Robot/World and Tool/Flange Calibration by Solving Homogeneous Transformation Equations of the Form AX = YB</b>, IEEE TRA 10(4):549–554, 1994. <a href="https://doi.org/10.1109/70.313105">doi:10.1109/70.313105</a></li>
+    <li><b>Shah, Solving the Robot-World/Hand-Eye Calibration Problem Using the Kronecker Product</b>, J. Mechanisms and Robotics 5(3), 2013. <a href="https://doi.org/10.1115/1.4024473">doi:10.1115/1.4024473</a></li>
+    <li><b>Olson, AprilTag: A Robust and Flexible Visual Fiducial System</b>, ICRA 2011, pp. 3400–3407. <a href="https://doi.org/10.1109/ICRA.2011.5979561">doi:10.1109/ICRA.2011.5979561</a></li>
+    <li><b>Garrido-Jurado et al., Automatic Generation and Detection of Highly Reliable Fiducial Markers under Occlusion</b>（ArUco），Pattern Recognition 47(6):2280–2292, 2014. <a href="https://doi.org/10.1016/j.patcog.2014.01.005">doi:10.1016/j.patcog.2014.01.005</a></li>
+    <li><b>OpenCV calib3d 文档</b>（针孔与畸变模型、<code>calibrateCamera</code>、<code>calibrateHandEye</code>、鱼眼模块）：<a href="https://docs.opencv.org/4.x/d9/d0c/group__calib3d.html">docs.opencv.org</a>；源码 <a href="https://github.com/opencv/opencv/blob/4.x/modules/calib3d/include/opencv2/calib3d.hpp">calib3d.hpp</a></li>
+    <li><b>REP 103: Standard Units of Measure and Coordinate Conventions</b>（ROS 机体系与 optical 系）：<a href="https://www.ros.org/reps/rep-0103.html">ros.org/reps/rep-0103</a></li>
+    <li><b>COLMAP 输出格式</b>（<code>images.txt</code> 的位姿约定）：<a href="https://colmap.github.io/format.html">colmap.github.io/format</a>；<b>librealsense</b>：<a href="https://github.com/IntelRealSense/librealsense">github.com/IntelRealSense/librealsense</a></li>
+  </ol>
+</section>
+
+</main>
+</div>
+
+<!-- v4u:foot -->
+<footer class="v4u-foot"><div class="v4u-foot-in"><a class="pv" href="../action-space/"><span>上一篇</span>机器人的运动空间</a><a class="nx" href="../3d-representations/"><span>下一篇</span>3D 表征</a></div></footer>
+<!-- /v4u:foot -->
+
+<script>
+V4U.ready(() => {
+/* MATH-BEGIN */
+const M = (() => {
+  const add = (a, b) => a.map((x, i) => x + b[i]);
+  const sub = (a, b) => a.map((x, i) => x - b[i]);
+  const scl = (a, s) => a.map((x) => x * s);
+  const dot = (a, b) => a.reduce((s, x, i) => s + x * b[i], 0);
+  const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+  const norm = (a) => Math.hypot(...a);
+  const unit = (a) => { const n = norm(a) || 1; return a.map((x) => x / n); };
+  const mm = (A, B) => A.map((r) => B[0].map((_, j) => r.reduce((s, x, k) => s + x * B[k][j], 0)));
+  const mv = (A, v) => A.map((r) => dot(r, v));
+  const tr = (A) => A[0].map((_, j) => A.map((r) => r[j]));
+  const I3 = () => [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+  const cols = (a, b, c) => [[a[0], b[0], c[0]], [a[1], b[1], c[1]], [a[2], b[2], c[2]]];
+  const rotX = (a) => { const c = Math.cos(a), s = Math.sin(a); return [[1, 0, 0], [0, c, -s], [0, s, c]]; };
+  const rotY = (a) => { const c = Math.cos(a), s = Math.sin(a); return [[c, 0, s], [0, 1, 0], [-s, 0, c]]; };
+  const rotZ = (a) => { const c = Math.cos(a), s = Math.sin(a); return [[c, -s, 0], [s, c, 0], [0, 0, 1]]; };
+  // axis-angle vector -> rotation matrix (Rodrigues)
+  const exp = (w) => {
+    const th = norm(w);
+    if (th < 1e-12) return [[1, -w[2], w[1]], [w[2], 1, -w[0]], [-w[1], w[0], 1]];
+    const k = scl(w, 1 / th), c = Math.cos(th), s = Math.sin(th), v = 1 - c;
+    return [
+      [c + k[0] * k[0] * v, k[0] * k[1] * v - k[2] * s, k[0] * k[2] * v + k[1] * s],
+      [k[1] * k[0] * v + k[2] * s, c + k[1] * k[1] * v, k[1] * k[2] * v - k[0] * s],
+      [k[2] * k[0] * v - k[1] * s, k[2] * k[1] * v + k[0] * s, c + k[2] * k[2] * v],
+    ];
+  };
+  // rotation matrix -> axis-angle vector
+  const log = (R) => {
+    const c = Math.max(-1, Math.min(1, (R[0][0] + R[1][1] + R[2][2] - 1) / 2));
+    const th = Math.acos(c);
+    if (th < 1e-9) return [0, 0, 0];
+    if (Math.PI - th < 1e-6) {
+      const d = [R[0][0], R[1][1], R[2][2]], i = d.indexOf(Math.max(...d));
+      const a = [0, 0, 0]; a[i] = Math.sqrt(Math.max(0, (R[i][i] + 1) / 2));
+      for (let j = 0; j < 3; j++) if (j !== i) a[j] = (R[i][j] + R[j][i]) / (4 * a[i]);
+      return scl(unit(a), th);
+    }
+    const s = 2 * Math.sin(th);
+    return [(R[2][1] - R[1][2]) * th / s, (R[0][2] - R[2][0]) * th / s, (R[1][0] - R[0][1]) * th / s];
+  };
+  const angle = (R) => norm(log(R));
+  // rigid transforms {R, t}
+  const T = (R, t) => ({ R, t });
+  const Tmul = (A, B) => ({ R: mm(A.R, B.R), t: add(mv(A.R, B.t), A.t) });
+  const Tinv = (A) => { const Rt = tr(A.R); return { R: Rt, t: scl(mv(Rt, A.t), -1) }; };
+  const Tap = (A, p) => add(mv(A.R, p), A.t);
+  // OpenCV-style look-at: camera at eye, z towards target, y roughly down (world z up)
+  const lookAt = (eye, target) => {
+    const z = unit(sub(target, eye));
+    let x = cross(z, [0, 0, 1]);
+    if (norm(x) < 1e-6) x = [0, -1, 0];
+    x = unit(x);
+    const y = cross(z, x);
+    return T(cols(x, y, z), eye.slice());
+  };
+  // symmetric eigen-decomposition (cyclic Jacobi). returns {vals, vecs} with vecs[:,k] the k-th eigenvector
+  const eigSym = (S0) => {
+    const n = S0.length, S = S0.map((r) => r.slice()), V = S0.map((_, i) => S0.map((_, j) => (i === j ? 1 : 0)));
+    for (let sweep = 0; sweep < 100; sweep++) {
+      let off = 0;
+      for (let p = 0; p < n; p++) for (let q = p + 1; q < n; q++) off += S[p][q] * S[p][q];
+      if (off < 1e-30) break;
+      for (let p = 0; p < n; p++) for (let q = p + 1; q < n; q++) {
+        if (Math.abs(S[p][q]) < 1e-300) continue;
+        const th = (S[q][q] - S[p][p]) / (2 * S[p][q]);
+        const t = Math.sign(th || 1) / (Math.abs(th) + Math.sqrt(th * th + 1));
+        const c = 1 / Math.sqrt(t * t + 1), s = t * c;
+        for (let k = 0; k < n; k++) { const a = S[k][p], b = S[k][q]; S[k][p] = c * a - s * b; S[k][q] = s * a + c * b; }
+        for (let k = 0; k < n; k++) { const a = S[p][k], b = S[q][k]; S[p][k] = c * a - s * b; S[q][k] = s * a + c * b; }
+        for (let k = 0; k < n; k++) { const a = V[k][p], b = V[k][q]; V[k][p] = c * a - s * b; V[k][q] = s * a + c * b; }
+      }
+    }
+    return { vals: S.map((r, i) => r[i]), vecs: V };
+  };
+  // eigenvector of the smallest eigenvalue of A^T A (null vector of A in least squares)
+  const nullvec = (A) => {
+    const n = A[0].length, AtA = Array.from({ length: n }, () => new Array(n).fill(0));
+    for (const r of A) for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) AtA[i][j] += r[i] * r[j];
+    const { vals, vecs } = eigSym(AtA);
+    let k = 0; vals.forEach((v, i) => { if (v < vals[k]) k = i; });
+    const sorted = vals.slice().sort((a, b) => a - b);
+    return { v: vecs.map((r) => r[k]), vals: sorted };
+  };
+  // dense linear solve (Gaussian elimination, partial pivoting)
+  const solve = (A0, b0) => {
+    const n = b0.length, A = A0.map((r, i) => [...r, b0[i]]);
+    for (let c = 0; c < n; c++) {
+      let p = c; for (let r = c + 1; r < n; r++) if (Math.abs(A[r][c]) > Math.abs(A[p][c])) p = r;
+      [A[c], A[p]] = [A[p], A[c]];
+      if (Math.abs(A[c][c]) < 1e-300) return null;
+      for (let r = c + 1; r < n; r++) { const f = A[r][c] / A[c][c]; if (f) for (let k = c; k <= n; k++) A[r][k] -= f * A[c][k]; }
+    }
+    const x = new Array(n).fill(0);
+    for (let r = n - 1; r >= 0; r--) { let s = A[r][n]; for (let k = r + 1; k < n; k++) s -= A[r][k] * x[k]; x[r] = s / A[r][r]; }
+    return x;
+  };
+  // seeded random numbers
+  const rng = (seed) => {
+    let a = seed >>> 0;
+    const u = () => { a |= 0; a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+    const g = () => { let x = 0; while (x === 0) x = u(); return Math.sqrt(-2 * Math.log(x)) * Math.cos(2 * Math.PI * u()); };
+    const dir = () => unit([g(), g(), g()]);
+    return { u, g, dir };
+  };
+
+  // ---------- camera ----------
+  // Brown-Conrady (OpenCV): k = {k1,k2,k3,p1,p2}
+  const distBC = (x, y, k) => {
+    const r2 = x * x + y * y, rad = 1 + r2 * (k.k1 + r2 * (k.k2 + r2 * (k.k3 || 0)));
+    return [x * rad + 2 * k.p1 * x * y + k.p2 * (r2 + 2 * x * x), y * rad + k.p1 * (r2 + 2 * y * y) + 2 * k.p2 * x * y];
+  };
+  // fixed-point inversion as in cv::undistortPoints
+  const undistBC = (xd, yd, k, iters) => {
+    let x = xd, y = yd;
+    for (let i = 0; i < iters; i++) {
+      const r2 = x * x + y * y, rad = 1 + r2 * (k.k1 + r2 * (k.k2 + r2 * (k.k3 || 0)));
+      const dx = 2 * k.p1 * x * y + k.p2 * (r2 + 2 * x * x), dy = k.p1 * (r2 + 2 * y * y) + 2 * k.p2 * x * y;
+      x = (xd - dx) / rad; y = (yd - dy) / rad;
+    }
+    return [x, y];
+  };
+  // Kannala-Brandt / OpenCV fisheye: k = [k1..k4]; input normalised pinhole coords (x,y) = (X/Z, Y/Z)
+  const kbTheta = (th, k) => { const t2 = th * th; return th * (1 + t2 * (k[0] + t2 * (k[1] + t2 * (k[2] + t2 * k[3])))); };
+  const distKB = (x, y, k) => {
+    const r = Math.hypot(x, y); if (r < 1e-12) return [x, y];
+    const td = kbTheta(Math.atan(r), k); return [x * td / r, y * td / r];
+  };
+  // KB from a ray angle directly (works past 90 deg): theta, azimuth phi
+  const kbRay = (th, phi, k) => { const td = kbTheta(th, k); return [td * Math.cos(phi), td * Math.sin(phi)]; };
+  // Newton on theta (as cv::fisheye::undistortPoints); returns normalised pinhole coords or null if theta >= 90 deg
+  const undistKB = (xd, yd, k, iters) => {
+    const td = Math.hypot(xd, yd); if (td < 1e-12) return [xd, yd];
+    let th = td;
+    for (let i = 0; i < iters; i++) {
+      const t2 = th * th, f = kbTheta(th, k) - td;
+      const df = 1 + t2 * (3 * k[0] + t2 * (5 * k[1] + t2 * (7 * k[2] + t2 * 9 * k[3])));
+      th -= f / df;
+    }
+    if (!(th < Math.PI / 2) || !(th > -Math.PI / 2)) return null;
+    const r = Math.tan(th); return [xd * r / td, yd * r / td];
+  };
+  // pinhole projection of a camera-frame point (+ optional radial k1,k2)
+  const proj = (K, Xc, k1 = 0, k2 = 0) => {
+    const x = Xc[0] / Xc[2], y = Xc[1] / Xc[2], r2 = x * x + y * y, d = 1 + r2 * (k1 + r2 * k2);
+    return [K.fx * x * d + (K.s || 0) * y * d + K.cx, K.fy * y * d + K.cy];
+  };
+
+  // ---------- Zhang ----------
+  // homography from plane points (X,Y) to pixels (u,v), DLT with Hartley normalisation; returns 3x3
+  const homography = (P, Q) => {
+    const nrm = (pts) => {
+      const n = pts.length, m = [0, 0]; pts.forEach((p) => { m[0] += p[0] / n; m[1] += p[1] / n; });
+      let d = 0; pts.forEach((p) => { d += Math.hypot(p[0] - m[0], p[1] - m[1]) / n; });
+      const s = Math.SQRT2 / d; return [[s, 0, -s * m[0]], [0, s, -s * m[1]], [0, 0, 1]];
+    };
+    const Tp = nrm(P), Tq = nrm(Q), A = [];
+    for (let i = 0; i < P.length; i++) {
+      const p = mv(Tp, [P[i][0], P[i][1], 1]), q = mv(Tq, [Q[i][0], Q[i][1], 1]);
+      const [X, Y] = p, [u, v] = q;
+      A.push([X, Y, 1, 0, 0, 0, -u * X, -u * Y, -u]);
+      A.push([0, 0, 0, X, Y, 1, -v * X, -v * Y, -v]);
+    }
+    const h = nullvec(A).v, Hn = [[h[0], h[1], h[2]], [h[3], h[4], h[5]], [h[6], h[7], h[8]]];
+    const TqInv = [[1 / Tq[0][0], 0, -Tq[0][2] / Tq[0][0]], [0, 1 / Tq[1][1], -Tq[1][2] / Tq[1][1]], [0, 0, 1]];
+    const H = mm(mm(TqInv, Hn), Tp);
+    const s = H[2][2]; return H.map((r) => r.map((x) => x / s));
+  };
+  const vij = (H, i, j) => {
+    const hi = [H[0][i], H[1][i], H[2][i]], hj = [H[0][j], H[1][j], H[2][j]];
+    return [hi[0] * hj[0], hi[0] * hj[1] + hi[1] * hj[0], hi[1] * hj[1], hi[2] * hj[0] + hi[0] * hj[2], hi[2] * hj[1] + hi[1] * hj[2], hi[2] * hj[2]];
+  };
+  // closed-form K from homographies (Zhang 2000, Appendix B). returns {K, rank} or null
+  const zhangK = (Hs) => {
+    const V = [];
+    Hs.forEach((H) => { V.push(vij(H, 0, 1)); V.push(sub(vij(H, 0, 0), vij(H, 1, 1))); });
+    const { v: b, vals } = nullvec(V);
+    const [B11, B12, B22, B13, B23, B33] = b;
+    const den = B11 * B22 - B12 * B12;
+    const v0 = (B12 * B13 - B11 * B23) / den;
+    const lam = B33 - (B13 * B13 + v0 * (B12 * B13 - B11 * B23)) / B11;
+    const al = Math.sqrt(lam / B11), be = Math.sqrt((lam * B11) / den);
+    const ga = (-B12 * al * al * be) / lam, u0 = (ga * v0) / be - (B13 * al * al) / lam;
+    return { K: { fx: al, fy: be, s: ga, cx: u0, cy: v0 }, vals };
+  };
+  const Kmat = (K) => [[K.fx, K.s || 0, K.cx], [0, K.fy, K.cy], [0, 0, 1]];
+  const Kinv = (K) => { const s = K.s || 0; return [[1 / K.fx, -s / (K.fx * K.fy), (s * K.cy - K.cx * K.fy) / (K.fx * K.fy)], [0, 1 / K.fy, -K.cy / K.fy], [0, 0, 1]]; };
+  // extrinsics of one view from H and K; R projected onto SO(3)
+  const zhangRt = (H, K) => {
+    const Ki = Kinv(K), h1 = [H[0][0], H[1][0], H[2][0]], h2 = [H[0][1], H[1][1], H[2][1]], h3 = [H[0][2], H[1][2], H[2][2]];
+    let lam = 1 / norm(mv(Ki, h1));
+    if (mv(Ki, h3)[2] * lam < 0) lam = -lam; // board in front of the camera
+    const r1 = scl(mv(Ki, h1), lam), r2 = scl(mv(Ki, h2), lam), r3 = cross(r1, r2), t = scl(mv(Ki, h3), lam);
+    const Q = cols(r1, r2, r3);
+    // nearest rotation: R = Q (Q^T Q)^{-1/2}
+    const { vals, vecs } = eigSym(mm(tr(Q), Q));
+    const D = vals.map((x) => 1 / Math.sqrt(Math.max(x, 1e-12)));
+    const S = vecs.map((r, i) => vecs.map((r2_, j) => r.reduce((s, x, k) => s + x * D[k] * vecs[j][k], 0)));
+    return T(mm(Q, S), t);
+  };
+  // project board point with intrinsics vector p = [fx, fy, cx, cy, k1, k2] and pose (w, t)
+  const projBoard = (p, w, t, X) => {
+    const Xc = add(mv(exp(w), [X[0], X[1], 0]), t);
+    return proj({ fx: p[0], fy: p[1], cx: p[2], cy: p[3], s: p[6] || 0 }, Xc, p[4], p[5]);
+  };
+  const rms = (p, poses, board, obs) => {
+    let s = 0, n = 0;
+    poses.forEach((ps, i) => board.forEach((X, j) => { const q = projBoard(p, ps.w, ps.t, X); s += (q[0] - obs[i][j][0]) ** 2 + (q[1] - obs[i][j][1]) ** 2; n++; }));
+    return Math.sqrt(s / n);
+  };
+  // Levenberg-Marquardt over [fx fy cx cy k1 k2] + per-view (w, t); numeric Jacobian, block structure
+  const refine = (K0, poses0, board, obs, iters = 12) => {
+    let p = [K0.fx, K0.fy, K0.cx, K0.cy, 0, 0];
+    let poses = poses0.map((q) => ({ w: q.w.slice(), t: q.t.slice() }));
+    const nv = poses.length, P = 6 + 6 * nv, nb = board.length;
+    const resid = (pp, ps) => { const r = []; ps.forEach((q, i) => board.forEach((X, j) => { const m = projBoard(pp, q.w, q.t, X); r.push(m[0] - obs[i][j][0], m[1] - obs[i][j][1]); })); return r; };
+    const cost = (r) => r.reduce((s, x) => s + x * x, 0);
+    let r = resid(p, poses), c = cost(r), mu = 1e-3;
+    const steps = [1e-3, 1e-3, 1e-3, 1e-3, 1e-6, 1e-6];
+    for (let it = 0; it < iters; it++) {
+      // Jacobian columns: intrinsics affect all residuals; pose i affects rows [2*nb*i, 2*nb*(i+1))
+      const J = Array.from({ length: r.length }, () => new Float64Array(P));
+      for (let k = 0; k < 6; k++) { const pp = p.slice(); pp[k] += steps[k]; const rr = resid(pp, poses); for (let m = 0; m < r.length; m++) J[m][k] = (rr[m] - r[m]) / steps[k]; }
+      poses.forEach((q, i) => {
+        for (let k = 0; k < 6; k++) {
+          const w = q.w.slice(), t = q.t.slice(), e = 1e-7;
+          if (k < 3) w[k] += e; else t[k - 3] += e;
+          board.forEach((X, j) => {
+            const m = projBoard(p, w, t, X), row = 2 * (i * nb + j);
+            J[row][6 + 6 * i + k] = (m[0] - obs[i][j][0] - r[row]) / e;
+            J[row + 1][6 + 6 * i + k] = (m[1] - obs[i][j][1] - r[row + 1]) / e;
+          });
+        }
+      });
+      const A = Array.from({ length: P }, () => new Array(P).fill(0)), g = new Array(P).fill(0);
+      for (let m = 0; m < r.length; m++) {
+        const Jm = J[m]; const nz = [];
+        for (let k = 0; k < P; k++) if (Jm[k] !== 0) nz.push(k);
+        for (const a of nz) { g[a] += Jm[a] * r[m]; for (const b of nz) A[a][b] += Jm[a] * Jm[b]; }
+      }
+      let improved = false;
+      for (let tries = 0; tries < 8 && !improved; tries++) {
+        const Ad = A.map((row, i) => row.map((x, j) => (i === j ? x * (1 + mu) + 1e-12 : x)));
+        const d = solve(Ad, g.map((x) => -x));
+        if (!d) { mu *= 10; continue; }
+        const pn = p.map((x, k) => x + d[k]);
+        const psn = poses.map((q, i) => ({ w: q.w.map((x, k) => x + d[6 + 6 * i + k]), t: q.t.map((x, k) => x + d[9 + 6 * i + k]) }));
+        const rn = resid(pn, psn), cn = cost(rn);
+        if (cn < c) { p = pn; poses = psn; r = rn; c = cn; mu = Math.max(mu / 10, 1e-9); improved = true; } else mu *= 10;
+      }
+      if (!improved) break;
+    }
+    return { p, poses, rms: Math.sqrt(c / (r.length / 2)) };
+  };
+
+  // ---------- hand-eye (Park & Martin 1994) ----------
+  // As, Bs: lists of transforms with A_i X B_i = const. Returns X.
+  const parkMartin = (As, Bs) => {
+    const Mx = [[0, 0, 0], [0, 0, 0], [0, 0, 0]], motions = [];
+    for (let i = 0; i < As.length; i++) for (let j = i + 1; j < As.length; j++) {
+      const A = Tmul(Tinv(As[j]), As[i]), B = Tmul(Bs[j], Tinv(Bs[i]));
+      const al = log(A.R), be = log(B.R);
+      for (let a = 0; a < 3; a++) for (let b = 0; b < 3; b++) Mx[a][b] += be[a] * al[b];
+      motions.push({ A, B });
+    }
+    const MtM = mm(tr(Mx), Mx), { vals, vecs } = eigSym(MtM);
+    const D = vals.map((x) => 1 / Math.sqrt(Math.max(x, 1e-18)));
+    const S = vecs.map((r, i) => vecs.map((_, j) => r.reduce((s, x, k) => s + x * D[k] * vecs[j][k], 0)));
+    const RX = mm(S, tr(Mx));
+    const N = [[0, 0, 0], [0, 0, 0], [0, 0, 0]], y = [0, 0, 0];
+    motions.forEach(({ A, B }) => {
+      const C = A.R.map((r, i) => r.map((x, j) => x - (i === j ? 1 : 0))), d = sub(mv(RX, B.t), A.t);
+      for (let a = 0; a < 3; a++) { for (let b = 0; b < 3; b++) for (let k = 0; k < 3; k++) N[a][b] += C[k][a] * C[k][b]; for (let k = 0; k < 3; k++) y[a] += C[k][a] * d[k]; }
+    });
+    const X = T(RX, solve(N, y));
+    X.cond = Math.min(...vals) / Math.max(...vals);
+    return X;
+  };
+
+  return { add, sub, scl, dot, cross, norm, unit, mm, mv, tr, I3, cols, rotX, rotY, rotZ, exp, log, angle, T, Tmul, Tinv, Tap, lookAt, eigSym, nullvec, solve, rng,
+    distBC, undistBC, kbTheta, distKB, kbRay, undistKB, proj, homography, zhangK, Kmat, Kinv, zhangRt, projBoard, rms, refine, parkMartin };
+})();
+/* MATH-END */
+// ---------- shared helpers ----------
+const C = V4U.css, $ = (id) => document.getElementById(id), F = V4U.fmt, deg = Math.PI / 180;
+const MONO = (px, w) => `${w || 400} ${px}px ${C('--f-mono')}`;
+const ln = (ctx, a, b, col, w, dash) => { ctx.strokeStyle = col; ctx.lineWidth = w || 1.5; ctx.setLineDash(dash || []); ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke(); ctx.setLineDash([]); };
+const pl = (ctx, pts, col, w, dash, close) => { if (pts.length < 2) return; ctx.strokeStyle = col; ctx.lineWidth = w || 1.5; ctx.setLineDash(dash || []); ctx.beginPath(); pts.forEach((p, i) => (i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]))); if (close) ctx.closePath(); ctx.stroke(); ctx.setLineDash([]); };
+const fillPoly = (ctx, pts, col, alpha) => { ctx.globalAlpha = alpha == null ? 1 : alpha; ctx.fillStyle = col; ctx.beginPath(); pts.forEach((p, i) => (i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]))); ctx.closePath(); ctx.fill(); ctx.globalAlpha = 1; };
+const dot = (ctx, p, r, col) => { ctx.fillStyle = col; ctx.beginPath(); ctx.arc(p[0], p[1], r, 0, 2 * Math.PI); ctx.fill(); };
+const ring = (ctx, p, r, col, w) => { ctx.strokeStyle = col; ctx.lineWidth = w || 1.6; ctx.setLineDash([]); ctx.beginPath(); ctx.arc(p[0], p[1], r, 0, 2 * Math.PI); ctx.stroke(); };
+const txt = (ctx, s, p, col, px, align, base, weight) => { ctx.fillStyle = col; ctx.font = MONO(px || 12, weight); ctx.textAlign = align || 'left'; ctx.textBaseline = base || 'alphabetic'; ctx.fillText(s, p[0], p[1]); ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic'; };
+const arrow = (ctx, a, b, col, w, hd) => {
+  w = w || 2; hd = hd || 8; ln(ctx, a, b, col, w);
+  const g = Math.atan2(b[1] - a[1], b[0] - a[0]); ctx.fillStyle = col; ctx.beginPath(); ctx.moveTo(b[0], b[1]);
+  ctx.lineTo(b[0] - hd * Math.cos(g - 0.42), b[1] - hd * Math.sin(g - 0.42)); ctx.lineTo(b[0] - hd * Math.cos(g + 0.42), b[1] - hd * Math.sin(g + 0.42)); ctx.closePath(); ctx.fill();
+};
+const fit = (w, h, W, H, m) => { m = m == null ? 16 : m; const s = Math.min((w - 2 * m) / W, (h - 2 * m) / H), ox = (w - s * W) / 2, oy = (h - s * H) / 2; return { s, ox, oy, P: (u, v) => [ox + s * u, oy + s * v] }; };
+const imgFrame = (ctx, f, W, H) => { ctx.fillStyle = C('--surface-2'); ctx.fillRect(f.ox, f.oy, f.s * W, f.s * H); ctx.strokeStyle = C('--line-2'); ctx.lineWidth = 1; ctx.setLineDash([]); ctx.strokeRect(f.ox + 0.5, f.oy + 0.5, f.s * W - 1, f.s * H - 1); };
+const clipRect = (ctx, x, y, w, h) => { ctx.save(); ctx.beginPath(); ctx.rect(x, y, w, h); ctx.clip(); };
+const slider = (id, fmt, cb) => { const el = $('sl-' + id), out = $('o-' + id); const show = () => { if (out) out.textContent = fmt(+el.value); }; show(); el.addEventListener('input', () => { show(); cb(); }); return () => +el.value; };
+const vec = (v, d) => '(' + v.map((x) => F(x, d == null ? 2 : d)).join(', ') + ')';
+const pixAxes = (ctx, f) => {
+  const L = 90; const a = f.P(0, 0);
+  arrow(ctx, a, f.P(L, 0), C('--bad'), 2, 7); txt(ctx, 'u', [f.ox + f.s * L + 4, f.oy - 5], C('--bad'), 12, 'left', 'alphabetic', 700);
+  arrow(ctx, a, f.P(0, L), C('--ok'), 2, 7); txt(ctx, 'v', [f.ox - 6, f.oy + f.s * L + 2], C('--ok'), 12, 'right', 'middle', 700);
+};
+const pcross = (ctx, p, col) => { ln(ctx, [p[0] - 6, p[1]], [p[0] + 6, p[1]], col, 1.2); ln(ctx, [p[0], p[1] - 6], [p[0], p[1] + 6], col, 1.2); };
+// a camera frustum in an orbit3d view; returns the four image-corner points (world)
+const frustum3 = (P, ctx, Twc, K, W, H, dz, col, fill) => {
+  const cc = [[0, 0], [W, 0], [W, H], [0, H]].map(([u, v]) => M.Tap(Twc, [((u - K.cx) / K.fx) * dz, ((v - K.cy) / K.fy) * dz, dz]));
+  if (fill) { ctx.globalAlpha = 0.45; P.poly(cc, fill, null); ctx.globalAlpha = 1; }
+  P.poly(cc, null, col, 1.2);
+  cc.forEach((q) => P.line(Twc.t, q, col, 1.1));
+  P.line(cc[0], cc[1], col, 3.2);
+  return cc;
+};
+const dash3 = (ctx, P, a, b, col, w) => { ctx.setLineDash([5, 4]); P.line(a, b, col, w || 1.2); ctx.setLineDash([]); };
+const tableGrid = (P, n, step, col) => { for (let i = -n; i <= n; i++) { P.line([i * step, -n * step, 0], [i * step, n * step, 0], col, 1); P.line([-n * step, i * step, 0], [n * step, i * step, 0], col, 1); } };
+// the box used in several figures
+const BOX = []; for (const z of [0, 0.12]) for (const [x, y] of [[-0.12, -0.08], [0.12, -0.08], [0.12, 0.08], [-0.12, 0.08]]) BOX.push([x, y, z]);
+const BOXE = [[0, 1], [1, 2], [2, 3], [3, 0], [4, 5], [5, 6], [6, 7], [7, 4], [0, 4], [1, 5], [2, 6], [3, 7]];
+
+// ---------- 1. chain of frames ----------
+(() => {
+  const W = 640, H = 480, tgt = [0, 0, 0.05];
+  const pts = [{ n: 'A', p: [0.12, 0.08, 0.12], c: '--c2' }, { n: 'B', p: [0.12, -0.08, 0], c: '--c5' }, { n: 'C', p: [-0.24, 0.22, 0], c: '--c6' }];
+  let sel = 0;
+  const az = slider('az', (v) => v + '°', () => draw()), el = slider('el', (v) => v + '°', () => draw());
+  const dist = slider('dist', (v) => F(v) + ' m', () => draw()), fx = slider('fx', (v) => v + ' px', () => draw());
+  const cam = () => {
+    const a = az() * deg, e = el() * deg, d = dist();
+    const eye = [tgt[0] + d * Math.cos(e) * Math.cos(a), tgt[1] + d * Math.cos(e) * Math.sin(a), tgt[2] + d * Math.sin(e)];
+    const Twc = M.lookAt(eye, tgt);
+    return { Twc, Tcw: M.Tinv(Twc), K: { fx: fx(), fy: fx(), cx: (W - 1) / 2, cy: (H - 1) / 2 } };
+  };
+  const v3 = V4U.orbit3d($('cv-chain3d'), { height: (w) => Math.round(Math.min(380, Math.max(280, w * 0.82))), yaw: -1.3, pitch: 0.45, dist: 1.9, target: [-0.28, -0.14, 0.24], fov: 38 }, (ctx, P) => {
+    const { Twc, Tcw, K } = cam();
+    tableGrid(P, 4, 0.1, C('--line'));
+    P.frame([0, 0, 0], M.I3(), 0.16, 2.4); P.text([0.02, 0.02, -0.04], 'w', C('--muted'), MONO(12, 700));
+    BOXE.forEach(([a, b]) => P.line(BOX[a], BOX[b], C('--ink-2'), 1.6));
+    const dz = 0.2;
+    frustum3(P, ctx, Twc, K, W, H, dz, C('--c4'), C('--c4s'));
+    P.frame(Twc.t, Twc.R, 0.12, 2.4); P.text(Twc.t, 'c', C('--muted'), MONO(12, 700));
+    pts.forEach((q, i) => {
+      const col = C(q.c), Xc = M.Tap(Tcw, q.p);
+      if (Xc[2] > 1e-3) { dash3(ctx, P, q.p, Twc.t, col, 1.1); P.point(M.Tap(Twc, M.scl(Xc, dz / Xc[2])), 3.2, col); }
+      P.point(q.p, i === sel ? 6.5 : 4.5, col); P.text(q.p, q.n, col, MONO(12, 700));
+    });
+  });
+  const r2 = V4U.canvas($('cv-chainimg'), (w) => Math.round(Math.min(380, Math.max(240, w * 0.8))), (ctx, w, h) => {
+    const { Tcw, K } = cam(), f = fit(w, h, W, H, 24);
+    imgFrame(ctx, f, W, H);
+    clipRect(ctx, f.ox, f.oy, f.s * W, f.s * H);
+    BOXE.forEach(([a, b]) => { const A = M.Tap(Tcw, BOX[a]), B = M.Tap(Tcw, BOX[b]); if (A[2] > 1e-3 && B[2] > 1e-3) ln(ctx, f.P(...M.proj(K, A)), f.P(...M.proj(K, B)), C('--ink-2'), 1.6); });
+    pts.forEach((q, i) => { const Xc = M.Tap(Tcw, q.p); if (Xc[2] <= 1e-3) return; const p = f.P(...M.proj(K, Xc)); dot(ctx, p, i === sel ? 6.5 : 4.5, C(q.c)); txt(ctx, q.n, [p[0] + 8, p[1] - 6], C(q.c), 12, 'left', 'alphabetic', 700); });
+    ctx.restore();
+    pixAxes(ctx, f); pcross(ctx, f.P(K.cx, K.cy), C('--muted'));
+    txt(ctx, '(cx, cy)', [f.P(K.cx, K.cy)[0] + 8, f.P(K.cx, K.cy)[1] + 14], C('--muted'), 11);
+  });
+  const rd = $('rd-chain');
+  const read = () => {
+    const { Tcw, K } = cam(), q = pts[sel], Xc = M.Tap(Tcw, q.p), front = Xc[2] > 1e-3;
+    const uv = front ? M.proj(K, Xc) : null;
+    const inside = front && uv[0] >= -0.5 && uv[0] <= W - 0.5 && uv[1] >= -0.5 && uv[1] <= H - 0.5;
+    rd.innerHTML = `<span>X<sub>w</sub> = <b>${vec(q.p)}</b></span><span>X<sub>c</sub> = T<sub>cw</sub>X<sub>w</sub> = <b>${vec(Xc, 3)}</b></span>` +
+      `<span>(x, y) = <b>${front ? vec([Xc[0] / Xc[2], Xc[1] / Xc[2]], 3) : 'Z<sub>c</sub> ≤ 0，在相机后方'}</b></span>` +
+      `<span>(u, v) = <b>${front ? vec(uv, 1) : '—'}</b>${front && !inside ? '（出画）' : ''}</span>`;
+  };
+  function draw() { v3.redraw(); r2(); read(); }
+  V4U.seg($('seg-chainpt'), (v) => { sel = +v; draw(); });
+})();
+
+// ---------- 2. FOV and similar triangles ----------
+(() => {
+  let W = 640, pt = [0.32, 1.25], geo = null;
+  const fov = slider('fov', (v) => v + '°', () => draw());
+  const cv = $('cv-fov');
+  const r = V4U.canvas(cv, (w) => Math.round(Math.min(400, Math.max(320, w * 0.5))), (ctx, w, h) => {
+    const A = fov() * deg, fx = W / (2 * Math.tan(A / 2));
+    const ox = w / 2, oy = h - 30, top = 14;
+    const Wd = Math.min(w * 0.46, 230), k = Wd / W, ys = oy - fx * k;
+    const S = (oy - top - 10) / 2.0;
+    geo = { ox, oy, S };
+    const t2 = Math.tan(A / 2), ext = oy - top;
+    ln(ctx, [ox, oy], [ox - ext * t2, top], C('--line-2'), 1); ln(ctx, [ox, oy], [ox + ext * t2, top], C('--line-2'), 1);
+    ln(ctx, [ox, oy], [ox, top], C('--line-2'), 1, [4, 4]);
+    const X = pt[0], Z = pt[1], ps = [ox + X * S, oy - Z * S];
+    const xs = ox + fx * k * (X / Z);
+    fillPoly(ctx, [[ox, oy], [ox, oy - Z * S], ps], C('--c2s'), 0.75);
+    fillPoly(ctx, [[ox, oy], [ox, ys], [xs, ys]], C('--c1s'), 0.95);
+    ln(ctx, [ox, oy - Z * S], ps, C('--c2'), 1.2, [3, 3]);
+    // image plane with pixel ticks
+    ln(ctx, [ox - Wd / 2, ys], [ox + Wd / 2, ys], C('--c1'), 3);
+    [0, W / 2, W].forEach((u) => { const x = ox - Wd / 2 + u * k; ln(ctx, [x, ys - 5], [x, ys + 5], C('--c1'), 1.5); txt(ctx, String(u), [x, ys - 9], C('--c1'), 11, 'center'); });
+    // ray and points
+    ln(ctx, [ox, oy], ps, C('--c2'), 1.6);
+    dot(ctx, ps, 6, C('--c2')); txt(ctx, `(${F(X)}, ${F(Z)}) m`, [ps[0] + 10, ps[1] + 4], C('--c2'), 11);
+    dot(ctx, [xs, ys], 5, C('--c1'));
+    // dimensions
+    const dx = ox - Wd / 2 - 18;
+    ln(ctx, [dx, oy], [dx, ys], C('--muted'), 1); ln(ctx, [dx - 4, ys], [dx + 4, ys], C('--muted'), 1); ln(ctx, [dx - 4, oy], [dx + 4, oy], C('--muted'), 1);
+    txt(ctx, 'fₓ = ' + F(fx, 0), [dx - 6, (oy + ys) / 2], C('--muted'), 11, 'right', 'middle');
+    // camera glyph
+    fillPoly(ctx, [[ox, oy], [ox - 9, oy + 14], [ox + 9, oy + 14]], C('--ink-2'));
+    txt(ctx, 'O', [ox + 12, oy + 10], C('--ink-2'), 11);
+  });
+  const rd = $('rd-fov');
+  const read = () => {
+    const A = fov() * deg, fx = W / (2 * Math.tan(A / 2)), cx = (W - 1) / 2, x = pt[0] / pt[1], u = fx * x + cx;
+    rd.innerHTML = `<span>f<sub>x</sub> = W / (2 tan(FOV/2)) = <b>${F(fx, 1)}</b> px</span><span>x = X/Z = <b>${F(x, 3)}</b></span>` +
+      `<span>u = f<sub>x</sub>x + c<sub>x</sub> = <b>${F(u, 1)}</b> px${u < -0.5 || u > W - 0.5 ? '（出画）' : ''}</span>`;
+  };
+  function draw() { r(); read(); }
+  V4U.drag(cv, (x, y) => { if (!geo) return; pt = [V4U.clamp((x - geo.ox) / geo.S, -1.6, 1.6), V4U.clamp((geo.oy - y) / geo.S, 0.2, 2.0)]; draw(); });
+  V4U.seg($('seg-fovw'), (v) => { W = +v; draw(); });
+})();
+
+// ---------- 3. crop / resize ----------
+(() => {
+  const W = 640, H = 480, K0 = { fx: 520, fy: 520, cx: 326.5, cy: 236.0 };
+  const Twc = M.lookAt([-0.62, -0.38, 0.4], [0.02, 0.0, 0.04]), Tcw = M.Tinv(Twc);
+  const box3 = BOXE.map(([a, b]) => [BOX[a], BOX[b]]), grid3 = [];
+  for (let i = -3; i <= 3; i++) { grid3.push([[i * 0.1, -0.3, 0], [i * 0.1, 0.3, 0]]); grid3.push([[-0.3, i * 0.1, 0], [0.3, i * 0.1, 0]]); }
+  const pj = (K, s) => s.map((X) => M.proj(K, M.Tap(Tcw, X)));
+  const box0 = box3.map((s) => pj(K0, s)), grid0 = grid3.map((s) => pj(K0, s));
+  const crops = { none: [640, 480], sq: [480, 480], small: [320, 240] };
+  let crop = 'sq', out = '224', cmp = 'nooff';
+  const x0f = slider('cx0', (v) => Math.round(v * 100) + '%', () => draw()), y0f = slider('cy0', (v) => Math.round(v * 100) + '%', () => draw());
+  const geom = () => {
+    const [cw, ch] = crops[crop], x0 = Math.round((W - cw) * x0f()), y0 = Math.round((H - ch) * y0f());
+    const [Wo, Ho] = out === '224' ? [224, 224] : [cw, ch], sx = Wo / cw, sy = Ho / ch;
+    const K1 = { fx: sx * K0.fx, fy: sy * K0.fy, cx: sx * (K0.cx - x0 + 0.5) - 0.5, cy: sy * (K0.cy - y0 + 0.5) - 0.5 };
+    return { cw, ch, x0, y0, Wo, Ho, sx, sy, K1 };
+  };
+  const hgt = (w) => Math.round(Math.min(340, Math.max(220, w * 0.72)));
+  const ra = V4U.canvas($('cv-rs-a'), hgt, (ctx, w, h) => {
+    const g = geom(), f = fit(w, h, W, H, 14);
+    imgFrame(ctx, f, W, H);
+    grid0.forEach(([a, b]) => ln(ctx, f.P(...a), f.P(...b), C('--line-2'), 1));
+    box0.forEach(([a, b]) => ln(ctx, f.P(...a), f.P(...b), C('--ink-2'), 1.6));
+    const [X0, Y0] = f.P(g.x0, g.y0), cw = g.cw * f.s, ch = g.ch * f.s;
+    ctx.globalAlpha = 0.6; ctx.fillStyle = C('--surface');
+    ctx.fillRect(f.ox, f.oy, f.s * W, Y0 - f.oy); ctx.fillRect(f.ox, Y0 + ch, f.s * W, f.oy + f.s * H - Y0 - ch);
+    ctx.fillRect(f.ox, Y0, X0 - f.ox, ch); ctx.fillRect(X0 + cw, Y0, f.ox + f.s * W - X0 - cw, ch); ctx.globalAlpha = 1;
+    ctx.strokeStyle = C('--c4'); ctx.lineWidth = 2; ctx.setLineDash([6, 4]); ctx.strokeRect(X0, Y0, cw, ch); ctx.setLineDash([]);
+    pcross(ctx, f.P(K0.cx, K0.cy), C('--muted'));
+    txt(ctx, `${W}×${H}`, [f.ox + 4, f.oy + f.s * H - 6], C('--muted'), 11);
+  });
+  const rb = V4U.canvas($('cv-rs-b'), hgt, (ctx, w, h) => {
+    const g = geom(), f = fit(w, h, g.Wo, g.Ho, 14), K1 = g.K1;
+    imgFrame(ctx, f, g.Wo, g.Ho);
+    clipRect(ctx, f.ox, f.oy, f.s * g.Wo, f.s * g.Ho);
+    const map = (p) => f.P(g.sx * (p[0] - g.x0 + 0.5) - 0.5, g.sy * (p[1] - g.y0 + 0.5) - 0.5);
+    grid0.forEach(([a, b]) => ln(ctx, map(a), map(b), C('--line-2'), 1));
+    box0.forEach(([a, b]) => ln(ctx, map(a), map(b), C('--c1s'), 7));
+    box3.forEach((s) => { const [a, b] = pj(K1, s); ln(ctx, f.P(...a), f.P(...b), C('--c1'), 1.5); });
+    ctx.restore();
+    if (cmp !== 'none') {
+      const Kw = cmp === 'K' ? K0 : { fx: g.sx * K0.fx, fy: g.sy * K0.fy, cx: g.sx * (K0.cx + 0.5) - 0.5, cy: g.sy * (K0.cy + 0.5) - 0.5 };
+      box3.forEach((s) => { const [a, b] = pj(Kw, s); ln(ctx, f.P(...a), f.P(...b), C('--bad'), 1.4, [5, 4]); });
+    }
+    pcross(ctx, f.P(K1.cx, K1.cy), C('--muted'));
+    txt(ctx, `${g.Wo}×${g.Ho}`, [f.ox + 4, f.oy + f.s * g.Ho - 6], C('--muted'), 11);
+  });
+  const rd = $('rd-resize');
+  const read = () => {
+    const g = geom(), K1 = g.K1, naive = g.sx * (K0.cx - g.x0);
+    rd.innerHTML = `<span>裁剪 (x<sub>0</sub>, y<sub>0</sub>, w, h) = <b>(${g.x0}, ${g.y0}, ${g.cw}, ${g.ch})</b></span><span>(s<sub>x</sub>, s<sub>y</sub>) = <b>${vec([g.sx, g.sy], 3)}</b></span>` +
+      `<span>f<sub>x</sub> ${F(K0.fx, 1)} → <b>${F(K1.fx, 1)}</b>, f<sub>y</sub> ${F(K0.fy, 1)} → <b>${F(K1.fy, 1)}</b></span>` +
+      `<span>c<sub>x</sub> ${F(K0.cx, 1)} → <b>${F(K1.cx, 2)}</b>, c<sub>y</sub> ${F(K0.cy, 1)} → <b>${F(K1.cy, 2)}</b></span>` +
+      `<span>写成 s<sub>x</sub>(c<sub>x</sub>−x<sub>0</sub>) 会差 <b>${F(naive - K1.cx, 2)}</b> px</span>`;
+  };
+  function draw() { ra(); rb(); read(); }
+  V4U.seg($('seg-crop'), (v) => { crop = v; draw(); });
+  V4U.seg($('seg-out'), (v) => { out = v; draw(); });
+  V4U.seg($('seg-cmp'), (v) => { cmp = v; draw(); });
+})();
+
+// ---------- 4. axis conventions ----------
+(() => {
+  const W = 640, H = 480, K = { fx: 520, fy: 520, cx: 319.5, cy: 239.5 };
+  const Twc = M.lookAt([-0.55, -0.4, 0.42], [0, 0, 0.06]), Tcw = M.Tinv(Twc), A = [0.12, 0.08, 0.12];
+  const conv = {
+    cv: { ax: [[1, 0, 0], [0, 1, 0], [0, 0, 1]], look: '+z', up: '−y' },
+    gl: { ax: [[1, 0, 0], [0, -1, 0], [0, 0, -1]], look: '−z', up: '+y' },
+    ros: { ax: [[0, 0, 1], [-1, 0, 0], [0, -1, 0]], look: '+x', up: '+z' },
+    p3d: { ax: [[-1, 0, 0], [0, -1, 0], [0, 0, 1]], look: '+z', up: '+y' },
+  };
+  let cur = 'cv';
+  const v3 = V4U.orbit3d($('cv-conv'), { height: (w) => Math.round(Math.min(360, Math.max(270, w * 0.5))), yaw: -0.8, pitch: 0.32, dist: 1.05, target: [-0.3, -0.24, 0.27], fov: 38 }, (ctx, P) => {
+    tableGrid(P, 3, 0.1, C('--line'));
+    BOXE.forEach(([a, b]) => P.line(BOX[a], BOX[b], C('--ink-2'), 1.5));
+    frustum3(P, ctx, Twc, K, W, H, 0.12, C('--c4'), C('--c4s'));
+    const cols = [C('--bad'), C('--ok'), C('--c1')], o = Twc.t;
+    conv[cur].ax.forEach((a, k) => {
+      const d = M.mv(Twc.R, a), tip = M.add(o, M.scl(d, 0.2));
+      P.line(o, tip, cols[k], 3); P.point(tip, 3, cols[k]); P.text(M.add(o, M.scl(d, 0.22)), 'xyz'[k], cols[k], MONO(14, 700));
+    });
+    dash3(ctx, P, A, o, C('--c2'), 1.1); P.point(A, 5, C('--c2')); P.text(A, 'A', C('--c2'), MONO(12, 700));
+  });
+  const rd = $('rd-conv');
+  const read = () => {
+    const c = conv[cur], R = M.cols(...c.ax), Xcv = M.Tap(Tcw, A), Xs = M.mv(M.tr(R), Xcv);
+    const tex = 'R_{\\text{cv}\\leftarrow\\text{sel}}=\\begin{bmatrix}' + R.map((r) => r.map((x) => (x === 0 ? '0' : String(x))).join('&')).join('\\\\') + '\\end{bmatrix}';
+    rd.innerHTML = `<span id="tx-conv"></span><span>光轴（看向）= <b>${c.look}</b></span><span>图像上方 = <b>${c.up}</b></span>` +
+      `<span>A 在 OpenCV 系 = <b>${vec(Xcv, 3)}</b></span><span>A 在所选系 = R<sup>⊤</sup>X<sub>cv</sub> = <b>${vec(Xs, 3)}</b></span>`;
+    V4U.tex($('tx-conv'), tex, false);
+  };
+  V4U.seg($('seg-conv'), (v) => { cur = v; v3.redraw(); read(); });
+})();
+
+// ---------- 5. distortion ----------
+(() => {
+  const W = 640, H = 480, Kb = { fx: 480, fy: 480, cx: 319.5, cy: 239.5 }, Kf = { fx: 200, fy: 200, cx: 319.5, cy: 239.5 };
+  let model = 'bc', view = 'dist';
+  const k1 = slider('k1', (v) => F(v), () => draw()), k2 = slider('k2', (v) => F(v), () => draw());
+  const p1 = slider('p1', (v) => F(v, 3), () => draw()), p2 = slider('p2', (v) => F(v, 3), () => draw());
+  const q1 = slider('q1', (v) => F(v, 3), () => draw()), q2 = slider('q2', (v) => F(v, 4), () => draw());
+  const kbc = () => ({ k1: k1(), k2: k2(), k3: 0, p1: p1(), p2: p2() }), kkb = () => [q1(), q2(), 0, 0];
+  const px = (K, x, y) => [K.fx * x + K.cx, K.fy * y + K.cy];
+  const lines = (ex, ey, step, n) => {
+    const L = [];
+    for (let x = -ex; x <= ex + 1e-9; x += step) { const l = []; for (let i = 0; i <= n; i++) l.push([x, -ey + (2 * ey * i) / n]); L.push(l); }
+    for (let y = -ey; y <= ey + 1e-9; y += step) { const l = []; for (let i = 0; i <= n; i++) l.push([-ex + (2 * ex * i) / n, y]); L.push(l); }
+    return L;
+  };
+  const border = (n) => { const b = []; for (let i = 0; i < n; i++) b.push([(W * i) / n, 0]); for (let i = 0; i < n; i++) b.push([W, (H * i) / n]); for (let i = 0; i < n; i++) b.push([W - (W * i) / n, H]); for (let i = 0; i < n; i++) b.push([0, H - (H * i) / n]); return b; };
+  // invert theta_d(theta) for the KB model
+  const thetaOf = (td, k) => { let th = Math.min(td, 3); for (let i = 0; i < 30; i++) { const t2 = th * th; th -= (M.kbTheta(th, k) - td) / (1 + t2 * (3 * k[0] + t2 * (5 * k[1] + t2 * (7 * k[2] + t2 * 9 * k[3])))); } return th; };
+  const cv = $('cv-dist');
+  const r = V4U.canvas(cv, (w) => Math.round(Math.min(460, Math.max(260, w * 0.62))), (ctx, w, h) => {
+    const g = fit(w, h, W * 1.3, H * 1.3, 6), P = (u, v) => g.P(u + 0.15 * W, v + 0.15 * H), [ix, iy] = P(0, 0), iw = W * g.s, ih = H * g.s;
+    const curve = (pts, col, lw, dash) => {
+      ctx.strokeStyle = col; ctx.lineWidth = lw; ctx.setLineDash(dash || []); ctx.beginPath(); let pen = false;
+      pts.forEach((p) => { if (!p || !isFinite(p[0]) || !isFinite(p[1]) || Math.abs(p[0]) > 1e5 || Math.abs(p[1]) > 1e5) { pen = false; return; } const q = P(p[0], p[1]); if (pen) ctx.lineTo(q[0], q[1]); else ctx.moveTo(q[0], q[1]); pen = true; });
+      ctx.stroke(); ctx.setLineDash([]);
+    };
+    ctx.fillStyle = C('--surface-2'); ctx.fillRect(ix, iy, iw, ih);
+    if (model === 'bc') {
+      const k = kbc(), L = lines(1.3, 1.0, 0.1, 80);
+      if (view === 'dist') {
+        clipRect(ctx, ix, iy, iw, ih);
+        L.forEach((l) => curve(l.map(([x, y]) => px(Kb, x, y)), C('--line-2'), 1, [3, 3]));
+        L.forEach((l) => curve(l.map(([x, y]) => { const d = M.distBC(x, y, k); return px(Kb, d[0], d[1]); }), C('--c1'), 1.4));
+        ctx.restore();
+      } else {
+        const bd = border(60).map(([u, v]) => { const un = M.undistBC((u - Kb.cx) / Kb.fx, (v - Kb.cy) / Kb.fy, k, 40); return P(...px(Kb, un[0], un[1])); });
+        fillPoly(ctx, bd, C('--c3s'), 0.9); pl(ctx, bd, C('--c3'), 2, null, true);
+        clipRect(ctx, ix, iy, iw, ih);
+        L.forEach((l) => curve(l.map(([x, y]) => px(Kb, x, y)), C('--c1'), 1.2));
+        ctx.restore();
+      }
+    } else {
+      const k = kkb();
+      if (view === 'dist') {
+        clipRect(ctx, ix, iy, iw, ih);
+        lines(4, 3, 0.5, 160).forEach((l) => curve(l.map(([x, y]) => { const d = M.distKB(x, y, k); return px(Kf, d[0], d[1]); }), C('--c1'), 1.3));
+        [30, 60, 90].forEach((a) => {
+          const c = []; for (let i = 0; i <= 120; i++) { const d = M.kbRay(a * deg, (i / 120) * 2 * Math.PI, k); c.push(px(Kf, d[0], d[1])); }
+          curve(c, C('--muted'), 1.2, [5, 4]);
+          const d = M.kbRay(a * deg, -0.62, k); const q = P(...px(Kf, d[0], d[1])); txt(ctx, a + '°', [q[0] + 4, q[1] - 4], C('--muted'), 11);
+        });
+        ctx.restore();
+      } else {
+        const Kn = { fx: 70, fy: 70, cx: Kf.cx, cy: Kf.cy };
+        const bd = border(160).map(([u, v]) => { const un = M.undistKB((u - Kf.cx) / Kf.fx, (v - Kf.cy) / Kf.fy, k, 30); return un ? px(Kn, un[0], un[1]) : null; });
+        clipRect(ctx, ix, iy, iw, ih);
+        lines(4, 3, 0.5, 2).forEach((l) => curve(l.map(([x, y]) => px(Kn, x, y)), C('--c1'), 1.2));
+        ctx.restore();
+        clipRect(ctx, 0, 0, w, h); curve(bd, C('--c3'), 2); ctx.restore();
+      }
+    }
+    ctx.strokeStyle = C('--ink-2'); ctx.lineWidth = 2; ctx.strokeRect(ix, iy, iw, ih);
+  });
+  const rd = $('rd-dist');
+  const read = () => {
+    if (model === 'bc') {
+      const k = kbc(), x0 = -Kb.cx / Kb.fx, y0 = -Kb.cy / Kb.fy, d = M.distBC(x0, y0, k), disp = Math.hypot((d[0] - x0) * Kb.fx, (d[1] - y0) * Kb.fy);
+      const u5 = M.undistBC(x0, y0, k, 5), r5 = M.distBC(u5[0], u5[1], k), res5 = Math.hypot((r5[0] - x0) * Kb.fx, (r5[1] - y0) * Kb.fy);
+      const uC = M.undistBC(x0, y0, k, 60), rmax = Math.max(Math.hypot(x0, y0), Math.hypot(uC[0], uC[1])) * 1.05;
+      let bad = null; for (let i = 1; i <= 400; i++) { const rr = (rmax * i) / 400, r2 = rr * rr; if (1 + 3 * k.k1 * r2 + 5 * k.k2 * r2 * r2 <= 0) { bad = rr; break; } }
+      rd.innerHTML = `<span>图像角点处畸变位移 <b>${F(disp, 1)}</b> px</span><span>undistortPoints 默认 5 次迭代后的残差 <b>${F(res5, 3)}</b> px</span>` +
+        `<span>r<sub>d</sub>(r) 在图像范围内单调：<b>${bad == null ? '是' : '否，r = ' + F(bad) + ' 处开始折回，标定应判为失败'}</b></span>`;
+    } else {
+      const k = kkb(), th = thetaOf(Kf.cx / Kf.fx, k), tv = thetaOf(Kf.cy / Kf.fy, k), a = 80 * deg;
+      rd.innerHTML = `<span>水平视场 <b>${F((2 * th) / deg, 1)}°</b>，竖直 <b>${F((2 * tv) / deg, 1)}°</b></span>` +
+        `<span>θ = 80° 时：鱼眼 r<sub>d</sub> = f·θ<sub>d</sub> = <b>${F(Kf.fx * M.kbTheta(a, k), 0)}</b> px，同样 f 的针孔 r = f·tanθ = <b>${F(Kf.fx * Math.tan(a), 0)}</b> px</span>` +
+        `${view === 'undist' ? '<span>去畸变图用 f = 70 px；绿线是鱼眼图上下边缘的去向，左右边缘和四角的入射角 ≥ 90°，在针孔图里没有位置</span>' : ''}`;
+    }
+  };
+  function draw() { r(); read(); }
+  V4U.seg($('seg-dmodel'), (v) => { model = v; $('g-bc').hidden = v !== 'bc'; $('g-kb').hidden = v !== 'kb'; draw(); });
+  V4U.seg($('seg-dview'), (v) => { view = v; draw(); });
+})();
+
+// ---------- 6. T_cw vs T_wc ----------
+(() => {
+  const W = 640, H = 480, K = { fx: 420, fy: 420, cx: 319.5, cy: 239.5 }, zc = 0.45, pitch = 35 * deg;
+  const pts = [[0.30, -0.10, 0.0], [0.42, 0.10, 0.0], [0.46, -0.04, 0.10], [0.26, 0.14, 0.05], [0.36, 0.0, 0.16]];
+  const pc = ['--c2', '--c3', '--c4', '--c5', '--c6'];
+  let Cw = [-0.3, -0.35], map = null;
+  const yaw = slider('yaw', (v) => v + '°', () => draw());
+  const pose = () => {
+    const ps = yaw() * deg, eye = [Cw[0], Cw[1], zc], dir = [Math.cos(ps) * Math.cos(pitch), Math.sin(ps) * Math.cos(pitch), -Math.sin(pitch)];
+    const Twc = M.lookAt(eye, M.add(eye, dir)); return { Twc, Tcw: M.Tinv(Twc) };
+  };
+  const cv = $('cv-ext');
+  const r1 = V4U.canvas(cv, (w) => Math.round(Math.min(380, Math.max(260, w * 0.78))), (ctx, w, h) => {
+    const xr = 1.0, yr = 0.8, s = Math.min((w - 16) / (2 * xr), (h - 16) / (2 * yr)), ox = w / 2, oy = h / 2;
+    const P = (p) => [ox + s * p[0], oy - s * p[1]];
+    map = { s, ox, oy, xr, yr };
+    for (let x = -1.0; x <= 1.0001; x += 0.2) ln(ctx, P([x, -yr]), P([x, yr]), C('--line'), 1);
+    for (let y = -0.8; y <= 0.8001; y += 0.2) ln(ctx, P([-xr, y]), P([xr, y]), C('--line'), 1);
+    arrow(ctx, P([0, 0]), P([0.2, 0]), C('--bad'), 2.2, 7); arrow(ctx, P([0, 0]), P([0, 0.2]), C('--ok'), 2.2, 7);
+    txt(ctx, 'w', [P([0, 0])[0] - 6, P([0, 0])[1] + 14], C('--muted'), 12, 'right', 'alphabetic', 700);
+    pts.forEach((p, i) => dot(ctx, P(p), 4.5, C(pc[i])));
+    const { Twc, Tcw } = pose();
+    const drawCam = (R, t, ghost) => {
+      const o = P(t), col = ghost ? C('--bad') : C('--c4'), dash = ghost ? [5, 4] : null;
+      [[0, 0], [W, 0], [W, H], [0, H]].forEach(([u, v]) => { const d = M.unit(M.mv(R, [(u - K.cx) / K.fx, (v - K.cy) / K.fy, 1])); ln(ctx, o, P(M.add(t, M.scl(d, 0.55))), col, 1.1, dash); });
+      const axc = ghost ? [col, col, col] : [C('--bad'), C('--ok'), C('--c1')];
+      [0, 1, 2].forEach((k) => { const d = [R[0][k], R[1][k], R[2][k]], e = P(M.add(t, M.scl(d, 0.16))); if (Math.hypot(e[0] - o[0], e[1] - o[1]) > 3) arrow(ctx, o, e, axc[k], 2, 6); if (ghost) txt(ctx, 'xyz'[k], [e[0] + 3, e[1] - 3], col, 11); });
+      if (ghost) ring(ctx, o, 7, col, 2); else dot(ctx, o, 7, col);
+    };
+    const tg = Tcw.t, inView = Math.abs(tg[0]) < xr && Math.abs(tg[1]) < yr;
+    if (inView) drawCam(Tcw.R, Tcw.t, true);
+    else { const q = [V4U.clamp(tg[0], -xr + 0.03, xr - 0.03), V4U.clamp(tg[1], -yr + 0.03, yr - 0.03)]; ring(ctx, P(q), 7, C('--bad'), 2); txt(ctx, '→ 出界', [P(q)[0] - 8, P(q)[1] - 10], C('--bad'), 11, 'right'); }
+    drawCam(Twc.R, Twc.t, false);
+  });
+  const r2 = V4U.canvas($('cv-ext-img'), (w) => Math.round(Math.min(380, Math.max(220, w * 0.78))), (ctx, w, h) => {
+    const { Twc, Tcw } = pose(), f = fit(w, h, W, H, 22);
+    imgFrame(ctx, f, W, H); clipRect(ctx, f.ox, f.oy, f.s * W, f.s * H);
+    pts.forEach((p, i) => {
+      const a = M.Tap(Tcw, p); if (a[2] > 1e-3) dot(ctx, f.P(...M.proj(K, a)), 5.5, C(pc[i]));
+      const b = M.Tap(Twc, p); if (b[2] > 1e-3) ring(ctx, f.P(...M.proj(K, b)), 7, C('--bad'), 2);
+    });
+    ctx.restore(); pixAxes(ctx, f);
+  });
+  const rd = $('rd-ext');
+  const read = () => {
+    const { Twc, Tcw } = pose();
+    const inside = (Xc) => { if (Xc[2] <= 1e-3) return false; const q = M.proj(K, Xc); return q[0] >= 0 && q[0] <= W && q[1] >= 0 && q[1] <= H; };
+    const ok = pts.filter((p) => inside(M.Tap(Tcw, p))).length, behind = pts.filter((p) => M.Tap(Twc, p)[2] <= 1e-3).length, inW = pts.filter((p) => inside(M.Tap(Twc, p))).length;
+    rd.innerHTML = `<span>T<sub>cw</sub> 的平移 t = <b>${vec(Tcw.t)}</b></span><span>相机中心 −R<sup>⊤</sup>t = <b>${vec(Twc.t)}</b></span>` +
+      `<span>正确投影：<b>${ok}/5</b> 个在图内</span><span>把 T<sub>wc</sub> 当外参：<b>${behind}</b> 个在相机后方，<b>${5 - behind - inW}</b> 个出画，<b>${inW}</b> 个在图内</span>`;
+  };
+  function draw() { r1(); r2(); read(); }
+  V4U.drag(cv, (x, y) => { if (!map) return; Cw = [V4U.clamp((x - map.ox) / map.s, -0.95, 0.95), V4U.clamp((map.oy - y) / map.s, -0.75, 0.75)]; draw(); });
+  read();
+})();
+
+// ---------- 7. depth back-projection ----------
+(() => {
+  let stored = 'ray', assume = 'z';
+  const fovS = slider('dfov', (v) => v + '°', () => draw());
+  const N = 25, boxF = 0.7, bx0 = 0.1, bx1 = 0.3;
+  const hit = (xn) => { // ray (xn, 1) in the x-z plane; returns Z of first hit
+    let Z = 1.0;
+    const zf = boxF; if (xn * zf >= bx0 && xn * zf <= bx1) Z = Math.min(Z, zf);
+    if (xn > 1e-9) { const zs = bx0 / xn; if (zs >= boxF && zs <= 1.0) Z = Math.min(Z, zs); }
+    return Z;
+  };
+  const rays = () => { const A = fovS() * deg, t = Math.tan(A / 2), out = []; for (let i = 0; i < N; i++) { const xn = -t + (2 * t * i) / (N - 1), Z = hit(xn), rho = Z * Math.sqrt(1 + xn * xn), d = stored === 'z' ? Z : rho; const Zh = assume === 'z' ? d : d / Math.sqrt(1 + xn * xn); out.push({ xn, Z, Zh }); } return out; };
+  const r = V4U.canvas($('cv-depth'), (w) => Math.round(Math.min(380, Math.max(280, w * 0.45))), (ctx, w, h) => {
+    const A = fovS() * deg, t = Math.tan(A / 2), oy = h / 2;
+    const S = Math.min((w - 50) / 1.55, (h / 2 - 12) / Math.max(t, 0.6)), ox = Math.max(34, (w - 1.55 * S) / 2);
+    const P = (x, z) => [ox + z * S, oy - x * S];
+    ln(ctx, [ox, oy], [w - 8, oy], C('--line-2'), 1, [4, 4]);
+    const R = rays(), match = stored === assume;
+    R.forEach((q) => ln(ctx, P(0, 0), P(q.xn * q.Z, q.Z), C('--line-2'), 1));
+    // true surfaces
+    const xm = t * 1.0 + 0.05;
+    ln(ctx, P(-xm, 1.0), P(xm, 1.0), C('--ink-2'), 3);
+    pl(ctx, [P(bx0, 1.0), P(bx0, boxF), P(bx1, boxF), P(bx1, 1.0)], C('--ink-2'), 3);
+    const col = match ? C('--ok') : C('--bad');
+    pl(ctx, R.map((q) => P(q.xn * q.Zh, q.Zh)), col, 1.2, [3, 3]);
+    R.forEach((q) => dot(ctx, P(q.xn * q.Zh, q.Zh), 3.6, col));
+    // camera
+    fillPoly(ctx, [[ox, oy], [ox - 14, oy - 9], [ox - 14, oy + 9]], C('--ink-2'));
+    arrow(ctx, [ox, oy], P(0, 0.22), C('--c1'), 2, 7); txt(ctx, 'z', [P(0, 0.22)[0] + 2, oy - 7], C('--c1'), 12, 'left', 'alphabetic', 700);
+    arrow(ctx, [ox, oy], P(0.18, 0), C('--bad'), 2, 7); txt(ctx, 'x', [ox + 6, P(0.18, 0)[1] + 2], C('--bad'), 12, 'left', 'middle', 700);
+    txt(ctx, 'Z = 1 m', [P(0, 1.0)[0] + 6, 14], C('--muted'), 11);
+  });
+  const rd = $('rd-depth');
+  const read = () => {
+    const A = fovS() * deg, t = Math.tan(A / 2), k = Math.sqrt(1 + t * t), R = rays(), e = R[0];
+    const err = Math.hypot(e.xn * (e.Zh - e.Z), e.Zh - e.Z);
+    rd.innerHTML = `<span>图像边缘 x = tan(FOV/2) = <b>${F(t, 3)}</b></span><span>ρ / Z<sub>c</sub> = <b>${F(k, 3)}</b></span>` +
+      `<span>边缘像素重建误差 <b>${F(err * 100, 1)}</b> cm（墙在 1 m）</span>`;
+  };
+  function draw() { r(); read(); }
+  V4U.seg($('seg-dstore'), (v) => { stored = v; draw(); });
+  V4U.seg($('seg-dassume'), (v) => { assume = v; draw(); });
+})();
+
+// ---------- 8. Zhang calibration ----------
+(() => {
+  const W = 640, H = 480, Kt = { fx: 620, fy: 615, cx: 322, cy: 238 }, kt = [-0.12, 0.03], MAG = 25;
+  const board = []; for (let j = 0; j < 6; j++) for (let i = 0; i < 8; i++) board.push([(i - 3.5) * 0.03, (j - 2.5) * 0.03]);
+  const corners4 = [0, 7, 47, 40], vcols = ['--c1', '--c2', '--c3', '--c4', '--c5', '--c6'];
+  let nv = 6, seed = 11, stage = 'lm', res = null, pend = false;
+  const schedule = () => { if (pend) return; pend = true; requestAnimationFrame(() => { pend = false; run(); }); };
+  const tilt = slider('ztilt', (v) => v + '°', schedule), noise = slider('znoise', (v) => F(v) + ' px', schedule);
+  const gen = () => {
+    const r = M.rng(seed), rn = M.rng(seed * 7 + 1), T = tilt() * deg, sg = noise(), obs = [];
+    let tries = 0;
+    while (obs.length < nv && tries++ < 800) {
+      const ax = M.unit([r.g(), r.g(), 0]);
+      const Rv = M.mm(M.exp(M.scl(ax, T * (0.4 + 0.6 * r.u()))), M.rotZ((r.u() - 0.5) * 0.8));
+      const z = 0.38 + 0.25 * r.u(), t = [(r.u() - 0.5) * 0.7 * z, (r.u() - 0.5) * 0.55 * z, z];
+      const o = board.map((X) => { const Xc = M.add(M.mv(Rv, [X[0], X[1], 0]), t); return Xc[2] > 0.05 ? M.proj(Kt, Xc, kt[0], kt[1]) : [NaN, NaN]; });
+      if (o.some((p) => !(p[0] > 8 && p[0] < W - 8 && p[1] > 8 && p[1] < H - 8))) continue;
+      obs.push(o.map((p) => [p[0] + sg * rn.g(), p[1] + sg * rn.g()]));
+    }
+    return obs;
+  };
+  function run() {
+    const obs = gen(), Hs = obs.map((o) => M.homography(board, o)), z = M.zhangK(Hs), K = z.K;
+    const ok = [K.fx, K.fy, K.cx, K.cy, K.s].every(isFinite) && K.fx > 0 && K.fy > 0;
+    let cf = null, lm = null;
+    if (ok) {
+      const poses = Hs.map((Hm) => { const Rt = M.zhangRt(Hm, K); return { w: M.log(Rt.R), t: Rt.t }; });
+      const p = [K.fx, K.fy, K.cx, K.cy, 0, 0, K.s];
+      cf = { p, poses, rms: M.rms(p, poses, board, obs) };
+      lm = M.refine(K, poses, board, obs, 15);
+      if (!isFinite(lm.rms)) lm = null;
+    }
+    res = { obs, cf, lm }; draw();
+  }
+  const r = V4U.canvas($('cv-zhang'), (w) => Math.round(Math.min(440, Math.max(240, w * 0.6))), (ctx, w, h) => {
+    const f = fit(w, h, W, H, 14);
+    imgFrame(ctx, f, W, H);
+    if (!res) return;
+    const sol = stage === 'cf' ? res.cf : res.lm;
+    res.obs.forEach((o, i) => {
+      const col = C(vcols[i % 6]);
+      pl(ctx, corners4.map((j) => f.P(...o[j])), col, 1.6, null, true);
+      o.forEach((m) => dot(ctx, f.P(...m), 1.9, col));
+      if (sol) o.forEach((m, j) => { const q = M.projBoard(sol.p, sol.poses[i].w, sol.poses[i].t, board[j]); ln(ctx, f.P(...m), f.P(m[0] + MAG * (q[0] - m[0]), m[1] + MAG * (q[1] - m[1])), C('--bad'), 1.2); });
+    });
+    pcross(ctx, f.P(Kt.cx, Kt.cy), C('--muted'));
+    if (!res.cf) { const m = [f.ox + f.s * W / 2, f.oy + 26]; ctx.font = MONO(14, 700); const tw = ctx.measureText('退化：B 不正定，闭式解失败').width; ctx.globalAlpha = 0.92; ctx.fillStyle = C('--surface'); ctx.fillRect(m[0] - tw / 2 - 10, m[1] - 14, tw + 20, 28); ctx.globalAlpha = 1; txt(ctx, '退化：B 不正定，闭式解失败', m, C('--bad'), 14, 'center', 'middle', 700); }
+  });
+  const tb = $('tb-zhang');
+  const read = () => {
+    const row = (name, v, rms) => `<tr><td>${name}</td>${v.map((x) => `<td>${x == null ? '—' : x}</td>`).join('')}<td>${rms}</td></tr>`;
+    const fmtp = (p, sk) => [F(p[0], 1), F(p[1], 1), F(p[2], 1), F(p[3], 1), sk, F(p[4], 3), F(p[5], 3)];
+    let body = row('真值', [F(Kt.fx, 1), F(Kt.fy, 1), F(Kt.cx, 1), F(Kt.cy, 1), '0', F(kt[0], 3), F(kt[1], 3)], F(noise(), 2) + '（σ）');
+    if (res && res.cf) body += row('闭式解', fmtp(res.cf.p, F(res.cf.p[6], 2)).map((x, i) => (i >= 5 ? '（无）' : x)), F(res.cf.rms, 3));
+    else body += row('闭式解', ['退化', null, null, null, null, null, null], '—');
+    if (res && res.lm) body += row('LM 精化', fmtp(res.lm.p, '0（固定）'), F(res.lm.rms, 3));
+    else body += row('LM 精化', [null, null, null, null, null, null, null], '—');
+    tb.innerHTML = `<table class="zt"><thead><tr><th></th><th>f<sub>x</sub></th><th>f<sub>y</sub></th><th>c<sub>x</sub></th><th>c<sub>y</sub></th><th>s</th><th>k<sub>1</sub></th><th>k<sub>2</sub></th><th>RMS px</th></tr></thead><tbody>${body}</tbody></table>` +
+      `${res ? `<p style="margin:6px 14px 2px;font-size:13px;color:var(--muted)">实际生成 ${res.obs.length} 张（要求所有角点都在画内）</p>` : ''}`;
+  };
+  function draw() { r(); read(); }
+  V4U.seg($('seg-zn'), (v) => { nv = +v; schedule(); });
+  V4U.seg($('seg-zstage'), (v) => { stage = v; draw(); });
+  $('bt-zre').addEventListener('click', () => { seed += 1; run(); });
+})();
+
+// ---------- 9. hand-eye ----------
+(() => {
+  const W = 640, H = 480, K = { fx: 500, fy: 500, cx: 319.5, cy: 239.5 }, N = 8;
+  const Xin = M.T(M.mm(M.rotZ(0.12), M.rotX(-0.22)), [0.0, -0.075, 0.025]);          // T_gc (eye-in-hand truth)
+  const Tbt = M.T(M.rotX(Math.PI), [0.55, 0.0, 0.0]);                                // board on the table (eye-in-hand)
+  const camFix = M.lookAt([1.0, 0.62, 0.72], [0.45, 0.0, 0.2]);                      // T_bc (eye-to-hand truth)
+  const Tgt = M.T(M.rotX(Math.PI), [0, 0, 0.07]);                                     // board on the gripper (eye-to-hand)
+  const boardPts = []; for (let j = 0; j < 4; j++) for (let i = 0; i < 5; i++) boardPts.push([(i - 2) * 0.05, (j - 1.5) * 0.05, 0]);
+  const sq = []; for (let j = 0; j < 3; j++) for (let i = 0; i < 4; i++) sq.push([[(i - 2) * 0.05, (j - 1.5) * 0.05], (i + j) % 2]);
+  const rotAbout = (a, c) => M.T(M.rotZ(a), M.sub(c, M.mv(M.rotZ(a), c)));
+  let mode = 'in', samp = 'multi', inv = false, seed = 5, idx = 0, D = null, anim = null;
+  const noise = slider('hnoise', (v) => F(v, 1), () => solve());
+  const poseSl = $('sl-hpose'); slider('hpose', (v) => `${v + 1} / ${N}`, () => { idx = +poseSl.value; draw(); });
+  const sample = () => {
+    const r = M.rng(seed), G = [];
+    if (mode === 'in') {
+      for (let i = 0; i < N; i++) {
+        const ph = (12 + 26 * r.u()) * deg, ps = r.u() * 2 * Math.PI, hh = 0.32 + 0.16 * r.u();
+        const eye = [0.55 + hh * Math.tan(ph) * Math.cos(ps), hh * Math.tan(ph) * Math.sin(ps), hh];
+        const Cm = M.lookAt(eye, [0.55 + 0.03 * r.g(), 0.03 * r.g(), 0]); Cm.R = M.mm(Cm.R, M.rotZ((r.u() - 0.5) * 70 * deg));
+        G.push(M.Tmul(Cm, M.Tinv(Xin)));
+      }
+    } else {
+      for (let i = 0; i < N; i++) {
+        const p = [0.4 + 0.12 * r.u(), -0.15 + 0.3 * r.u(), 0.18 + 0.15 * r.u()];
+        const Rb = M.mm(M.lookAt(camFix.t, p).R, M.exp(M.scl(r.dir(), 0.45 * r.u())));
+        G.push(M.Tmul(M.T(Rb, p), M.Tinv(Tgt)));
+      }
+    }
+    if (samp === 'single') { const c = mode === 'in' ? [0.55, 0, 0] : [0.45, 0, 0], G0 = G[0]; for (let i = 0; i < N; i++) G[i] = M.Tmul(rotAbout((-50 + (100 * i) / (N - 1)) * deg, c), G0); }
+    return G;
+  };
+  let G = sample();
+  function solve() {
+    const rn = M.rng(seed * 13 + 7), s = noise(), Xt = mode === 'in' ? Xin : camFix;
+    const noisy = (T) => ({ R: M.mm(T.R, M.exp(M.scl([rn.g(), rn.g(), rn.g()], s * 0.1 * deg))), t: M.add(T.t, M.scl([rn.g(), rn.g(), rn.g()], s * 1e-3)) });
+    const As = [], Bs = [];
+    G.forEach((g) => {
+      if (mode === 'in') { As.push(g); Bs.push(noisy(M.Tmul(M.Tinv(M.Tmul(g, Xin)), Tbt))); }
+      else { As.push(M.Tinv(g)); Bs.push(noisy(M.Tmul(M.Tinv(camFix), M.Tmul(g, Tgt)))); }
+    });
+    const Xh = M.parkMartin(As, Bs);
+    const degen = !(Xh.cond > 1e-7) || !Xh.t || !Xh.t.every(isFinite);
+    const Xu = inv ? M.Tinv(Xh) : Xh;
+    const loops = degen ? [] : As.map((A, i) => M.Tmul(M.Tmul(A, Xu), Bs[i]));
+    let spread = NaN;
+    if (loops.length) { const m = [0, 1, 2].map((k) => loops.reduce((a, L) => a + L.t[k], 0) / loops.length); spread = Math.sqrt(loops.reduce((a, L) => a + M.norm(M.sub(L.t, m)) ** 2, 0) / loops.length); }
+    const A01 = M.Tmul(M.Tinv(As[1]), As[0]), B01 = M.Tmul(Bs[1], M.Tinv(Bs[0]));
+    D = { Xt, Xh, Xu, degen, loops, spread, rotErr: degen ? NaN : M.angle(M.mm(Xh.R, M.tr(Xt.R))) / deg, tErr: degen ? NaN : M.norm(M.sub(Xh.t, Xt.t)) * 1000, dAng: Math.abs(M.angle(A01.R) - M.angle(B01.R)) / deg };
+    draw();
+  }
+  const drawBoard = (P, ctx, T) => {
+    sq.forEach(([[x, y], dark]) => { const q = [[x, y, 0], [x + 0.05, y, 0], [x + 0.05, y + 0.05, 0], [x, y + 0.05, 0]].map((p) => M.Tap(T, p)); P.poly(q, dark ? C('--ink-2') : C('--surface'), C('--line-2'), 1); });
+  };
+  const drawArm = (P, g) => {
+    const z = [g.R[0][2], g.R[1][2], g.R[2][2]], wrist = M.sub(g.t, M.scl(z, 0.09)), sh = [0, 0, 0.32];
+    const mid = M.add(M.scl(M.add(sh, wrist), 0.5), [0, 0, 0.16]);
+    [[[0, 0, 0], sh], [sh, mid], [mid, wrist], [wrist, g.t]].forEach(([a, b]) => P.line(a, b, C('--line-2'), 6));
+    const y = [g.R[0][1], g.R[1][1], g.R[2][1]];
+    [-1, 1].forEach((sg) => { const b = M.add(g.t, M.scl(y, 0.025 * sg)); P.line(M.add(g.t, M.scl(y, 0.0)), b, C('--ink-2'), 2.5); P.line(b, M.add(b, M.scl(z, 0.05)), C('--ink-2'), 2.5); });
+  };
+  const mid = (a, b) => M.scl(M.add(a, b), 0.5);
+  const v3 = V4U.orbit3d($('cv-he3d'), { height: (w) => Math.round(Math.min(400, Math.max(290, w * 0.85))), yaw: -2.3, pitch: 0.62, dist: 1.5, target: [0.45, 0.04, 0.2], fov: 38 }, (ctx, P) => {
+    if (!D) return;
+    for (let i = 0; i <= 7; i++) { const x = -0.15 + 0.15 * i; P.line([x, -0.45, 0], [x, 0.45, 0], C('--line'), 1); }
+    for (let j = 0; j <= 6; j++) { const y = -0.45 + 0.15 * j; P.line([-0.15, y, 0], [0.9, y, 0], C('--line'), 1); }
+    P.frame([0, 0, 0], M.I3(), 0.14, 2.4); P.text([0, 0, -0.04], 'b', C('--muted'), MONO(12, 700));
+    G.forEach((g) => P.point(g.t, 2.4, C('--muted')));
+    const g = G[idx];
+    drawArm(P, g); P.frame(g.t, g.R, 0.08, 2);
+    const fr = (T, lab) => { P.text(T.t, lab, C('--muted'), MONO(12, 700)); };
+    if (mode === 'in') {
+      const Cm = M.Tmul(g, Xin);
+      drawBoard(P, ctx, Tbt); fr(Tbt, 't');
+      frustum3(P, ctx, Cm, K, W, H, 0.1, C('--c4'), null);
+      dash3(ctx, P, [0, 0, 0], g.t, C('--c1'), 2); P.text(mid([0, 0, 0], g.t), 'A', C('--c1'), MONO(13, 700));
+      dash3(ctx, P, g.t, Cm.t, C('--c2'), 2.5); P.text(Cm.t, 'X', C('--c2'), MONO(13, 700));
+      dash3(ctx, P, Cm.t, Tbt.t, C('--c3'), 2); P.text(mid(Cm.t, Tbt.t), 'B', C('--c3'), MONO(13, 700));
+      dash3(ctx, P, [0, 0, 0], Tbt.t, C('--c4'), 2); P.text(M.add(mid([0, 0, 0], Tbt.t), [0, -0.04, 0]), 'T_bt', C('--c4'), MONO(12, 700));
+      D.loops.forEach((L) => P.point(L.t, 2.8, C('--c5')));
+    } else {
+      const Tb = M.Tmul(g, Tgt);
+      drawBoard(P, ctx, Tb); fr(Tb, 't');
+      frustum3(P, ctx, camFix, K, W, H, 0.1, C('--c4'), null);
+      dash3(ctx, P, [0, 0, 0], g.t, C('--c1'), 2); P.text(mid([0, 0, 0], g.t), 'A⁻¹', C('--c1'), MONO(13, 700));
+      dash3(ctx, P, [0, 0, 0], camFix.t, C('--c2'), 2.5); P.text(mid([0, 0, 0], camFix.t), 'X', C('--c2'), MONO(13, 700));
+      dash3(ctx, P, camFix.t, Tb.t, C('--c3'), 2); P.text(mid(camFix.t, Tb.t), 'B', C('--c3'), MONO(13, 700));
+      dash3(ctx, P, g.t, Tb.t, C('--c4'), 2); P.text(M.add(Tb.t, [0, 0, 0.04]), 'T_gt', C('--c4'), MONO(12, 700));
+      D.loops.forEach((L) => P.point(M.Tap(g, L.t), 2.8, C('--c5')));
+    }
+  });
+  const r2 = V4U.canvas($('cv-heimg'), (w) => Math.round(Math.min(380, Math.max(220, w * 0.8))), (ctx, w, h) => {
+    const f = fit(w, h, W, H, 22);
+    imgFrame(ctx, f, W, H);
+    if (!D) return;
+    const g = G[idx];
+    let Tobs, Tpre, pts3;
+    if (mode === 'in') { Tobs = M.Tinv(M.Tmul(g, Xin)); Tpre = D.degen ? null : M.Tinv(M.Tmul(g, D.Xu)); pts3 = boardPts.map((p) => M.Tap(Tbt, p)); }
+    else { Tobs = M.Tinv(camFix); Tpre = D.degen ? null : M.Tinv(D.Xu); const zt = [g.R[0][2], g.R[1][2], g.R[2][2]], yt = [g.R[0][1], g.R[1][1], g.R[2][1]]; pts3 = boardPts.map((p) => M.Tap(M.Tmul(g, Tgt), p)).concat([g.t, M.add(M.add(g.t, M.scl(yt, 0.025)), M.scl(zt, 0.05)), M.add(M.sub(g.t, M.scl(yt, 0.025)), M.scl(zt, 0.05))]); }
+    clipRect(ctx, f.ox, f.oy, f.s * W, f.s * H);
+    let err = 0, n = 0;
+    pts3.forEach((p) => {
+      const a = M.Tap(Tobs, p); if (a[2] <= 1e-3) return; const qa = M.proj(K, a); dot(ctx, f.P(...qa), 3.2, C('--ink-2'));
+      if (!Tpre) return; const b = M.Tap(Tpre, p); if (b[2] <= 1e-3) { err = Infinity; return; } const qb = M.proj(K, b); ring(ctx, f.P(...qb), 5, C('--c5'), 1.8); err += Math.hypot(qa[0] - qb[0], qa[1] - qb[1]); n++;
+    });
+    ctx.restore(); pixAxes(ctx, f);
+    D.imgErr = n ? err / n : NaN;
+  });
+  const rd = $('rd-he');
+  const read = () => {
+    if (!D) return;
+    if (D.degen) { rd.innerHTML = `<span><b>退化</b>：所有相对旋转的转轴平行，M 秩不足，X 解不出</span><span>|θ<sub>A</sub> − θ<sub>B</sub>|（第 1 对）= <b>${F(D.dAng, 3)}°</b></span>`; return; }
+    rd.innerHTML = `<span>X̂ 误差：旋转 <b>${F(D.rotErr, 3)}°</b>，平移 <b>${F(D.tErr, 2)}</b> mm</span>` +
+      `<span>回路散布（8 个不变量的 RMS）<b>${F(D.spread * 1000, 1)}</b> mm</span>` +
+      `<span>|θ<sub>A</sub> − θ<sub>B</sub>|（第 1 对）= <b>${F(D.dAng, 3)}°</b></span>` +
+      `<span>预测点平均偏差 <b>${isFinite(D.imgErr) ? F(D.imgErr, 1) + ' px' : '在相机后方'}</b></span>`;
+  };
+  function draw() { v3.redraw(); r2(); read(); }
+  const resample = () => { G = sample(); solve(); };
+  V4U.seg($('seg-hmode'), (v) => { mode = v; Object.assign(v3.view, v === 'in' ? { dist: 1.5, target: [0.45, 0.04, 0.2] } : { dist: 2.1, target: [0.55, 0.22, 0.32] }); resample(); });
+  V4U.seg($('seg-hsamp'), (v) => { samp = v; resample(); });
+  V4U.seg($('seg-hinv'), (v) => { inv = v === 'inv'; solve(); });
+  $('bt-hre').addEventListener('click', () => { seed += 1; resample(); });
+  $('bt-hplay').addEventListener('click', (e) => {
+    if (anim) { anim.stop(); anim = null; e.target.textContent = '播放'; return; }
+    e.target.textContent = '暂停'; let acc = 0;
+    anim = V4U.loop($('cv-he3d'), (t, dt) => { acc += dt; if (acc < 0.9) return; acc = 0; idx = (idx + 1) % N; poseSl.value = idx; $('o-hpose').textContent = `${idx + 1} / ${N}`; draw(); });
+  });
+})();
+
+});
+</script>
+</body>
+</html>

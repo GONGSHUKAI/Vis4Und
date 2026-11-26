@@ -1,0 +1,1042 @@
+<!doctype html>
+<html lang="zh-CN" data-sec="vision3d">
+<head>
+<!-- v4u:head -->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="icon" href="data:,">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700&family=Inter+Tight:wght@700&family=JetBrains+Mono:wght@400;700&family=Noto+Sans+SC:wght@400;700&display=swap">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<link rel="stylesheet" href="../../assets/v4u.css?v=4288b6c4">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
+<script src="../../assets/v4u.js?v=d6640e00"></script>
+<!-- /v4u:head -->
+<title>SLAM · Vis4Und</title>
+<meta name="description" content="边走边定位边建图：概率建模到非线性最小二乘、前端（特征、对极几何、PnP、三角化、直接法）、后端（因子图、BA、Schur 补）、回环与位姿图优化，以及到 2026-11 的进展。">
+<style>
+/* KaTeX's absolutely positioned MathML escapes the scroll box unless the box is positioned */
+.tbl{position:relative}
+.tbl.wide table{min-width:760px}
+.tbl.wide td:first-child{white-space:normal;min-width:8em}
+.sw{display:inline-block;width:14px;height:14px;border-radius:3px;vertical-align:-2px;border:1px solid var(--line-2);margin:0 2px}
+.viz-ctrl .seg button{padding:7px 10px}
+.yr{font-family:var(--f-mono);white-space:nowrap}
+</style>
+</head>
+<body>
+<!-- v4u:nav -->
+<nav class="v4u-nav" aria-label="站点导航"><div class="v4u-nav-in"><span class="v4u-crumb"><a href="../../"><b>Vis4Und</b></a><span class="v4u-sep">/</span><a href="../../#vision3d">(2) 3D 视觉与图形学</a></span><span class="v4u-links"><a href="../3d-representations/">(i) 3D 表征</a><a href="../slam/" aria-current="page">(ii) SLAM</a><a href="../3d-foundation-models/">(iii) 3D 基础模型</a><button type="button" class="v4u-theme" aria-label="切换深浅色">深色</button></span></div></nav>
+<!-- /v4u:nav -->
+
+<header class="hero"><div class="wrap">
+  <p class="kicker">(2) 3D 视觉与图形学 · (ii)</p>
+  <h1>SLAM</h1>
+  <p class="lede">SLAM（Simultaneous Localization and Mapping）让一个在未知环境里移动的传感器，同时估计自己走过的轨迹和环境的地图。经典做法是把它写成一个大的非线性最小二乘问题；近两年的趋势是用 3D 基础模型替换前端，后端仍是因子图。</p>
+  <p class="asks-h">读完能回答</p>
+  <ul class="asks">
+    <li>为什么定位和建图必须一起做？只用里程计为什么会漂？</li>
+    <li>从「最大后验」怎么一步步推到 Gauss–Newton 的正规方程 $H\delta=-\mathbf{b}$？</li>
+    <li>BA 为什么能解几千个点？Schur 补消掉了什么？</li>
+    <li>回环检测之后，位姿图优化怎样把整条轨迹拉回来？</li>
+    <li>做机器人操作时什么情况下需要 SLAM？MASt3R-SLAM、VGGT-SLAM 这一类新在哪？</li>
+  </ul>
+</div></header>
+
+<div class="wrap layout">
+<nav class="toc" id="toc" aria-label="本页目录"></nav>
+<main>
+
+<section id="problem">
+  <h2 data-toc="问题与用途">SLAM 要解决什么</h2>
+  <p class="def"><b>SLAM</b>：给定传感器读数 $\mathbf{z}_{1:K}$（图像、深度、激光、IMU）和可能有的控制量 $\mathbf{u}_{1:T}$，同时估计传感器轨迹 $\mathbf{x}_{0:T}$ 和地图 $\mathbf{m}$。</p>
+  <p>鸡生蛋问题：知道每一帧的位姿，把观测拼起来就是地图（见 <a href="../3d-representations/#voxel">TSDF 融合</a>）；知道地图，每一帧和地图配准就得到位姿（PnP、ICP）。两者都不知道时只能一起估计。</p>
+  <ul>
+    <li><b>里程计</b>（odometry，VO / VIO / LIO）：只用相邻帧或一个滑动窗口估计相对运动。每一步的小误差会累积，轨迹<b>漂移</b>，误差随路程增长。</li>
+    <li><b>SLAM</b> = 里程计 + 全局一致的地图 + <b>回环</b>：认出「这里来过」，加一条约束把累积误差消掉。</li>
+    <li><b>重定位 / 地图上定位</b>：地图已经建好，只估计当前位姿（如扫地机、AMR 开机后在已有地图里找自己）。</li>
+  </ul>
+  <div class="tbl"><table>
+    <thead><tr><th>应用</th><th>常用配置</th><th>要的输出</th></tr></thead>
+    <tbody>
+      <tr><td>室内移动机器人 / AMR</td><td>2D 激光 + 轮速计；或 RGB-D</td><td>2D 占据栅格地图 + 实时位姿，供导航规划</td></tr>
+      <tr><td>AR / VR 头显、手机</td><td>多相机 + IMU（VIO）</td><td>低延迟 6-DoF 位姿</td></tr>
+      <tr><td>无人机</td><td>双目 / 单目 + IMU</td><td>高频位姿 + 局部障碍地图</td></tr>
+      <tr><td>自动驾驶</td><td>激光雷达 + IMU + GNSS + 相机</td><td>离线建高精地图，在线在地图上定位</td></tr>
+      <tr><td>三维重建、数字孪生</td><td>RGB-D、激光、多视角照片</td><td>稠密网格 / 点云 / 3DGS</td></tr>
+    </tbody>
+  </table></div>
+  <div class="note"><b>机器人操作什么时候需要 SLAM</b>
+    <p>固定在桌边的第三人称相机：外参做一次<a href="../camera/">手眼标定</a>就够了，不需要 SLAM。腕部相机：相机位姿 = 正运动学 × 手眼外参，也已知；要把多帧拼成地图时做的是<a href="../3d-representations/#voxel">融合</a>，不是 SLAM。</p>
+    <p>需要的场合：(1) 移动操作，底盘在房间里移动，要建图和重定位；(2) 采集设备没有运动学，比如手持夹爪 UMI（Chi et al., RSS 2024）用 GoPro 的鱼眼图像 + 内置 IMU 跑基于 ORB-SLAM3 的惯性单目 SLAM，恢复夹爪的 6-DoF 轨迹作为动作标签；(3) 从人类第一视角视频里恢复相机轨迹；(4) 机械臂运动学或外参不可靠，需要视觉闭环校正。</p>
+  </div>
+</section>
+
+<section id="sensors">
+  <h2>传感器与可观测性</h2>
+  <div class="tbl"><table>
+    <thead><tr><th>传感器</th><th>直接测到</th><th>测不到 / 难点</th><th>典型系统</th></tr></thead>
+    <tbody>
+      <tr><td>单目相机</td><td>方向（每个像素一条射线）</td><td>绝对尺度：整个场景和轨迹同乘 $s$，图像完全一样；初始化要足够视差；尺度会漂</td><td>ORB-SLAM、DSO、MASt3R-SLAM</td></tr>
+      <tr><td>双目相机</td><td>视差 → 深度 $z=fb/d$</td><td>远处深度误差 $\propto z^2$；需要标定基线</td><td>ORB-SLAM2/3、VINS-Fusion</td></tr>
+      <tr><td>RGB-D</td><td>每像素深度（结构光 / ToF）</td><td>量程几米；户外阳光、黑色和反光表面失效</td><td>KinectFusion、ElasticFusion、SplaTAM</td></tr>
+      <tr><td>激光雷达</td><td>精确的度量距离，几十到上百米</td><td>点稀疏；长走廊、隧道等几何退化场景；运动畸变</td><td>LOAM、Cartographer、FAST-LIO2</td></tr>
+      <tr><td>IMU</td><td>角速度、比力（加速度减重力），数百 Hz</td><td>积分后很快发散；有零偏</td><td>与视觉或激光紧耦合：VIO、LIO</td></tr>
+    </tbody>
+  </table></div>
+  <ul>
+    <li><b>单目尺度不可观</b>：把所有点 $\mathbf{m}_j$ 和所有相机平移 $\mathbf{t}_i$ 同乘 $s$，相机系坐标 $R_i^\top(\mathbf{m}_j-\mathbf{t}_i)$ 也乘 $s$，透视除法 $x/z$ 把 $s$ 约掉。单目 SLAM 的不确定自由度是 7 维相似变换 Sim(3)（旋转 3 + 平移 3 + 尺度 1）。下面<a href="#viz-tri">三角化的图</a>里可以拖尺度滑块验证。</li>
+    <li><b>加 IMU 后</b>：加速度计测的是含重力的比力，重力方向使 roll、pitch 可观；加速度的米制单位使尺度可观（需要足够的加速度激励）。剩下全局位置 3 维和绕重力的 yaw 1 维不可观，所以 VINS-Mono 的回环位姿图只优化 4 个自由度（$x,y,z,\text{yaw}$）。</li>
+    <li><b>IMU 预积分</b>（Forster et al., T-RO 2017）：两个关键帧之间几百个 IMU 读数先积分成一个相对运动量和它的协方差，作为一个因子；线性化点变了只做一阶修正，不用重新积分。</li>
+  </ul>
+</section>
+
+<section id="map">
+  <h2 data-toc="MAP → 最小二乘">从概率到非线性最小二乘</h2>
+  <p class="def"><b>最大后验估计</b>（MAP）：在所有观测下，找后验概率最大的轨迹和地图。高斯噪声假设下，它等价于一个加权非线性最小二乘问题。</p>
+  <table class="notation">
+    <caption>记号</caption>
+    <thead><tr><th>符号</th><th>含义</th><th>形状</th></tr></thead>
+    <tbody>
+      <tr><td>$\mathbf{x}_i$</td><td>第 $i$ 个位姿；三维是 $T_i=(R_i,\mathbf{t}_i)\in SE(3)$，平面是 $(x,y,\theta)$</td><td>6 或 3 个自由度</td></tr>
+      <tr><td>$\mathbf{m}_j$</td><td>第 $j$ 个路标点</td><td>$\mathbb{R}^3$</td></tr>
+      <tr><td>$\mathcal{X}$</td><td>全部未知量 $\{\mathbf{x}_i\}\cup\{\mathbf{m}_j\}$</td><td>$D$ 维</td></tr>
+      <tr><td>$\mathbf{z}_k$</td><td>第 $k$ 个观测（像素、相对位姿、IMU 预积分量…）</td><td>$d_k$ 维</td></tr>
+      <tr><td>$\mathcal{X}_k$</td><td>观测 $k$ 涉及的那几个变量</td><td>$\mathcal{X}$ 的子集</td></tr>
+      <tr><td>$h_k(\cdot)$</td><td>观测模型：给定 $\mathcal{X}_k$ 时应该测到什么</td><td>$\to\mathbb{R}^{d_k}$</td></tr>
+      <tr><td>$\Sigma_k,\ \Omega_k=\Sigma_k^{-1}$</td><td>观测噪声协方差、信息矩阵</td><td>$d_k\times d_k$</td></tr>
+      <tr><td>$\mathbf{e}_k=h_k(\mathcal{X}_k)-\mathbf{z}_k$</td><td>残差</td><td>$d_k$</td></tr>
+      <tr><td>$J_k=\partial\mathbf{e}_k/\partial\boldsymbol\delta$</td><td>残差对增量的雅可比</td><td>$d_k\times D$（只有 $\mathcal{X}_k$ 对应的列非零）</td></tr>
+      <tr><td>$H,\ \mathbf{b}$</td><td>正规方程的矩阵和右端</td><td>$D\times D$；$D$</td></tr>
+    </tbody>
+  </table>
+  <ol class="derive">
+    <li><p>贝叶斯公式，分母 $p(\mathbf{Z})$ 与 $\mathcal{X}$ 无关：</p>$$\mathcal{X}^\star=\arg\max_{\mathcal{X}}p(\mathcal{X}\mid\mathbf{Z})=\arg\max_{\mathcal{X}}p(\mathbf{Z}\mid\mathcal{X})\,p(\mathcal{X})$$</li>
+    <li><p>假设各观测在给定变量时条件独立，每个观测只依赖少数几个变量；先验只放在第一个位姿上（固定坐标系）：</p>$$p(\mathbf{Z}\mid\mathcal{X})\,p(\mathcal{X})=p(\mathbf{x}_0)\prod_{k}p(\mathbf{z}_k\mid\mathcal{X}_k)$$</li>
+    <li><p>这个乘积就是<b>因子图</b>：变量是节点，每个 $p(\mathbf{z}_k\mid\mathcal{X}_k)$ 是一个连着 $\mathcal{X}_k$ 的因子。观测噪声取高斯 $\mathbf{z}_k=h_k(\mathcal{X}_k)+\boldsymbol\epsilon_k$，$\boldsymbol\epsilon_k\sim\mathcal{N}(\mathbf{0},\Sigma_k)$：</p>$$p(\mathbf{z}_k\mid\mathcal{X}_k)\propto\exp\!\Big(-\tfrac12\,\mathbf{e}_k^\top\Omega_k\,\mathbf{e}_k\Big)$$</li>
+    <li><p>取负对数，乘积变求和，最大化变最小化：</p>$$\mathcal{X}^\star=\arg\min_{\mathcal{X}}F(\mathcal{X}),\qquad F(\mathcal{X})=\sum_k\mathbf{e}_k(\mathcal{X}_k)^\top\Omega_k\,\mathbf{e}_k(\mathcal{X}_k)$$</li>
+    <li><p>$h_k$ 含旋转和透视除法，是非线性的。在当前估计处对增量 $\boldsymbol\delta$ 做一阶展开（位姿的增量在李代数上，$\mathbf{x}\boxplus\boldsymbol\delta=\mathbf{x}\,\mathrm{Exp}(\boldsymbol\delta)$，见 <a href="../rotations/">旋转与位姿</a>）：</p>$$\mathbf{e}_k(\mathcal{X}\boxplus\boldsymbol\delta)\approx\mathbf{e}_k+J_k\boldsymbol\delta$$</li>
+    <li><p>代回 $F$，得到 $\boldsymbol\delta$ 的二次函数：</p>$$F(\boldsymbol\delta)\approx\underbrace{\sum_k\mathbf{e}_k^\top\Omega_k\mathbf{e}_k}_{c}+2\,\mathbf{b}^\top\boldsymbol\delta+\boldsymbol\delta^\top H\boldsymbol\delta,\quad H=\sum_kJ_k^\top\Omega_kJ_k,\quad \mathbf{b}=\sum_kJ_k^\top\Omega_k\mathbf{e}_k$$</li>
+    <li><p>对 $\boldsymbol\delta$ 求导令其为零，得到 <b>Gauss–Newton</b> 的正规方程；解出后更新 $\mathcal{X}\leftarrow\mathcal{X}\boxplus\boldsymbol\delta$，重新线性化，迭代：</p>$$H\,\boldsymbol\delta=-\mathbf{b}$$</li>
+    <li><p><b>Levenberg–Marquardt</b> 加阻尼：$\lambda$ 大时接近步长很小的梯度下降，$\lambda$ 小时接近 Gauss–Newton。代价下降就接受这步、把 $\lambda$ 调小，否则拒绝、把 $\lambda$ 调大：</p>$$(H+\lambda\,\mathrm{diag}(H))\,\boldsymbol\delta=-\mathbf{b}$$</li>
+  </ol>
+  <p>$H$ 的稀疏结构由因子图决定：$H$ 的块 $(a,b)$ 非零当且仅当变量 $a$、$b$ 出现在同一个因子里。SLAM 的每个因子只连两三个变量，所以 $H$ 极其稀疏，用稀疏 Cholesky 解（g2o、GTSAM、Ceres）。</p>
+  <div class="note pit"><b>易错</b><p>一条错误的数据关联（误匹配、错误回环）的残差是几十个标准差，平方之后会主导整个代价。实际系统都给残差套<b>鲁棒核</b> $\rho(s)$（Huber、Cauchy），$s=\mathbf{e}^\top\Omega\mathbf{e}$；求解时等价于给每个因子乘一个权重 $w=\rho'(s)$，大残差的权重很小。Cauchy 核 $\rho(s)=c^2\log(1+s/c^2)$，$w=1/(1+s/c^2)$。<a href="#viz-pg">位姿图的图</a>里可以对比。</p></div>
+</section>
+
+<section id="frontend">
+  <h2 data-toc="前端：特征与几何">前端：特征、对极几何、三角化、PnP</h2>
+  <p>前端把原始图像变成后端能用的约束：哪些像素是同一个 3D 点（数据关联），以及位姿和点的初值。</p>
+  <h3>特征提取与匹配</h3>
+  <ul>
+    <li><b>ORB</b>（Rublee et al., ICCV 2011）：FAST 角点 + 带方向的 BRIEF 描述子，每个特征 256 bit；两个描述子的距离是汉明距离（异或后数 1 的个数），一条指令级操作。在图像金字塔上提取，得到一定的尺度不变性。ORB-SLAM 用同一套 ORB 特征做跟踪、建图和回环。</li>
+    <li><b>匹配</b>：最近邻 + 比值检验（最近距离 / 次近距离 $\lt 0.8$ 才接受，Lowe 2004）；或在投影位置附近的小窗口里搜（跟踪时已知大致位姿）。</li>
+    <li><b>RANSAC</b>：每次随机取最少 $s$ 对匹配算一个模型，数内点，保留内点最多的。内点比例 $w$ 时，以概率 $p$ 至少抽到一次全内点所需次数 $N=\lceil\log(1-p)/\log(1-w^s)\rceil$。$w=0.5,\ p=0.99$：$s=3$（P3P）要 35 次，$s=5$（五点法）146 次，$s=8$（八点法）1177 次。</li>
+  </ul>
+
+  <h3>对极几何：两帧之间的相对位姿</h3>
+  <p>用归一化坐标 $\hat{\mathbf{x}}=K^{-1}[u,v,1]^\top$（去掉内参）。同一个点在两个相机系下 $\mathbf{X}_2=R\,\mathbf{X}_1+\mathbf{t}$，$\mathbf{X}_i=z_i\hat{\mathbf{x}}_i$。</p>
+  <ol class="derive">
+    <li><p>两边左乘 $[\mathbf{t}]_\times$（与 $\mathbf{t}$ 做叉积的矩阵），$\mathbf{t}$ 项消失：</p>$$[\mathbf{t}]_\times\mathbf{X}_2=[\mathbf{t}]_\times R\,\mathbf{X}_1$$</li>
+    <li><p>再左乘 $\mathbf{X}_2^\top$，左边 $\mathbf{X}_2^\top(\mathbf{t}\times\mathbf{X}_2)=0$：</p>$$0=\mathbf{X}_2^\top[\mathbf{t}]_\times R\,\mathbf{X}_1$$</li>
+    <li><p>除以两个深度 $z_1z_2$，得到<b>对极约束</b>，$E$ 是本质矩阵：</p>$$\hat{\mathbf{x}}_2^\top E\,\hat{\mathbf{x}}_1=0,\qquad E=[\mathbf{t}]_\times R$$</li>
+    <li><p>约束对 $E$ 齐次，$\mathbf{t}$ 的长度消掉了：两帧只能确定平移方向，这就是单目尺度的来源。$E$ 有 5 个自由度（旋转 3 + 平移方向 2），五点法（Nistér 2004）最少用 5 对点；八点法把 $E$ 的 9 个元素当线性未知量，要 8 对。从 $E$ 分解出 4 组 $(R,\mathbf{t})$，选让点在两个相机前方的那组。</p></li>
+  </ol>
+  <p>场景接近平面或纯旋转时 $E$ 退化，要改用单应矩阵 $H$；ORB-SLAM 的单目初始化同时算单应和基础矩阵，按得分选一个。</p>
+
+  <h3>三角化</h3>
+  <p>已知两帧位姿和一对匹配，求 3D 点。线性法（DLT）：每个视图给 $\hat{\mathbf{x}}\times(R\mathbf{X}+\mathbf{t})=\mathbf{0}$ 中的两个独立方程，两视图共 4 个方程、3 个未知数，用 SVD 求最小二乘解。精度取决于两条射线的夹角（视差）。双目里深度和视差 $d$ 的关系：</p>
+  <div class="eq">$$z=\frac{fb}{d}\quad\Rightarrow\quad|\delta z|\approx\Big|\frac{\partial z}{\partial d}\Big|\,|\delta d|=\frac{z^2}{fb}\,|\delta d|$$</div>
+  <p>例：$f=600$ px、基线 $b=0.1$ m，视差误差 1 px 时，$z=2$ m 处深度误差约 0.067 m，$z=4$ m 处约 0.27 m。</p>
+
+  <figure class="viz" id="viz-tri">
+    <div class="viz-h"><b>两条射线的交点：基线、像素噪声和尺度</b><span>俯视的二维世界 · 一维相机 f = 200 px · 单位：m</span></div>
+    <div class="viz-stage"><canvas id="cv-tri" aria-label="两个一维相机、射线及三角化的不确定区域"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="sl-tri-b">基线 b <input type="range" id="sl-tri-b" min="0.05" max="1.5" step="0.01" value="0.3"><output id="o-tri-b">0.30</output></label>
+      <label for="sl-tri-n">像素噪声 σ <input type="range" id="sl-tri-n" min="0.25" max="4" step="0.25" value="2"><output id="o-tri-n">2.00</output></label>
+      <label for="sl-tri-s">整体尺度 s <input type="range" id="sl-tri-s" min="0.5" max="2" step="0.01" value="1"><output id="o-tri-s">1.00</output></label>
+    </div>
+    <div class="viz-read" id="rd-tri"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>相机 1</li><li><i style="background:var(--c2)"></i>相机 2</li><li><i style="background:var(--c4)"></i>±σ 像素内所有可能的交点</li><li><i style="background:var(--ink)"></i>真实点（可拖动）</li></ul>
+    <figcaption>每个相机把点测成一个像素 $u$，真实射线在 $u\pm\sigma$ 之间，两束射线相交成一个四边形。它沿深度方向又细又长：深度误差按 $z^2/(fb)$ 增长，加大基线就缩短。拖尺度 $s$：基线和点一起放大，图下两个一维图像上的像素位置完全不变，单目相机分辨不出 $s$。</figcaption>
+  </figure>
+
+  <h3>PnP：已知地图点求当前位姿</h3>
+  <p class="def"><b>PnP</b>（Perspective-n-Point）：已知 $n$ 个 3D 点 $\mathbf{m}_j$ 和它们在当前图像里的像素 $\mathbf{u}_j$，求相机位姿 $T=(R,\mathbf{t})$。这是跟踪阶段每一帧要做的事。</p>
+  <div class="eq">$$T^\star=\arg\min_{T}\sum_j\big\|\mathbf{u}_j-\pi\big(K(R\,\mathbf{m}_j+\mathbf{t})\big)\big\|^2,\qquad \pi([x,y,z]^\top)=[x/z,\ y/z]^\top$$</div>
+  <p>括号里的差叫<b>重投影误差</b>，单位是像素。流程：P3P（3 个点，最多 4 个解）或 EPnP 放进 RANSAC 得到初值和内点，再对所有内点用 Gauss–Newton / LM 最小化重投影误差。下图是一个平面版：相机在平面上有 $(x,y,\theta)$ 三个自由度，图像是一维的。</p>
+
+  <figure class="viz" id="viz-pnp">
+    <div class="viz-h"><b>重投影误差与 LM 迭代：平面上的 PnP</b><span>拖动蓝色相机或它前方的手柄 · 单位：m，像素</span></div>
+    <div class="viz-stage"><canvas id="cv-pnp" aria-label="俯视图中的路标、真实相机和估计相机，下方是一维图像上的观测和重投影"></canvas></div>
+    <div class="viz-ctrl">
+      <button type="button" class="btn" id="bt-pnp-step">LM 一步</button>
+      <button type="button" class="btn ghost" id="bt-pnp-run">迭代到收敛</button>
+      <button type="button" class="btn ghost" id="bt-pnp-reset">换一个初值</button>
+      <label for="sl-pnp-n">观测噪声 σ <input type="range" id="sl-pnp-n" min="0" max="6" step="0.5" value="1.5"><output id="o-pnp-n">1.5</output></label>
+    </div>
+    <div class="viz-read" id="rd-pnp"></div>
+    <ul class="chips"><li><i style="background:var(--muted)"></i>真实相机</li><li><i style="background:var(--c1)"></i>估计相机与它的重投影</li><li><i style="background:var(--c2)"></i>实测像素</li><li><i style="background:var(--bad)"></i>重投影误差</li><li><i style="background:var(--c3)"></i>地图点</li></ul>
+    <figcaption>下方的条是一维图像（0–600 px）。橙点是真实相机测到的像素（带噪声），蓝色竖线是按当前估计位姿把地图点投过去的位置，红线是两者之差。每按一次，用数值雅可比 $J$ 解 $(J^\top J+\lambda\,\mathrm{diag}(J^\top J))\boldsymbol\delta=J^\top\mathbf{r}$；代价没下降就拒绝并增大 $\lambda$。这里四个初值都能收敛到同一个位姿，残差 RMS 和观测噪声同量级。把相机拖到地图点中间，跑到它背后的点不能用（「可用观测」变少），初值差到一定程度 LM 就可能停在局部极小，所以实际系统先用 RANSAC + P3P 给初值。</figcaption>
+  </figure>
+</section>
+
+<section id="direct">
+  <h2 data-toc="直接法">直接法与特征点法</h2>
+  <p class="def"><b>直接法</b>（LSD-SLAM、DSO、SVO 的跟踪部分）不提特征、不做匹配，直接最小化<b>光度误差</b>：把参考帧像素 $\mathbf{p}$ 按它的逆深度 $\rho_{\mathbf{p}}$ 和待估位姿 $T$ 投到当前帧，要求亮度相同。</p>
+  <div class="eq">$$E_{\text{photo}}(T)=\sum_{\mathbf{p}}\rho_{\text{Huber}}\Big(I_2\big(\pi(T\,\pi^{-1}(\mathbf{p},\rho_{\mathbf{p}}))\big)-\big(a\,I_1(\mathbf{p})+b\big)\Big)$$</div>
+  <p>$a,b$ 是两帧之间的仿射亮度变化（曝光），DSO 把它们和位姿、逆深度一起估计。雅可比里出现图像梯度 $\nabla I_2$，所以只有在梯度大的像素（边缘、纹理）上才有信息；这些像素可以远多于角点，弱纹理场景也能用。</p>
+  <div class="tbl"><table>
+    <thead><tr><th></th><th>特征点法（ORB-SLAM）</th><th>直接法（DSO）</th></tr></thead>
+    <tbody>
+      <tr><td>残差</td><td>重投影误差（像素）</td><td>光度误差（灰度）</td></tr>
+      <tr><td>用到的像素</td><td>几百到上千个角点</td><td>所有梯度够大的像素</td></tr>
+      <tr><td>收敛域</td><td>大：匹配给出了对应关系</td><td>小：初值要在约一两个像素内，靠图像金字塔由粗到细</td></tr>
+      <tr><td>对光照</td><td>描述子较鲁棒</td><td>要光度标定 + 仿射亮度模型</td></tr>
+      <tr><td>回环 / 重定位</td><td>描述子可直接用于词袋检索</td><td>没有描述子，回环要另外提特征</td></tr>
+    </tbody>
+  </table></div>
+  <figure class="viz" id="viz-photo">
+    <div class="viz-h"><b>一维光度对齐：收敛域和图像金字塔</b><span>真实平移 t* = 9 px</span></div>
+    <div class="viz-stage"><canvas id="cv-photo" aria-label="两条亮度曲线和光度误差随平移的变化曲线"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="sl-ph-t0">初值 t₀ <input type="range" id="sl-ph-t0" min="-25" max="35" step="0.5" value="-2"><output id="o-ph-t0">-2.0</output></label>
+      <div class="seg" id="sg-ph-lv"><button type="button" data-v="0" aria-pressed="true">原图</button><button type="button" data-v="1">模糊 σ=3</button><button type="button" data-v="2">σ=6</button><button type="button" data-v="3">σ=12</button></div>
+      <button type="button" class="btn" id="bt-ph-gn">在当前层迭代</button>
+      <button type="button" class="btn ghost" id="bt-ph-pyr">由粗到细</button>
+      <label for="sl-ph-a">曝光变化 <input type="range" id="sl-ph-a" min="0" max="0.6" step="0.05" value="0"><output id="o-ph-a">0.00</output></label>
+      <div class="seg" id="sg-ph-aff"><button type="button" data-v="0" aria-pressed="true">只估 t</button><button type="button" data-v="1">同时估 a、b</button></div>
+    </div>
+    <div class="viz-read" id="rd-ph"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>参考帧 $I_1$（经仿射校正）</li><li><i style="background:var(--c2)"></i>当前帧 $I_2$ 按当前 $\hat t$ 平移回来</li><li><i style="background:var(--ink-2)"></i>当前层的光度误差 $E(t)$</li><li><i style="background:var(--c4)"></i>Gauss–Newton 迭代轨迹</li></ul>
+    <figcaption>原图上光度误差有很多局部极小：这条纹理的特征宽度 1–3 px，从 $t_0$ 出发的 Gauss–Newton 只有在 $|t_0-t^*|$ 小于约 6 px 时才收敛到真值，默认的 $t_0=-2$ 停在了别的坑里。模糊后的那层曲线变宽变平滑，收敛域变大但最小值不尖；「由粗到细」先在 σ=12 上迭代，再逐层用上一层的结果做初值。把曝光变化调大：只估 $t$ 时最小值不再为 0，估计也会偏；同时估 $a,b$ 才对得上。</figcaption>
+  </figure>
+  <p>学习式前端（DROID-SLAM、DPVO）介于两者之间：网络预测稠密或成块的光流作为「对应关系」，再交给一个可微的 BA 层，把光流换成位姿和深度。</p>
+</section>
+
+<section id="backend">
+  <h2 data-toc="后端：因子图与 BA">后端：滤波、因子图与 BA</h2>
+  <h3>滤波还是优化</h3>
+  <ul>
+    <li><b>EKF-SLAM</b>（MonoSLAM 2007）：状态 = 当前位姿 + 全部路标，维护均值和一个满的协方差矩阵。$n$ 个路标时存储和每次更新都是 $O(n^2)$；每个观测只在当时的估计处线性化一次，误差被「冻」进协方差，不能再纠正。</li>
+    <li><b>MSCKF</b>（2007）：状态里放一段相机位姿的滑动窗口，路标被边缘化掉，不进状态；常用于计算受限的 VIO。</li>
+    <li><b>关键帧 + 优化</b>（PTAM 2007 起）：保留一部分关键帧和点，反复重新线性化地求解。Strasdat et al.（ICRA 2010）的对比结论：在相同计算量下，关键帧 BA 的精度高于滤波，因为它能用多得多的特征。现在的主流系统（ORB-SLAM、VINS、LIO-SAM）都属于这一类。</li>
+    <li><b>滑动窗口</b>：只优化最近 $N$ 帧；滑出窗口的变量用 Schur 补<b>边缘化</b>成一个先验因子，而不是直接丢掉。</li>
+  </ul>
+
+  <h3>光束法平差（Bundle Adjustment）</h3>
+  <p class="def"><b>BA</b>：同时优化所有相机位姿和所有 3D 点，使全部重投影误差最小。名字来自每个 3D 点射向各相机的「光束」。</p>
+  <table class="notation">
+    <caption>记号</caption>
+    <thead><tr><th>符号</th><th>含义</th><th>形状</th></tr></thead>
+    <tbody>
+      <tr><td>$n_c,\ n_p$</td><td>相机（关键帧）数、点数</td><td>标量</td></tr>
+      <tr><td>$T_i$，$\mathbf{m}_j$</td><td>第 $i$ 个相机位姿、第 $j$ 个点</td><td>6 自由度；$\mathbb{R}^3$</td></tr>
+      <tr><td>$\mathcal{V}$</td><td>可见性：相机 $i$ 看到点 $j$ 的 $(i,j)$ 对</td><td>集合</td></tr>
+      <tr><td>$\mathbf{u}_{ij}$</td><td>点 $j$ 在相机 $i$ 里的观测像素</td><td>$\mathbb{R}^2$</td></tr>
+      <tr><td>$\boldsymbol\delta_c,\ \boldsymbol\delta_p$</td><td>所有相机、所有点的增量</td><td>$6n_c$；$3n_p$</td></tr>
+      <tr><td>$B,\ C,\ E$</td><td>$H$ 的相机–相机、点–点、相机–点块</td><td>$6n_c\times6n_c$；$3n_p\times3n_p$；$6n_c\times3n_p$</td></tr>
+      <tr><td>$S$</td><td>Schur 补（约化相机系统）</td><td>$6n_c\times6n_c$</td></tr>
+    </tbody>
+  </table>
+  <div class="eq">$$\min_{\{T_i\},\{\mathbf{m}_j\}}\sum_{(i,j)\in\mathcal{V}}\rho\Big(\big\|\mathbf{u}_{ij}-\pi\big(K\,T_i\,\mathbf{m}_j\big)\big\|^2_{\Sigma_{ij}}\Big)$$</div>
+  <ol class="derive">
+    <li><p>残差 $\mathbf{e}_{ij}$ 只依赖 $T_i$ 和 $\mathbf{m}_j$，所以雅可比的这一行（2 行）只有两个非零块：</p>$$J_{ij}=\big[\ 0\ \cdots\ \underbrace{A_{ij}}_{2\times6,\ \text{第 }i\text{ 个相机}}\ \cdots\ 0\ \cdots\ \underbrace{P_{ij}}_{2\times3,\ \text{第 }j\text{ 个点}}\ \cdots\ 0\ \big]$$</li>
+    <li><p>把变量按「先相机、后点」排，$H=\sum J_{ij}^\top\Omega_{ij}J_{ij}$ 分成四块。$B$ 和 $C$ 都是块对角（没有相机–相机、点–点的直接因子）；$E$ 的块 $(i,j)$ 非零当且仅当 $(i,j)\in\mathcal{V}$：</p>$$\begin{bmatrix}B & E\\ E^\top & C\end{bmatrix}\begin{bmatrix}\boldsymbol\delta_c\\ \boldsymbol\delta_p\end{bmatrix}=\begin{bmatrix}\mathbf{v}\\ \mathbf{w}\end{bmatrix}$$</li>
+    <li><p>第二行解出点的增量。$C$ 是 $n_p$ 个 $3\times3$ 块，求逆是 $O(n_p)$：</p>$$\boldsymbol\delta_p=C^{-1}\big(\mathbf{w}-E^\top\boldsymbol\delta_c\big)$$</li>
+    <li><p>代入第一行，消掉所有点，只剩相机：</p>$$\underbrace{\big(B-E\,C^{-1}E^\top\big)}_{S}\,\boldsymbol\delta_c=\mathbf{v}-E\,C^{-1}\mathbf{w}$$</li>
+    <li><p>$S$ 的块 $(i,k)=B_{ik}-\sum_jE_{ij}C_j^{-1}E_{kj}^\top$，非零当且仅当相机 $i$ 和 $k$ 共同看到至少一个点。先解这个 $6n_c$ 维的小系统，再回代第 3 步求每个点。</p></li>
+    <li><p>规模：10 个关键帧、2000 个点，完整系统 $6\cdot10+3\cdot2000=6060$ 维，Schur 之后只有 60 维。BA 能实时跑，靠的就是点远多于相机且点之间互不相连。</p></li>
+  </ol>
+  <figure class="viz" id="viz-ba">
+    <div class="viz-h"><b>BA 的稀疏结构：$J$、$H$ 和 Schur 补 $S$</b><span>一格 = 一个标量 · 点击 $J$ 的一行</span></div>
+    <div class="viz-stage"><canvas id="cv-ba" aria-label="雅可比、海森矩阵和 Schur 补的稀疏图案"></canvas></div>
+    <div class="viz-ctrl">
+      <label for="sl-ba-c">相机数 <input type="range" id="sl-ba-c" min="3" max="8" step="1" value="5"><output id="o-ba-c">5</output></label>
+      <label for="sl-ba-p">点数 <input type="range" id="sl-ba-p" min="4" max="20" step="1" value="10"><output id="o-ba-p">10</output></label>
+      <label for="sl-ba-w">每个点被几个相机看到 <input type="range" id="sl-ba-w" min="1" max="8" step="1" value="2"><output id="o-ba-w">2</output></label>
+    </div>
+    <div class="viz-read" id="rd-ba"></div>
+    <ul class="chips"><li><i style="background:var(--c1)"></i>相机相关块（$A_{ij}$、$B$）</li><li><i style="background:var(--c3)"></i>点相关块（$P_{ij}$、$C$）</li><li><i style="background:var(--c2)"></i>相机–点耦合 $E$</li><li><i style="background:var(--c4)"></i>Schur 补 $S$</li><li><i style="background:var(--ink)"></i>选中的观测</li></ul>
+    <figcaption>点沿一条走廊排开，相邻的几个相机能看到同一个点。$J$ 每两行一个观测，只有两个非零块；$H$ 的右下角 $C$ 永远是块对角，所以能便宜地消掉；$S$ 只在「共视」的相机之间非零。把「每个点被几个相机看到」调到最大，$S$ 变成满的，但仍只有 $6n_c$ 维。选中的观测在 $H$ 里贡献了 $B_{ii}$、$C_{jj}$ 和 $E_{ij}$ 三块。</figcaption>
+  </figure>
+</section>
+
+<section id="loop">
+  <h2 data-toc="回环与位姿图">回环检测与位姿图优化</h2>
+  <h3>回环检测（place recognition）</h3>
+  <ul>
+    <li><b>词袋</b>（Bag of Words）：离线把大量描述子分层 k-means 聚类成一棵词汇树；一张图的每个描述子沿树走到一个叶子（视觉单词），图像表示成 tf-idf 加权的单词直方图。倒排索引只比较共享单词的历史关键帧。DBoW2（Gálvez-López &amp; Tardós, T-RO 2012）针对二进制描述子，ORB-SLAM 和 VINS-Mono 都用它。</li>
+    <li><b>学习式全局描述子</b>：NetVLAD（CVPR 2016）等直接输出一张图的全局向量，用最近邻检索；VGGT-SLAM 用 SALAD 检索。</li>
+    <li><b>几何验证</b>：检索只给候选，必须再用特征匹配 + RANSAC 算出相对位姿（单目是 Sim(3)，带尺度），内点够多才接受。错误回环会把地图扭坏，所以宁可漏掉。</li>
+  </ul>
+  <h3>位姿图优化</h3>
+  <p class="def"><b>位姿图</b>：只保留位姿变量，点被边缘化掉；边是相对位姿测量 $Z_{ij}$（来自里程计或回环）。比完整 BA 小得多，回环时先用它把漂移摊开，再视需要做全局 BA。</p>
+  <div class="eq">$$\min_{\{T_i\}}\sum_{(i,j)}\rho\big(\mathbf{e}_{ij}^\top\Omega_{ij}\mathbf{e}_{ij}\big),\qquad \mathbf{e}_{ij}=\mathrm{Log}\big(Z_{ij}^{-1}\,T_i^{-1}T_j\big)\in\mathbb{R}^6$$</div>
+  <p>平面情形（下图）$T=(x,y,\theta)$，$R_i$ 是 $\theta_i$ 的旋转矩阵，$Z_{ij}=(\mathbf{t}_z,\theta_z)$：</p>
+  <div class="eq">$$\mathbf{e}_{ij}=\begin{bmatrix}R_z^\top\big(R_i^\top(\mathbf{t}_j-\mathbf{t}_i)-\mathbf{t}_z\big)\\ \theta_j-\theta_i-\theta_z\end{bmatrix},\quad \frac{\partial\mathbf{e}}{\partial\mathbf{x}_i}=\begin{bmatrix}-R_z^\top R_i^\top & R_z^\top\frac{\partial R_i^\top}{\partial\theta_i}(\mathbf{t}_j-\mathbf{t}_i)\\ \mathbf{0}^\top & -1\end{bmatrix},\quad \frac{\partial\mathbf{e}}{\partial\mathbf{x}_j}=\begin{bmatrix}R_z^\top R_i^\top & \mathbf{0}\\ \mathbf{0}^\top & 1\end{bmatrix}$$</div>
+  <p>单目系统用 Sim(3) 位姿图（多一个尺度，纠正尺度漂移，ORB-SLAM、LSD-SLAM）；VIO 用 4 自由度位姿图（VINS-Mono）。</p>
+
+  <figure class="viz" id="viz-pg">
+    <div class="viz-h"><b>开一圈回到起点：里程计漂移，回环后 Gauss–Newton 拉回来</b><span>111 个位姿 · 步长 0.25 m · 单位：m</span></div>
+    <div class="viz-stage"><canvas id="cv-pg" aria-label="真实轨迹、里程计轨迹、回环约束和优化后的轨迹"></canvas></div>
+    <div class="viz-ctrl">
+      <button type="button" class="btn ghost" id="bt-pg-drive">行驶</button>
+      <button type="button" class="btn" id="bt-pg-opt">优化（Gauss–Newton）</button>
+      <button type="button" class="btn ghost" id="bt-pg-reset">回到优化前</button>
+      <button type="button" class="btn ghost" id="bt-pg-seed">换一组噪声</button>
+      <div class="seg" id="sg-pg-loop"><button type="button" data-v="none">不加回环</button><button type="button" data-v="good" aria-pressed="true">正确回环</button><button type="button" data-v="bad">+1 条错误回环</button></div>
+      <div class="seg" id="sg-pg-rob"><button type="button" data-v="l2" aria-pressed="true">平方损失</button><button type="button" data-v="cauchy">Cauchy 核</button></div>
+      <label for="sl-pg-th">里程计航向噪声 <input type="range" id="sl-pg-th" min="0" max="2.5" step="0.1" value="1"><output id="o-pg-th">1.0°</output></label>
+    </div>
+    <div class="viz-read" id="rd-pg"></div>
+    <ul class="chips"><li><i style="background:var(--muted)"></i>真实轨迹</li><li><i style="background:var(--c2)"></i>只积分里程计</li><li><i style="background:var(--c1)"></i>当前估计</li><li><i style="background:var(--c5)"></i>回环约束</li><li><i style="background:var(--bad)"></i>错误回环</li></ul>
+    <figcaption>每步里程计的航向带 1° 量级的随机误差和 0.35° 的系统偏差，积分一圈后终点偏出米级。回到起点附近时，场景识别给出 5 条「这里来过」的约束（$\sigma$ = 4 cm、0.6°）。按「优化」后每 0.3 s 做一次 Gauss–Newton 迭代（稠密 Cholesky 解 $333\times333$ 的正规方程），通常 3 次内收敛。剩下的误差在中段：回环只约束了首尾，中间的漂移被平均摊开。选「+1 条错误回环」再用平方损失，整个地图会被拉歪；换成 Cauchy 核，这条边的权重降到很小。</figcaption>
+  </figure>
+
+  <figure class="viz" id="viz-fg">
+    <div class="viz-h"><b>同一个问题的因子图和 $H$ 的稀疏结构</b><span>移动指针或点击一个因子</span></div>
+    <div class="viz-stage"><canvas id="cv-fg" aria-label="位姿节点、里程计因子、回环因子以及对应的 H 矩阵块"></canvas></div>
+    <div class="viz-ctrl">
+      <div class="seg" id="sg-fg"><button type="button" data-v="H" aria-pressed="true">$H$ 的非零块</button><button type="button" data-v="L">Cholesky 因子 $L$（按时间顺序消元）</button></div>
+    </div>
+    <div class="viz-read" id="rd-fg"></div>
+    <ul class="chips"><li><i style="background:var(--ink-2)"></i>位姿变量</li><li><i style="background:var(--c2)"></i>里程计因子</li><li><i style="background:var(--c5)"></i>回环因子</li><li><i style="background:var(--c6)"></i>先验因子（固定第一帧）</li><li><i style="background:var(--c4)"></i>消元产生的填充</li></ul>
+    <figcaption>矩阵里每格是一个 $3\times3$ 块。里程计因子只连相邻两帧，在 $H$ 上是三对角带；每条回环因子在远离对角线的位置加一对对称块。按时间顺序做 Cholesky 时，回环会在 $L$ 里产生一整片填充；实际求解器（g2o、GTSAM）先用 COLAMD 一类的排序减少填充，iSAM2 用 Bayes 树做增量更新。</figcaption>
+  </figure>
+</section>
+
+<section id="history">
+  <h2 data-toc="里程碑">里程碑</h2>
+  <div class="tbl wide"><table>
+    <thead><tr><th>年份</th><th>系统</th><th>发表</th><th>传感器</th><th>带来了什么</th></tr></thead>
+    <tbody>
+      <tr><td class="yr">2007</td><td>MonoSLAM</td><td>TPAMI 2007</td><td>单目</td><td>第一个实时单目 SLAM：EKF 估计相机 + 稀疏路标</td></tr>
+      <tr><td class="yr">2007</td><td>MSCKF</td><td>ICRA 2007</td><td>单目 + IMU</td><td>滤波式 VIO：状态里放相机位姿窗口，特征不进状态</td></tr>
+      <tr><td class="yr">2007</td><td>PTAM</td><td>ISMAR 2007</td><td>单目</td><td>跟踪与建图分成两个线程；关键帧 + BA</td></tr>
+      <tr><td class="yr">2011</td><td>KinectFusion</td><td>ISMAR 2011</td><td>RGB-D</td><td>GPU 上的 TSDF 融合 + ICP 帧到模型跟踪</td></tr>
+      <tr><td class="yr">2011</td><td>DTAM</td><td>ICCV 2011</td><td>单目</td><td>稠密直接法跟踪与建图</td></tr>
+      <tr><td class="yr">2012</td><td>DBoW2</td><td>T-RO 2012</td><td>—</td><td>二进制描述子的词袋回环检测</td></tr>
+      <tr><td class="yr">2014</td><td>LSD-SLAM</td><td>ECCV 2014</td><td>单目</td><td>半稠密直接法 + Sim(3) 位姿图</td></tr>
+      <tr><td class="yr">2014</td><td>SVO</td><td>ICRA 2014</td><td>单目</td><td>半直接法，极快的 VO</td></tr>
+      <tr><td class="yr">2014</td><td>LOAM</td><td>RSS 2014</td><td>激光</td><td>边缘 / 平面特征；高频里程计 + 低频建图</td></tr>
+      <tr><td class="yr">2015</td><td>ORB-SLAM</td><td>T-RO 2015</td><td>单目</td><td>ORB 贯穿跟踪、建图、回环；共视图</td></tr>
+      <tr><td class="yr">2015</td><td>OKVIS</td><td>IJRR 2015</td><td>双目 + IMU</td><td>关键帧紧耦合 VIO 优化 + 边缘化</td></tr>
+      <tr><td class="yr">2015</td><td>ElasticFusion</td><td>RSS 2015</td><td>RGB-D</td><td>面元地图；回环时让地图非刚性形变</td></tr>
+      <tr><td class="yr">2016</td><td>Cartographer</td><td>ICRA 2016</td><td>2D / 3D 激光</td><td>子图 + 分支定界扫描匹配，实时回环</td></tr>
+      <tr><td class="yr">2017</td><td>ORB-SLAM2</td><td>T-RO 2017</td><td>单目 / 双目 / RGB-D</td><td>开源的多传感器版本</td></tr>
+      <tr><td class="yr">2018</td><td>DSO</td><td>TPAMI 2018</td><td>单目</td><td>稀疏直接法，联合估计光度标定、位姿、逆深度</td></tr>
+      <tr><td class="yr">2018</td><td>VINS-Mono</td><td>T-RO 2018</td><td>单目 + IMU</td><td>预积分滑窗 VIO、鲁棒初始化、4 自由度位姿图</td></tr>
+      <tr><td class="yr">2020</td><td>LIO-SAM</td><td>IROS 2020</td><td>激光 + IMU (+GPS)</td><td>iSAM2 因子图融合激光、IMU 预积分、GPS、回环</td></tr>
+      <tr><td class="yr">2021</td><td>ORB-SLAM3</td><td>T-RO 2021</td><td>单目 / 双目 / RGB-D ± IMU</td><td>紧耦合视觉惯性 MAP；Atlas 多地图合并</td></tr>
+      <tr><td class="yr">2021</td><td>iMAP</td><td>ICCV 2021</td><td>RGB-D</td><td>一个 MLP 就是整张地图的实时 SLAM</td></tr>
+      <tr><td class="yr">2021</td><td>DROID-SLAM</td><td>NeurIPS 2021</td><td>单目 / 双目 / RGB-D</td><td>循环光流更新 + 可微稠密 BA 层</td></tr>
+      <tr><td class="yr">2022</td><td>NICE-SLAM</td><td>CVPR 2022</td><td>RGB-D</td><td>分层特征网格 + 预训练解码器</td></tr>
+      <tr><td class="yr">2022</td><td>FAST-LIO2</td><td>T-RO 2022</td><td>激光 + IMU</td><td>迭代 EKF 直接配准原始点到 ikd-Tree 地图</td></tr>
+      <tr><td class="yr">2023</td><td>DPVO</td><td>NeurIPS 2023</td><td>单目</td><td>稀疏块的深度 VO，比 DROID 省内存、快</td></tr>
+      <tr><td class="yr">2024</td><td>SplaTAM / MonoGS</td><td>CVPR 2024</td><td>RGB-D / 单目</td><td>3D 高斯作为地图，用可微渲染同时跟踪和建图</td></tr>
+      <tr><td class="yr">2025</td><td>MASt3R-SLAM</td><td>CVPR 2025</td><td>单目（可不标定）</td><td>用 MASt3R 双视图点图做前端的稠密 SLAM</td></tr>
+      <tr><td class="yr">2025</td><td>VGGT-SLAM</td><td>NeurIPS 2025</td><td>单目（未标定）</td><td>VGGT 子图在 SL(4) 上对齐</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="recent">
+  <h2 data-toc="近年进展">近年进展（截至 2026-11）</h2>
+  <p>2025 年以后视觉 SLAM 的主线：前端不再自己学特征或光流，而是直接调用一个预训练的前馈 3D 重建模型（DUSt3R / MASt3R / VGGT 一系，见 <a href="../3d-foundation-models/">3D 基础模型</a>），它一次输出几帧的点图和相对位姿；论文的贡献集中在后端：用什么变换群对齐子图、怎样做回环检索和验证、怎样接 IMU 拿到度量尺度。</p>
+  <div class="tbl wide"><table>
+    <thead><tr><th>工作</th><th>发表</th><th>做法</th></tr></thead>
+    <tbody>
+      <tr><td>MASt3R-SLAM（Murai, Dexheimer, Davison）</td><td>CVPR 2025</td><td>每个新帧和关键帧过一次 MASt3R 得到点图和匹配，融合成每关键帧的点图；只假设单一投影中心，不要求参数化相机模型；有回环和全局优化，约 15 FPS。</td></tr>
+      <tr><td>SLAM3R、CUT3R、MegaSaM</td><td>CVPR 2025</td><td>SLAM3R 在滑窗里前馈回归点图再用网络配准（4090D 上 20+ FPS）；CUT3R 是带持久状态的循环模型，在线输出公共坐标系下的点图；MegaSaM 用 DROID 式可微 BA 加单目深度先验，处理随手拍的动态视频。</td></tr>
+      <tr><td>VGGT-SLAM（Maggio, Lim, Carlone）</td><td>NeurIPS 2025</td><td>VGGT 一次处理一段子图；未标定时子图之间差一个 15 自由度射影变换，在 SL(4) 流形上优化。</td></tr>
+      <tr><td>VGGT-SLAM 2.0（Maggio, Carlone）</td><td>RSS 2026</td><td>改用关键帧因子图，消除 15 维漂移和平面退化；用 VGGT 的注意力层免训练地验证回环；TUM 上位姿误差比 v1 低约 23%，在地面机器人的 Jetson Thor 上在线运行。</td></tr>
+      <tr><td>VGGT-Long</td><td>ICRA 2026</td><td>分块跑 VGGT，重叠区域对齐 + 轻量回环；不标定、不重训，跑公里级的 KITTI / Waymo 序列。</td></tr>
+      <tr><td>AMB3R（Wang, Agapito）</td><td>CVPR 2026</td><td>冻结的 VGGT 前端 + 度量尺度头 + 稀疏体素后端；只训练多视图重建，不微调就能做未标定的在线 VO 和大规模 SfM。</td></tr>
+      <tr><td>SLAM-Former</td><td>ECCV 2026</td><td>把前端（增量跟踪建图）和后端（全局细化）放进同一个 Transformer。</td></tr>
+      <tr><td>流式 3D 基础模型</td><td>ICLR 2026 等</td><td>StreamVGGT（因果注意力 + KV cache）、π³（不依赖参考帧）、TTT3R 等让前馈模型能处理长视频，正在替代「分块 + 对齐」。</td></tr>
+      <tr><td>带回环的 3DGS SLAM</td><td>3DV 2025 等</td><td>LoopSplat 用高斯子图之间的配准做回环边；SplaTAM / MonoGS 原版没有回环。</td></tr>
+      <tr><td>激光 / LIO</td><td>IROS 2025、RA-L 2026</td><td>方向是少调参、抗退化：KISS-SLAM（几乎零调参的纯激光 SLAM）、RKO-LIO（只需 IMU–激光外参）。</td></tr>
+    </tbody>
+  </table></div>
+  <p>2026 年下半年 arXiv 上还有一批预印本，比如把 IMU 因子图接到基础模型 SLAM 上恢复度量尺度的 FoundationVIO（arXiv:2610.14951），以及声称能在单张消费级显卡上跑上万帧、公里级序列的 AMB3R-SLAM（arXiv:2609.19518），截至 2026-11 还没有正式发表。</p>
+  <div class="note"><b>对机器人学习的意义</b><p>这一类系统只要 RGB 视频、不要求标定，就能给出相机轨迹和稠密几何，适合从手持采集或第一视角视频里恢复轨迹和场景。但它们给的尺度通常不是米制（除非接 IMU、深度或度量尺度头），速度在高端 GPU 上约每秒几帧到十几帧，部署前要确认尺度和延迟是否满足需求。</p></div>
+</section>
+
+<section id="systems">
+  <h2 data-toc="开源系统对照">开源系统对照</h2>
+  <div class="tbl wide"><table>
+    <thead><tr><th>系统</th><th>传感器</th><th>地图</th><th>实时性（论文声称）</th><th>回环</th><th>许可证</th></tr></thead>
+    <tbody>
+      <tr><td>ORB-SLAM3</td><td>单目 / 双目 / RGB-D，可加 IMU；针孔与鱼眼</td><td>稀疏 ORB 点 + 关键帧；多地图</td><td>纯 CPU（i7-7700）实时</td><td>是（DBoW2）+ 地图合并</td><td>GPLv3</td></tr>
+      <tr><td>VINS-Mono / Fusion</td><td>单目 + IMU；Fusion 加双目、GPS</td><td>滑窗稀疏特征 + 位姿图</td><td>CPU 实时，可在无人机机载电脑上跑</td><td>是（4 自由度位姿图）</td><td>GPLv3</td></tr>
+      <tr><td>DSO</td><td>单目</td><td>稀疏直接点</td><td>笔记本 CPU 实时</td><td>否（LDSO 补上）</td><td>GPLv3</td></tr>
+      <tr><td>LIO-SAM</td><td>3D 激光 + 9 轴 IMU（+GPS）</td><td>关键帧的边 / 面特征点云</td><td>笔记本 CPU，最高约 13 倍实时</td><td>是</td><td>BSD-3</td></tr>
+      <tr><td>FAST-LIO2</td><td>激光（旋转或固态）+ IMU</td><td>ikd-Tree 里的原始点</td><td>最高 100 Hz，ARM 板上也能跑</td><td>否（只做里程计和建图）</td><td>GPLv2</td></tr>
+      <tr><td>Cartographer</td><td>2D / 3D 激光、IMU、轮速计</td><td>概率栅格子图</td><td>工作站上约 5 倍实时</td><td>是（分支定界扫描匹配）</td><td>Apache-2.0</td></tr>
+      <tr><td>ElasticFusion</td><td>RGB-D</td><td>稠密面元</td><td>GTX 780 Ti 上平均 31 ms / 帧</td><td>是（地图形变）</td><td>非商用</td></tr>
+      <tr><td>DROID-SLAM</td><td>单目 / 双目 / RGB-D</td><td>关键帧稠密逆深度</td><td>2 张 RTX 3090，EuRoC 平均 20 FPS</td><td>是（全局 BA）</td><td>BSD-3</td></tr>
+      <tr><td>SplaTAM</td><td>RGB-D</td><td>3D 高斯</td><td>否：RTX 3080 Ti 上每帧约 2.4 s</td><td>否</td><td>BSD-3</td></tr>
+      <tr><td>MonoGS</td><td>单目 / 双目 / RGB-D</td><td>3D 高斯</td><td>RTX 4090 上约 3 FPS</td><td>否</td><td>非商用</td></tr>
+      <tr><td>MASt3R-SLAM</td><td>单目 RGB，可不标定</td><td>每关键帧的稠密点图</td><td>RTX 4090 上约 15 FPS</td><td>是</td><td>CC BY-NC-SA</td></tr>
+      <tr><td>VGGT-SLAM (2.0)</td><td>单目 RGB，未标定</td><td>VGGT 子图的稠密点图</td><td>v2：RTX 3090 上 8.4 FPS</td><td>是</td><td>BSD-2</td></tr>
+    </tbody>
+  </table></div>
+  <p>表中速度来自各自论文、各自硬件，不能直接横比：同一个 MASt3R-SLAM，在原文的 4090 上约 15 FPS，在 VGGT-SLAM 2.0 论文的 3090 上测得 7.2 FPS。</p>
+</section>
+
+<section id="quiz">
+  <h2>自测</h2>
+  <details class="q"><summary>只用单目相机跑了一圈回到起点，回环时为什么要在 Sim(3) 而不是 SE(3) 上优化？</summary><div><p>单目的尺度不可观，一圈下来不仅位置和朝向漂了，尺度也漂了。SE(3) 位姿图只能修正 6 个自由度，Sim(3) 多一个尺度，才能把首尾的尺度差也摊开。</p></div></details>
+  <details class="q"><summary>BA 有 10 个关键帧、2000 个点，正规方程多少维？Schur 补之后多少维？</summary><div><p>$6\times10+3\times2000=6060$ 维；消掉点之后只剩相机，60 维。点的块 $C$ 是块对角，求逆是线性代价。</p></div></details>
+  <details class="q"><summary>为什么一条错误回环比漏掉一条正确回环更危险？鲁棒核怎样缓解？</summary><div><p>漏掉回环只是少消一点漂移；错误回环是一个几十个标准差的约束，平方损失下它会把整张地图拉歪。鲁棒核让大残差的权重变成 $w=\rho'(s)$，Cauchy 核下约为 $c^2/s$，错误边的影响随残差增大而减小。但它不能代替几何验证。</p></div></details>
+  <details class="q"><summary>内点率 50%、要 99% 成功率，八点法和五点法的 RANSAC 各需要多少次采样？</summary><div><p>$N=\lceil\log 0.01/\log(1-0.5^s)\rceil$：八点法 1177 次，五点法 146 次。最小样本越少，RANSAC 越便宜。</p></div></details>
+  <details class="q"><summary>EKF-SLAM 地图里有 $n$ 个路标，每次观测更新的代价是多少？为什么后来主流转向了优化？</summary><div><p>协方差是 $(3+3n)$ 维的满矩阵，存储和更新都是 $O(n^2)$；而且每个观测只在当时的估计处线性化一次。关键帧 BA 能反复重新线性化，并能用更多特征，同样算力下精度更高（Strasdat et al., 2010）。</p></div></details>
+  <details class="q"><summary>VIO 里哪些自由度不可观？</summary><div><p>全局位置 3 个和绕重力轴的 yaw 1 个。重力让 roll、pitch 可观，加速度计让尺度可观（要有足够激励）。所以 VINS-Mono 的回环位姿图是 4 自由度的。</p></div></details>
+  <details class="q"><summary>直接法为什么要用图像金字塔？</summary><div><p>光度误差的线性化只在一两个像素范围内有效，原图上代价函数有很多局部极小。模糊、降采样后代价变平滑、收敛域变大，先在粗层得到近似解，再逐层细化。</p></div></details>
+  <details class="q"><summary>桌面操作，一个固定相机 + 一个腕部相机，需要跑 SLAM 吗？</summary><div><p>一般不需要：固定相机的外参由手眼标定给出，腕部相机的位姿由正运动学和手眼外参给出。需要 SLAM 的是位姿未知的情况：移动底盘、手持采集设备（如 UMI）、第一视角视频，或运动学 / 标定不可靠时。</p></div></details>
+</section>
+
+<section id="refs">
+  <h2>延伸阅读</h2>
+  <ol class="refs">
+    <li><b>Cadena et al., Past, Present, and Future of Simultaneous Localization and Mapping: Toward the Robust-Perception Age</b>, T-RO 2016. <a href="https://arxiv.org/abs/1606.05830">arXiv:1606.05830</a></li>
+    <li><b>Grisetti, Kümmerle, Stachniss, Burgard, A Tutorial on Graph-Based SLAM</b>, IEEE ITS Magazine 2010.</li>
+    <li><b>Dellaert, Kaess, Factor Graphs for Robot Perception</b>, Foundations and Trends in Robotics 2017. <a href="https://github.com/borglab/gtsam">GTSAM</a></li>
+    <li><b>Triggs, McLauchlan, Hartley, Fitzgibbon, Bundle Adjustment — A Modern Synthesis</b>, Vision Algorithms: Theory and Practice, 2000.</li>
+    <li><b>Kümmerle et al., g2o: A General Framework for Graph Optimization</b>, ICRA 2011. <a href="https://github.com/RainerKuemmerle/g2o">GitHub</a></li>
+    <li><b>Kaess et al., iSAM2: Incremental Smoothing and Mapping Using the Bayes Tree</b>, IJRR 2012.</li>
+    <li><b>Strasdat, Montiel, Davison, Real-time Monocular SLAM: Why Filter?</b>, ICRA 2010.</li>
+    <li><b>Forster, Carlone, Dellaert, Scaramuzza, On-Manifold Preintegration for Real-Time Visual-Inertial Odometry</b>, T-RO 2017. <a href="https://arxiv.org/abs/1512.02363">arXiv:1512.02363</a></li>
+    <li><b>Nistér, An Efficient Solution to the Five-Point Relative Pose Problem</b>, TPAMI 2004.</li>
+    <li><b>Rublee, Rabaud, Konolige, Bradski, ORB: An Efficient Alternative to SIFT or SURF</b>, ICCV 2011.</li>
+    <li><b>Gálvez-López, Tardós, Bags of Binary Words for Fast Place Recognition in Image Sequences</b>, T-RO 2012. <a href="https://github.com/dorian3d/DBoW2">GitHub</a></li>
+    <li><b>Davison et al., MonoSLAM: Real-Time Single Camera SLAM</b>, TPAMI 2007.</li>
+    <li><b>Klein, Murray, Parallel Tracking and Mapping for Small AR Workspaces</b>, ISMAR 2007.</li>
+    <li><b>Mur-Artal, Montiel, Tardós, ORB-SLAM: a Versatile and Accurate Monocular SLAM System</b>, T-RO 2015. <a href="https://arxiv.org/abs/1502.00956">arXiv:1502.00956</a></li>
+    <li><b>Campos et al., ORB-SLAM3: An Accurate Open-Source Library for Visual, Visual-Inertial and Multi-Map SLAM</b>, T-RO 2021. <a href="https://arxiv.org/abs/2007.11898">arXiv:2007.11898</a> · <a href="https://github.com/UZ-SLAMLab/ORB_SLAM3">GitHub</a></li>
+    <li><b>Engel, Koltun, Cremers, Direct Sparse Odometry</b>, TPAMI 2018. <a href="https://arxiv.org/abs/1607.02565">arXiv:1607.02565</a></li>
+    <li><b>Qin, Li, Shen, VINS-Mono: A Robust and Versatile Monocular Visual-Inertial State Estimator</b>, T-RO 2018. <a href="https://arxiv.org/abs/1708.03852">arXiv:1708.03852</a></li>
+    <li><b>Shan et al., LIO-SAM: Tightly-coupled Lidar Inertial Odometry via Smoothing and Mapping</b>, IROS 2020. <a href="https://arxiv.org/abs/2007.00258">arXiv:2007.00258</a></li>
+    <li><b>Xu et al., FAST-LIO2: Fast Direct LiDAR-inertial Odometry</b>, T-RO 2022. <a href="https://arxiv.org/abs/2107.06829">arXiv:2107.06829</a></li>
+    <li><b>Hess, Kohler, Rapp, Andor, Real-Time Loop Closure in 2D LIDAR SLAM</b>（Cartographer）, ICRA 2016. <a href="https://github.com/cartographer-project/cartographer">GitHub</a></li>
+    <li><b>Teed, Deng, DROID-SLAM: Deep Visual SLAM for Monocular, Stereo, and RGB-D Cameras</b>, NeurIPS 2021. <a href="https://arxiv.org/abs/2108.10869">arXiv:2108.10869</a></li>
+    <li><b>Teed, Lipson, Deng, Deep Patch Visual Odometry</b>, NeurIPS 2023. <a href="https://arxiv.org/abs/2208.04726">arXiv:2208.04726</a></li>
+    <li><b>Keetha et al., SplaTAM: Splat, Track &amp; Map 3D Gaussians for Dense RGB-D SLAM</b>, CVPR 2024. <a href="https://arxiv.org/abs/2312.02126">arXiv:2312.02126</a></li>
+    <li><b>Matsuki, Murai, Kelly, Davison, Gaussian Splatting SLAM</b>, CVPR 2024. <a href="https://arxiv.org/abs/2312.06741">arXiv:2312.06741</a></li>
+    <li><b>Murai, Dexheimer, Davison, MASt3R-SLAM: Real-Time Dense SLAM with 3D Reconstruction Priors</b>, CVPR 2025. <a href="https://arxiv.org/abs/2412.12392">arXiv:2412.12392</a> · <a href="https://github.com/rmurai0610/MASt3R-SLAM">GitHub</a></li>
+    <li><b>Maggio, Lim, Carlone, VGGT-SLAM: Dense RGB SLAM Optimized on the SL(4) Manifold</b>, NeurIPS 2025. <a href="https://arxiv.org/abs/2505.12549">arXiv:2505.12549</a> · <a href="https://github.com/MIT-SPARK/VGGT-SLAM">GitHub</a></li>
+    <li><b>Maggio, Carlone, VGGT-SLAM 2.0: Real-time Dense Feed-forward Scene Reconstruction</b>, RSS 2026. <a href="https://arxiv.org/abs/2601.19887">arXiv:2601.19887</a></li>
+    <li><b>Deng et al., VGGT-Long: Chunk it, Loop it, Align it</b>, ICRA 2026. <a href="https://arxiv.org/abs/2507.16443">arXiv:2507.16443</a></li>
+    <li><b>Wang, Agapito, AMB3R: Accurate Feed-forward Metric-scale 3D Reconstruction with Backend</b>, CVPR 2026. <a href="https://arxiv.org/abs/2511.20343">arXiv:2511.20343</a></li>
+    <li><b>Yuan et al., SLAM-Former: Putting SLAM into One Transformer</b>, ECCV 2026. <a href="https://arxiv.org/abs/2509.16909">arXiv:2509.16909</a></li>
+    <li><b>Chi et al., Universal Manipulation Interface: In-The-Wild Robot Teaching Without In-The-Wild Robots</b>, RSS 2024. <a href="https://arxiv.org/abs/2402.10329">arXiv:2402.10329</a></li>
+  </ol>
+</section>
+
+</main>
+</div>
+
+<!-- v4u:foot -->
+<footer class="v4u-foot"><div class="v4u-foot-in"><a class="pv" href="../3d-representations/"><span>上一篇</span>3D 表征</a><a class="nx" href="../3d-foundation-models/"><span>下一篇</span>3D 基础模型</a></div></footer>
+<!-- /v4u:foot -->
+
+<script>
+V4U.ready(() => {
+  const $ = (id) => document.getElementById(id);
+  const C = (n) => V4U.css(n);
+  const fmt = V4U.fmt;
+  const parseCol = (s) => {
+    s = (s || '').trim();
+    if (s[0] === '#') {
+      if (s.length === 4) s = '#' + s[1] + s[1] + s[2] + s[2] + s[3] + s[3];
+      return [parseInt(s.slice(1, 3), 16), parseInt(s.slice(3, 5), 16), parseInt(s.slice(5, 7), 16)];
+    }
+    const m = s.match(/[\d.]+/g); return m ? m.slice(0, 3).map(Number) : [128, 128, 128];
+  };
+  const RGB = (n) => parseCol(C(n));
+  const rgba = (c, a = 1) => `rgba(${c[0] | 0},${c[1] | 0},${c[2] | 0},${a})`;
+  const mixc = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+  const mono = (px = 12) => px + 'px ' + C('--f-mono');
+  const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  /* =====================================================================
+     2D pose-graph core (tested in node: analytic Jacobians vs finite differences)
+     ===================================================================== */
+  const PG = (() => {
+    const wrap = (a) => Math.atan2(Math.sin(a), Math.cos(a));
+    const rng = (seed) => () => { seed |= 0; seed = (seed + 0x6D2B79F5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+    const gauss = (r) => Math.sqrt(-2 * Math.log(Math.max(1e-12, r()))) * Math.cos(2 * Math.PI * r());
+    const rel = (a, b) => { const c = Math.cos(a[2]), s = Math.sin(a[2]), dx = b[0] - a[0], dy = b[1] - a[1]; return [c * dx + s * dy, -s * dx + c * dy, wrap(b[2] - a[2])]; };
+    const compose = (a, d) => { const c = Math.cos(a[2]), s = Math.sin(a[2]); return [a[0] + c * d[0] - s * d[1], a[1] + s * d[0] + c * d[1], wrap(a[2] + d[2])]; };
+    function groundTruth() {
+      const W = 8, H = 4.5, R = 1.2, ds = 0.25, pts = [];
+      const L = 2 * (W - 2 * R) + 2 * (H - 2 * R) + 2 * Math.PI * R;
+      const segs = [[W - 2 * R, 'l', [R, 0], 0], [Math.PI * R / 2, 'a', [W - R, R], -Math.PI / 2], [H - 2 * R, 'l', [W, R], Math.PI / 2], [Math.PI * R / 2, 'a', [W - R, H - R], 0],
+        [W - 2 * R, 'l', [W - R, H], Math.PI], [Math.PI * R / 2, 'a', [R, H - R], Math.PI / 2], [H - 2 * R, 'l', [0, H - R], -Math.PI / 2], [Math.PI * R / 2, 'a', [R, R], Math.PI]];
+      const at = (s) => {
+        s = ((s % L) + L) % L;
+        for (const [len, k, p, ang] of segs) {
+          if (s <= len) {
+            if (k === 'l') return [p[0] + s * Math.cos(ang), p[1] + s * Math.sin(ang), ang];
+            const a = ang + s / R; return [p[0] + R * Math.cos(a), p[1] + R * Math.sin(a), wrap(a + Math.PI / 2)];
+          }
+          s -= len;
+        }
+        return [R, 0, 0];
+      };
+      const n = Math.round(1.2 * L / ds);
+      for (let i = 0; i <= n; i++) pts.push(at(i * ds));
+      return pts;
+    }
+    function makeProblem(gt, opt) {
+      const r = rng(opt.seed), st = opt.sigT, sth = Math.max(1e-4, opt.sigTh), bias = opt.bias || 0;
+      const odoE = [], loopE = [], odo = [gt[0].slice()];
+      for (let i = 0; i + 1 < gt.length; i++) {
+        const d = rel(gt[i], gt[i + 1]);
+        const m = [d[0] + st * gauss(r), d[1] + st * gauss(r), wrap(d[2] + sth * gauss(r) + bias)];
+        odoE.push({ i, j: i + 1, z: m, info: [1 / (st * st), 1 / (st * st), 1 / (sth * sth + 1e-6)], kind: 'odo' });
+        odo.push(compose(odo[i], m));
+      }
+      const lt = 0.04, lth = 0.6 * Math.PI / 180;
+      let last = -99;
+      for (let j = 0; j < gt.length; j++) for (let i = 0; i < j - 40; i++) {
+        if (j - last < 4) continue;
+        const d = rel(gt[i], gt[j]);
+        if (Math.hypot(d[0], d[1]) < 0.35 && Math.abs(d[2]) < 0.5) {
+          loopE.push({ i, j, z: [d[0] + lt * gauss(r), d[1] + lt * gauss(r), wrap(d[2] + lth * gauss(r))], info: [1 / (lt * lt), 1 / (lt * lt), 1 / (lth * lth)], kind: 'loop' });
+          last = j; break;
+        }
+      }
+      const badE = { i: 30, j: 105, z: [0, 0, 0], info: loopE.length ? loopE[0].info : [625, 625, 9000], kind: 'bad' };
+      return { odoE, loopE, badE, init: odo };
+    }
+    function errJ(xi, xj, z) {
+      const c = Math.cos(xi[2]), s = Math.sin(xi[2]), cz = Math.cos(z[2]), sz = Math.sin(z[2]);
+      const dx = xj[0] - xi[0], dy = xj[1] - xi[1], qx = c * dx + s * dy, qy = -s * dx + c * dy;
+      const e = [cz * (qx - z[0]) + sz * (qy - z[1]), -sz * (qx - z[0]) + cz * (qy - z[1]), wrap(xj[2] - xi[2] - z[2])];
+      const A = [[-(cz * c - sz * s), -(cz * s + sz * c), cz * qy - sz * qx], [sz * c + cz * s, sz * s - cz * c, -sz * qy - cz * qx], [0, 0, -1]];
+      const B = [[cz * c - sz * s, cz * s + sz * c, 0], [-sz * c - cz * s, -sz * s + cz * c, 0], [0, 0, 1]];
+      return { e, A, B };
+    }
+    const sOf = (E, x) => { const { e } = errJ(x[E.i], x[E.j], E.z); return e[0] * e[0] * E.info[0] + e[1] * e[1] * E.info[1] + e[2] * e[2] * E.info[2]; };
+    const cost = (x, edges, rc) => edges.reduce((t, E) => { const s = sOf(E, x); return t + (rc ? rc * rc * Math.log(1 + s / (rc * rc)) : s); }, 0);
+    function gnStep(x, edges, rc) {
+      const n = x.length, N = 3 * n, H = new Float64Array(N * N), b = new Float64Array(N);
+      for (const E of edges) {
+        const { e, A, B } = errJ(x[E.i], x[E.j], E.z);
+        const s = e[0] * e[0] * E.info[0] + e[1] * e[1] * E.info[1] + e[2] * e[2] * E.info[2];
+        const w = rc ? 1 / (1 + s / (rc * rc)) : 1;
+        const Js = [[A, 3 * E.i], [B, 3 * E.j]];
+        for (const [Ja, oa] of Js) {
+          for (let p = 0; p < 3; p++) { let acc = 0; for (let k = 0; k < 3; k++) acc += Ja[k][p] * E.info[k] * e[k]; b[oa + p] += w * acc; }
+          for (const [Jb, ob] of Js) for (let p = 0; p < 3; p++) for (let q = 0; q < 3; q++) {
+            let acc = 0; for (let k = 0; k < 3; k++) acc += Ja[k][p] * E.info[k] * Jb[k][q];
+            H[(oa + p) * N + ob + q] += w * acc;
+          }
+        }
+      }
+      for (let p = 0; p < 3; p++) H[p * N + p] += 1e8;
+      const L = H;
+      for (let j = 0; j < N; j++) {
+        let d = L[j * N + j]; for (let k = 0; k < j; k++) d -= L[j * N + k] * L[j * N + k];
+        d = Math.sqrt(Math.max(d, 1e-12)); L[j * N + j] = d;
+        for (let i = j + 1; i < N; i++) { let v = L[i * N + j]; for (let k = 0; k < j; k++) v -= L[i * N + k] * L[j * N + k]; L[i * N + j] = v / d; }
+      }
+      const y = new Float64Array(N);
+      for (let i = 0; i < N; i++) { let v = -b[i]; for (let k = 0; k < i; k++) v -= L[i * N + k] * y[k]; y[i] = v / L[i * N + i]; }
+      const dx = new Float64Array(N);
+      for (let i = N - 1; i >= 0; i--) { let v = y[i]; for (let k = i + 1; k < N; k++) v -= L[k * N + i] * dx[k]; dx[i] = v / L[i * N + i]; }
+      return x.map((p, i) => [p[0] + dx[3 * i], p[1] + dx[3 * i + 1], wrap(p[2] + dx[3 * i + 2])]);
+    }
+    const ate = (x, gt) => Math.sqrt(x.reduce((s, p, i) => s + (p[0] - gt[i][0]) ** 2 + (p[1] - gt[i][1]) ** 2, 0) / x.length);
+    return { wrap, rng, gauss, rel, compose, groundTruth, makeProblem, errJ, sOf, cost, gnStep, ate };
+  })();
+  const rng = PG.rng, gauss = PG.gauss;
+
+  /* =====================================================================
+     V1 + V2: pose-graph SLAM and its factor graph / H sparsity (shared state)
+     ===================================================================== */
+  (function () {
+    const cv = $('cv-pg'), rd = $('rd-pg'), slTh = $('sl-pg-th'), cvF = $('cv-fg'), rdF = $('rd-fg');
+    const gt = PG.groundTruth(), N = gt.length;
+    let bounds = null;
+    let seed = 1, prob, x, loopMode = 'good', robust = false, iters = 0, shown = N, timer = null, anim = null, fgMode = 'H', hoverF = null;
+    const edges = () => prob.odoE.concat(loopMode === 'none' ? [] : prob.loopE, loopMode === 'bad' ? [prob.badE] : []).filter((E) => E.j < shown);
+    const stopTimers = () => { if (timer) { clearTimeout(timer); timer = null; } if (anim) { anim.stop(); anim = null; $('bt-pg-drive').textContent = '行驶'; } };
+    const rebuild = () => { stopTimers(); prob = PG.makeProblem(gt, { seed, sigT: 0.02, sigTh: (+slTh.value * Math.PI) / 180, bias: (+slTh.value > 0 ? 0.35 : 0) * Math.PI / 180 }); x = prob.init.map((p) => p.slice()); iters = 0; shown = N;
+      const all = gt.concat(prob.init), xs = all.map((p) => p[0]), ys = all.map((p) => p[1]);
+      bounds = { x0: Math.min(...xs) - 0.8, x1: Math.max(...xs) + 0.8, y0: Math.min(...ys) - 0.8, y1: Math.max(...ys) + 0.8 };
+    };
+    rebuild();
+    let drawF = null, fgGeo = null;
+    const draw = V4U.canvas(cv, (w) => Math.round(Math.min(470, Math.max(300, w * 0.6))), (ctx, w, h) => {
+      $('o-pg-th').textContent = (+slTh.value).toFixed(1) + '°';
+      const pad = 10, S = Math.min((w - 2 * pad) / (bounds.x1 - bounds.x0), (h - 2 * pad) / (bounds.y1 - bounds.y0));
+      const ox = (w - S * (bounds.x1 - bounds.x0)) / 2, oy = (h - S * (bounds.y1 - bounds.y0)) / 2;
+      const X = (p) => [ox + (p[0] - bounds.x0) * S, h - oy - (p[1] - bounds.y0) * S];
+      const path = (pts, n, col, lw, dash) => { ctx.strokeStyle = col; ctx.lineWidth = lw; ctx.setLineDash(dash || []); ctx.beginPath(); for (let i = 0; i < n; i++) { const [a, b] = X(pts[i]); i ? ctx.lineTo(a, b) : ctx.moveTo(a, b); } ctx.stroke(); ctx.setLineDash([]); };
+      // 1 m grid
+      ctx.strokeStyle = C('--line'); ctx.lineWidth = 1; ctx.beginPath();
+      for (let gx = Math.ceil(bounds.x0); gx <= bounds.x1; gx++) { const [a] = X([gx, 0]); ctx.moveTo(a, 0); ctx.lineTo(a, h); }
+      for (let gy = Math.ceil(bounds.y0); gy <= bounds.y1; gy++) { const [, b] = X([0, gy]); ctx.moveTo(0, b); ctx.lineTo(w, b); }
+      ctx.stroke();
+      path(gt, N, C('--muted'), 1.5, [5, 4]);
+      path(prob.init, shown, C('--c2'), 1.5);
+      const E = edges();
+      for (const e of E) {
+        if (e.kind === 'odo') continue;
+        const [a, b] = X(x[e.i]), [c, d] = X(x[e.j]);
+        ctx.strokeStyle = e.kind === 'bad' ? C('--bad') : C('--c5'); ctx.lineWidth = 2.2; ctx.beginPath(); ctx.moveTo(a, b); ctx.lineTo(c, d); ctx.stroke();
+      }
+      path(x, shown, C('--c1'), 2.4);
+      const c1 = C('--c1');
+      for (let i = 0; i < shown; i += 1) { const [a, b] = X(x[i]); ctx.fillStyle = c1; ctx.beginPath(); ctx.arc(a, b, 1.8, 0, 2 * Math.PI); ctx.fill(); }
+      // robot at the end of the shown estimate
+      const pe = x[shown - 1], [ra, rb] = X(pe), th = pe[2];
+      ctx.fillStyle = c1; ctx.beginPath();
+      ctx.moveTo(ra + 11 * Math.cos(th), rb - 11 * Math.sin(th)); ctx.lineTo(ra + 7 * Math.cos(th + 2.4), rb - 7 * Math.sin(th + 2.4)); ctx.lineTo(ra + 7 * Math.cos(th - 2.4), rb - 7 * Math.sin(th - 2.4)); ctx.closePath(); ctx.fill();
+      const [sa, sb] = X(gt[0]); ctx.strokeStyle = C('--ink'); ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(sa, sb, 7, 0, 2 * Math.PI); ctx.stroke();
+      ctx.fillStyle = C('--ink-2'); ctx.font = mono(12); ctx.fillText('x₀', sa + 9, sb + 16);
+      const nl = E.filter((e) => e.kind !== 'odo').length, rc = robust ? 3 : 0;
+      const endErr = Math.hypot(x[shown - 1][0] - gt[shown - 1][0], x[shown - 1][1] - gt[shown - 1][1]);
+      const xs = x.slice(0, shown), gs = gt.slice(0, shown);
+      rd.innerHTML = `<span>位姿 <b>${shown}</b></span><span>里程计边 <b>${shown - 1}</b></span><span>回环边 <b>${nl}</b></span><span>迭代 <b>${iters}</b></span><span>${robust ? 'Σρ(s)' : 'χ² = Σs'} <b>${PG.cost(x, E, rc).toExponential(2)}</b></span><span>ATE（位置 RMSE）<b>${fmt(PG.ate(xs, gs))}</b> m</span><span>终点误差 <b>${fmt(endErr)}</b> m</span>`;
+      if (drawF) drawF();
+    });
+    /* ---- factor graph + H sparsity ---- */
+    drawF = V4U.canvas(cvF, (w) => (w >= 620 ? Math.round(Math.min(380, w * 0.46)) : Math.round(w * 1.6)), (ctx, w, h) => {
+      const wide = w >= 620, E = edges(), n = shown;
+      const gw = wide ? w * 0.5 - 12 : w, gh = wide ? h : h * 0.47;
+      const mx0 = wide ? w * 0.5 + 12 : (w - Math.min(w - 20, h * 0.46)) / 2, msz = wide ? Math.min(w * 0.5 - 24, h - 30) : Math.min(w - 20, h * 0.46), my0 = wide ? (h - msz) / 2 : gh + 14;
+      // left: factor graph laid out at current estimate
+      const pad = 12, S = Math.min((gw - 2 * pad) / (bounds.x1 - bounds.x0), (gh - 2 * pad) / (bounds.y1 - bounds.y0));
+      const ox = (gw - S * (bounds.x1 - bounds.x0)) / 2, oy = (gh - S * (bounds.y1 - bounds.y0)) / 2;
+      const X = (p) => [ox + (p[0] - bounds.x0) * S, gh - oy - (p[1] - bounds.y0) * S];
+      const facs = [{ kind: 'prior', i: 0, j: 0 }].concat(E);
+      const fpos = facs.map((f) => { if (f.kind === 'prior') { const [a, b] = X(x[0]); return [a - 14, b + 12]; } const [a, b] = X(x[f.i]), [c, d] = X(x[f.j]); return [(a + c) / 2, (b + d) / 2]; });
+      fgGeo = { facs, fpos, mx0, my0, msz, n };
+      const colOf = (f) => (f.kind === 'odo' ? C('--c2') : f.kind === 'prior' ? C('--c6') : f.kind === 'bad' ? C('--bad') : C('--c5'));
+      facs.forEach((f, k) => {
+        if (f.kind === 'prior') return;
+        const [a, b] = X(x[f.i]), [c, d] = X(x[f.j]), [p, q] = fpos[k], hi = hoverF === k;
+        ctx.strokeStyle = hi ? C('--ink') : colOf(f); ctx.lineWidth = hi ? 2.5 : f.kind === 'odo' ? 1 : 1.6;
+        ctx.beginPath(); ctx.moveTo(a, b); ctx.lineTo(p, q); ctx.lineTo(c, d); ctx.stroke();
+      });
+      const vr = Math.max(2, Math.min(3.2, S * 0.09));
+      for (let i = 0; i < n; i++) { const [a, b] = X(x[i]); ctx.fillStyle = C('--surface'); ctx.strokeStyle = C('--ink-2'); ctx.lineWidth = 1.2; ctx.beginPath(); ctx.arc(a, b, vr, 0, 2 * Math.PI); ctx.fill(); ctx.stroke(); }
+      facs.forEach((f, k) => {
+        const [p, q] = fpos[k], hi = hoverF === k, s = (f.kind === 'odo' ? 2.4 : 4) + (hi ? 2 : 0);
+        if (f.kind === 'prior') { const [a, b] = X(x[0]); ctx.strokeStyle = colOf(f); ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(a, b); ctx.lineTo(p, q); ctx.stroke(); }
+        ctx.fillStyle = hi ? C('--ink') : colOf(f); ctx.fillRect(p - s, q - s, 2 * s, 2 * s);
+      });
+      // right: block sparsity of H or L
+      const adj = [...Array(n)].map(() => new Set());
+      for (const f of facs) { if (f.kind === 'prior') continue; adj[f.i].add(f.j); adj[f.j].add(f.i); }
+      const nzH = adj.reduce((s, a) => s + a.size, 0) + n;
+      let fill = null, nzL = 0;
+      if (fgMode === 'L') {
+        const A = adj.map((s) => new Set(s)); fill = [...Array(n)].map(() => new Set());
+        for (let k = 0; k < n; k++) {
+          const later = [...A[k]].filter((v) => v > k); nzL += later.length + 1;
+          for (const a of later) for (const b of later) if (a !== b && !A[a].has(b)) { A[a].add(b); fill[Math.max(a, b)].add(Math.min(a, b)); }
+          if (fill) for (const a of later) if (!adj[k].has(a)) fill[a].add(k);
+        }
+      }
+      const cs = msz / n, line = C('--line');
+      ctx.strokeStyle = line; ctx.lineWidth = 1; ctx.strokeRect(mx0, my0, msz, msz);
+      const cell = (r, c, col) => { ctx.fillStyle = col; ctx.fillRect(mx0 + c * cs, my0 + r * cs, Math.max(1, cs), Math.max(1, cs)); };
+      const hiSet = new Set();
+      if (hoverF != null) { const f = facs[hoverF]; hiSet.add(f.i + ',' + f.i); hiSet.add(f.j + ',' + f.j); hiSet.add(f.i + ',' + f.j); hiSet.add(f.j + ',' + f.i); }
+      const kindOf = (a, b) => { for (const f of facs) if ((f.i === a && f.j === b) || (f.i === b && f.j === a)) return f; return null; };
+      for (let r = 0; r < n; r++) {
+        cell(r, r, C('--ink-2'));
+        for (const c of adj[r]) {
+          if (fgMode === 'L' && c > r) continue;
+          const f = kindOf(r, c); cell(r, c, colOf(f));
+        }
+        if (fill) for (const c of fill[r]) cell(r, c, C('--c4'));
+      }
+      for (const key of hiSet) { const [r, c] = key.split(',').map(Number); if (fgMode === 'L' && c > r) continue; ctx.strokeStyle = C('--ink'); ctx.lineWidth = 1.5; ctx.strokeRect(mx0 + c * cs - 1.5, my0 + r * cs - 1.5, cs + 3, cs + 3); }
+      ctx.fillStyle = C('--ink-2'); ctx.font = mono(12); ctx.textAlign = 'left';
+      ctx.fillText(fgMode === 'H' ? 'H' : 'L', mx0, my0 - 4 < 10 ? my0 + msz + 14 : my0 - 4);
+      const lowerH = (nzH - n) / 2 + n;
+      let fs = '';
+      if (hoverF != null) { const f = facs[hoverF]; fs = f.kind === 'prior' ? '<span>选中：先验因子 → H 块 (0,0)</span>' : `<span>选中：${f.kind === 'odo' ? '里程计' : f.kind === 'bad' ? '错误回环' : '回环'}因子 x<sub>${f.i}</sub>–x<sub>${f.j}</sub> → H 块 (${f.i},${f.i}) (${f.j},${f.j}) (${f.i},${f.j}) (${f.j},${f.i})</span>`; }
+      rdF.innerHTML = `<span>变量 <b>${n}</b> 个（${3 * n} 维）</span><span>因子 <b>${facs.length}</b></span><span>H 非零块 <b>${nzH}</b> / ${n * n}（${(100 * nzH / (n * n)).toFixed(1)}%）</span>` + (fgMode === 'L' ? `<span>L 非零块 <b>${nzL}</b>，其中填充 <b>${nzL - lowerH}</b></span>` : '') + fs;
+    });
+    const pickF = (e) => {
+      if (!fgGeo) return;
+      const r = cvF.getBoundingClientRect(), px = e.clientX - r.left, py = e.clientY - r.top;
+      let best = -1, bd = 14;
+      fgGeo.fpos.forEach((p, k) => { const d = Math.hypot(p[0] - px, p[1] - py) - (fgGeo.facs[k].kind === 'odo' ? 0 : 4); if (d < bd) { bd = d; best = k; } });
+      if (best < 0) { // try the matrix
+        const { mx0, my0, msz, n, facs } = fgGeo, cs = msz / n, c = Math.floor((px - mx0) / cs), rr = Math.floor((py - my0) / cs);
+        if (c >= 0 && rr >= 0 && c < n && rr < n) facs.forEach((f, k) => { if ((f.i === rr && f.j === c) || (f.i === c && f.j === rr)) best = k; });
+      }
+      if (best !== hoverF && best >= 0) { hoverF = best; drawF(); }
+    };
+    cvF.addEventListener('pointermove', pickF); cvF.addEventListener('click', pickF);
+    V4U.seg($('sg-fg'), (v) => { fgMode = v; drawF(); });
+    const optimize = () => {
+      stopTimers(); shown = N;
+      const step = () => {
+        const E = edges(), rc = robust ? 3 : 0, before = PG.cost(x, E, rc);
+        x = PG.gnStep(x, E, rc); iters++; draw();
+        const after = PG.cost(x, E, rc);
+        if (iters < 25 && Math.abs(before - after) > 1e-6 * Math.max(1, before)) timer = setTimeout(step, reduced ? 0 : 300); else timer = null;
+      };
+      step();
+    };
+    $('bt-pg-opt').addEventListener('click', optimize);
+    $('bt-pg-reset').addEventListener('click', () => { stopTimers(); x = prob.init.map((p) => p.slice()); iters = 0; shown = N; draw(); });
+    $('bt-pg-seed').addEventListener('click', () => { seed++; rebuild(); draw(); });
+    slTh.addEventListener('input', () => { rebuild(); draw(); });
+    V4U.seg($('sg-pg-loop'), (v) => { loopMode = v; hoverF = null; if (prob) { stopTimers(); x = prob.init.map((p) => p.slice()); iters = 0; draw(); } });
+    V4U.seg($('sg-pg-rob'), (v) => { robust = v === 'cauchy'; if (prob) { stopTimers(); x = prob.init.map((p) => p.slice()); iters = 0; draw(); } });
+    $('bt-pg-drive').addEventListener('click', (ev) => {
+      if (anim) { stopTimers(); return; }
+      stopTimers(); x = prob.init.map((p) => p.slice()); iters = 0; shown = 2; ev.target.textContent = '停止';
+      let acc = 0;
+      anim = V4U.loop(cv, (t, dt) => { acc += dt * 28; shown = Math.min(N, 2 + Math.floor(acc)); if (reduced) shown = N; draw(); if (shown >= N) stopTimers(); });
+    });
+  })();
+
+  /* =====================================================================
+     V3: triangulation with 1D cameras, uncertainty, scale ambiguity
+     ===================================================================== */
+  (function () {
+    const cv = $('cv-tri'), rd = $('rd-tri'), slB = $('sl-tri-b'), slN = $('sl-tri-n'), slS = $('sl-tri-s');
+    const f = 200, IW = 400;
+    let P0 = [0.55, 3.2], geo = null;
+    const V = { x0: -1.3, x1: 2.6, z0: -0.4, z1: 8.4 };
+    const draw = V4U.canvas(cv, (w) => (w >= 560 ? Math.round(Math.min(440, w * 0.5)) : Math.round(Math.min(520, w * 1.45))), (ctx, w, h) => {
+      const b = +slB.value, sig = +slN.value, s = +slS.value;
+      $('o-tri-b').textContent = fmt(b); $('o-tri-n').textContent = fmt(sig); $('o-tri-s').textContent = fmt(s);
+      const stripH = 54, wh = h - stripH - 6, pad = 8, horiz = w >= 560;
+      // horizontal layout on wide screens: depth z runs to the right, lateral x runs up
+      const spanA = V.z1 - V.z0, spanB = V.x1 - V.x0;
+      const S = horiz ? Math.min((w - 2 * pad) / spanA, (wh - 2 * pad) / spanB) : Math.min((w - 2 * pad) / spanB, (wh - 2 * pad) / spanA);
+      const ox = horiz ? pad + 4 : (w - S * spanB) / 2, oy = horiz ? (wh - S * spanB) / 2 : 0;
+      const X = horiz ? (p) => [ox + (p[1] - V.z0) * S, wh - oy - (p[0] - V.x0) * S] : (p) => [ox + (p[0] - V.x0) * S, wh - pad - (p[1] - V.z0) * S];
+      const inv = horiz ? (px, py) => [V.x0 + (wh - oy - py) / S, V.z0 + (px - ox) / S] : (px, py) => [V.x0 + (px - ox) / S, V.z0 + (wh - pad - py) / S];
+      geo = { inv, wh, s };
+      const cams = [0, b * s], P = [P0[0] * s, P0[1] * s];
+      const u = cams.map((c) => f * (P[0] - c) / P[1] + IW / 2);
+      const cols = [C('--c1'), C('--c2')], c4 = RGB('--c4');
+      ctx.strokeStyle = C('--line'); ctx.lineWidth = 1; ctx.beginPath();
+      for (let z = 0; z <= V.z1; z++) { const A = X([V.x0, z]), B2 = X([V.x1, z]); ctx.moveTo(A[0], A[1]); ctx.lineTo(B2[0], B2[1]); }
+      ctx.stroke();
+      ctx.fillStyle = C('--muted'); ctx.font = mono(11);
+      for (let z = 2; z <= V.z1; z += 2) { const A = X([V.x0, z]); ctx.fillText('z=' + z, A[0] + 3, A[1] - 4); }
+      // ray direction for pixel u from camera c: x = c + (u - IW/2)/f * z
+      const at = (c, uu, z) => [c + (uu - IW / 2) / f * z, z];
+      const isect = (c1, u1, c2, u2) => { const a1 = (u1 - IW / 2) / f, a2 = (u2 - IW / 2) / f; if (a1 - a2 <= 1e-9) return null; const z = (c2 - c1) / (a1 - a2); return [c1 + a1 * z, z]; };
+      // uncertainty quad
+      const Q = [isect(cams[0], u[0] - sig, cams[1], u[1] + sig), isect(cams[0], u[0] + sig, cams[1], u[1] + sig), isect(cams[0], u[0] + sig, cams[1], u[1] - sig), isect(cams[0], u[0] - sig, cams[1], u[1] - sig)];
+      const unb = Q.some((q) => !q);
+      // ray cones
+      cams.forEach((c, k) => {
+        const zEnd = V.z1 + 2;
+        ctx.fillStyle = rgba(RGB(k ? '--c2' : '--c1'), 0.08); ctx.beginPath();
+        const A = X([c, 0]), B1 = X(at(c, u[k] - sig, zEnd)), B2 = X(at(c, u[k] + sig, zEnd));
+        ctx.moveTo(A[0], A[1]); ctx.lineTo(B1[0], B1[1]); ctx.lineTo(B2[0], B2[1]); ctx.closePath(); ctx.fill();
+        ctx.strokeStyle = cols[k]; ctx.lineWidth = 1.2; const M = X(at(c, u[k], zEnd)); ctx.beginPath(); ctx.moveTo(A[0], A[1]); ctx.lineTo(M[0], M[1]); ctx.stroke();
+      });
+      let zr = '∞';
+      if (!unb) {
+        ctx.fillStyle = rgba(c4, 0.35); ctx.strokeStyle = rgba(c4); ctx.lineWidth = 1.5; ctx.beginPath();
+        Q.forEach((q, i) => { const [a, bb] = X(q); i ? ctx.lineTo(a, bb) : ctx.moveTo(a, bb); }); ctx.closePath(); ctx.fill(); ctx.stroke();
+        const zs = Q.map((q) => q[1]); zr = `${fmt(Math.min(...zs))} – ${fmt(Math.max(...zs))}`;
+      }
+      // cameras
+      cams.forEach((c, k) => {
+        const [a, bb] = X([c, 0]), [fa, fb] = X([c, -0.15]), dx = fa - a, dy = fb - bb, L = Math.hypot(dx, dy) || 1, ux = dx / L, uy = dy / L;
+        ctx.fillStyle = cols[k]; ctx.beginPath(); ctx.moveTo(a, bb); ctx.lineTo(a + 12 * ux - 9 * uy, bb + 12 * uy + 9 * ux); ctx.lineTo(a + 12 * ux + 9 * uy, bb + 12 * uy - 9 * ux); ctx.closePath(); ctx.fill();
+      });
+      const [pa, pb] = X(P); ctx.fillStyle = C('--ink'); ctx.beginPath(); ctx.arc(pa, pb, 5.5, 0, 2 * Math.PI); ctx.fill();
+      // 1D image strips
+      const sy = h - stripH, sw = Math.min(w * 0.42, 260), gap = (w - 2 * sw) / 3;
+      [0, 1].forEach((k) => {
+        const x0 = gap + k * (sw + gap);
+        ctx.fillStyle = C('--surface-2'); ctx.fillRect(x0, sy + 14, sw, 16);
+        ctx.strokeStyle = C('--line-2'); ctx.strokeRect(x0, sy + 14, sw, 16);
+        const ux = x0 + V4U.clamp(u[k] / IW, 0, 1) * sw;
+        ctx.fillStyle = cols[k]; ctx.fillRect(ux - 2, sy + 10, 4, 24);
+        ctx.fillStyle = C('--ink-2'); ctx.font = mono(11); ctx.textAlign = 'left'; ctx.fillText(`u${k + 1} = ${u[k].toFixed(1)}`, x0, sy + 46); ctx.textAlign = 'left';
+      });
+      const z = P[1], d = u[0] - u[1], dz = z * z / (f * b * s) * 2 * sig;
+      rd.innerHTML = `<span>点 (x, z) = (<b>${fmt(P[0])}</b>, <b>${fmt(z)}</b>) m</span><span>视差 d = fb/z = <b>${fmt(d, 1)}</b> px</span><span>交点深度范围 <b>${zr}</b> m</span><span>线性估计 z²·2σ/(fb) = <b>±${fmt(dz)}</b> m</span><span>夹角 <b>${(Math.atan2(b * s, z) * 180 / Math.PI).toFixed(1)}°</b></span>`;
+    });
+    [slB, slN, slS].forEach((sl) => sl.addEventListener('input', draw));
+    V4U.drag(cv, (px, py, ph) => {
+      if (!geo || ph === 'up') return;
+      if (py > geo.wh) return;
+      const [wx, wz] = geo.inv(px, py);
+      P0 = [V4U.clamp(wx / geo.s, -1.2, 3.2), V4U.clamp(wz / geo.s, 0.6, 4.1)]; draw();
+    });
+    cv.style.touchAction = 'pan-y';
+  })();
+
+  /* =====================================================================
+     V4: planar PnP — reprojection error and LM
+     ===================================================================== */
+  (function () {
+    const cv = $('cv-pnp'), rd = $('rd-pnp'), slN = $('sl-pnp-n');
+    const f = 300, IW = 600, cx = 300;
+    const LM = [[-2.1, 5.2], [-1.2, 6.8], [0.2, 4.1], [1.4, 6.2], [2.5, 4.7], [-0.7, 3.0], [0.9, 7.6]];
+    const TRUE = [0.1, 0.2, Math.PI / 2 + 0.06];
+    const inits = [[1.3, -0.6, Math.PI / 2 - 0.28], [-1.6, 0.9, Math.PI / 2 + 0.35], [0.9, 1.6, Math.PI / 2 + 0.5], [2.2, 0.2, Math.PI / 2 - 0.5]];
+    let est = inits[0].slice(), iters = 0, ii = 0, lambda = 1e-3, timer = null, geo = null, dragMode = null;
+    // camera frame: forward d = (cos θ, sin θ), right r = (sin θ, -cos θ); u = f * (r·q)/(d·q) + cx
+    const proj = (x, p) => { const c = Math.cos(x[2]), s = Math.sin(x[2]), dx = p[0] - x[0], dy = p[1] - x[1], z = c * dx + s * dy, l = s * dx - c * dy; return z > 0.05 ? f * l / z + cx : null; };
+    let meas = [];
+    const remeasure = () => { const r = rng(7), s = +slN.value; meas = LM.map((p) => { const uu = proj(TRUE, p); return uu == null || uu < 0 || uu > IW ? null : uu + s * gauss(r); }); };
+    remeasure();
+    const resid = (x) => LM.map((p, k) => { const uu = proj(x, p); return meas[k] == null || uu == null ? null : meas[k] - uu; });
+    const cost = (x) => resid(x).reduce((s, r) => s + (r == null ? 0 : r * r), 0);
+    const lmStep = () => {
+      const r = resid(est), h = 1e-6, Jr = [];
+      LM.forEach((p, k) => {
+        if (r[k] == null) return;
+        const u0 = proj(est, p), row = [0, 1, 2].map((q) => { const x2 = est.slice(); x2[q] += h; const u1 = proj(x2, p); return u1 == null ? 0 : (u1 - u0) / h; });
+        Jr.push({ row, r: r[k] });
+      });
+      if (Jr.length < 3) return false;
+      const A = [[0, 0, 0], [0, 0, 0], [0, 0, 0]], g = [0, 0, 0];
+      for (const { row, r: rk } of Jr) for (let a = 0; a < 3; a++) { g[a] += row[a] * rk; for (let b = 0; b < 3; b++) A[a][b] += row[a] * row[b]; }
+      const c0 = cost(est);
+      for (let tries = 0; tries < 8; tries++) {
+        const M = A.map((rw, a) => rw.map((v, b) => v + (a === b ? lambda * Math.max(A[a][a], 1e-9) : 0)));
+        const det = M[0][0] * (M[1][1] * M[2][2] - M[1][2] * M[2][1]) - M[0][1] * (M[1][0] * M[2][2] - M[1][2] * M[2][0]) + M[0][2] * (M[1][0] * M[2][1] - M[1][1] * M[2][0]);
+        const solve = (col) => { const m = M.map((rw) => rw.slice()); for (let a = 0; a < 3; a++) m[a][col] = g[a]; return (m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])) / det; };
+        const dlt = [solve(0), solve(1), solve(2)], cand = [est[0] + dlt[0], est[1] + dlt[1], est[2] + dlt[2]];
+        const nVis = resid(cand).filter((v) => v != null).length;
+        if (nVis >= Jr.length && cost(cand) < c0) { est = cand; lambda = Math.max(1e-6, lambda / 10); iters++; return true; }
+        lambda *= 10;
+      }
+      return false;
+    };
+    const draw = V4U.canvas(cv, (w) => Math.round(Math.min(480, Math.max(380, w * 0.62))), (ctx, w, h) => {
+      $('o-pnp-n').textContent = (+slN.value).toFixed(1);
+      const stripH = 64, wh = h - stripH, B = { x0: -3.6, x1: 3.6, y0: -1.6, y1: 8.3 }, pad = 8;
+      const S = Math.min((w - 2 * pad) / (B.x1 - B.x0), (wh - 2 * pad) / (B.y1 - B.y0)), ox = (w - S * (B.x1 - B.x0)) / 2;
+      const X = (p) => [ox + (p[0] - B.x0) * S, wh - pad - (p[1] - B.y0) * S];
+      geo = { X, S, ox, wh, pad, B };
+      const camDraw = (x, col, dash, lw) => {
+        const [a, b] = X(x), L = 0.9;
+        ctx.strokeStyle = col; ctx.lineWidth = lw; ctx.setLineDash(dash);
+        ctx.beginPath();
+        for (const sg of [-1, 1]) { const t = x[2] + sg * Math.PI / 4; const [c, d] = X([x[0] + L * Math.cos(t) * Math.SQRT2, x[1] + L * Math.sin(t) * Math.SQRT2]); ctx.moveTo(a, b); ctx.lineTo(c, d); }
+        const [e1, e2] = X([x[0] + L * Math.cos(x[2] + Math.PI / 4) * Math.SQRT2, x[1] + L * Math.sin(x[2] + Math.PI / 4) * Math.SQRT2]), [e3, e4] = X([x[0] + L * Math.cos(x[2] - Math.PI / 4) * Math.SQRT2, x[1] + L * Math.sin(x[2] - Math.PI / 4) * Math.SQRT2]);
+        ctx.moveTo(e1, e2); ctx.lineTo(e3, e4); ctx.stroke(); ctx.setLineDash([]);
+      };
+      // rays from the estimate
+      const r = resid(est);
+      ctx.strokeStyle = C('--line-2'); ctx.lineWidth = 1;
+      LM.forEach((p, k) => { if (r[k] == null) return; const [a, b] = X(est), [c, d] = X(p); ctx.beginPath(); ctx.moveTo(a, b); ctx.lineTo(c, d); ctx.stroke(); });
+      camDraw(TRUE, C('--muted'), [5, 4], 1.5);
+      camDraw(est, C('--c1'), [], 2.4);
+      const [ea, eb] = X(est); ctx.fillStyle = C('--c1'); ctx.beginPath(); ctx.arc(ea, eb, 6, 0, 2 * Math.PI); ctx.fill();
+      const hp = X([est[0] + 1.25 * Math.cos(est[2]), est[1] + 1.25 * Math.sin(est[2])]);
+      ctx.strokeStyle = C('--c1'); ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(hp[0], hp[1], 6, 0, 2 * Math.PI); ctx.stroke();
+      LM.forEach((p, k) => { const [a, b] = X(p); ctx.fillStyle = C('--c3'); ctx.fillRect(a - 5, b - 5, 10, 10); ctx.fillStyle = C('--ink-2'); ctx.font = mono(11); ctx.fillText(String(k + 1), a + 7, b - 5); });
+      // 1D image strip
+      const sy = wh + 8, x0 = 16, sw = w - 32, U = (uu) => x0 + (uu / IW) * sw;
+      ctx.fillStyle = C('--surface-2'); ctx.fillRect(x0, sy + 10, sw, 22); ctx.strokeStyle = C('--line-2'); ctx.lineWidth = 1; ctx.strokeRect(x0, sy + 10, sw, 22);
+      ctx.fillStyle = C('--muted'); ctx.font = mono(10.5); ctx.fillText('0', x0, sy + 46); ctx.textAlign = 'right'; ctx.fillText('600 px', x0 + sw, sy + 46); ctx.textAlign = 'left';
+      LM.forEach((p, k) => {
+        const up = proj(est, p), um = meas[k];
+        if (um != null && up != null && up > -200 && up < IW + 200) { ctx.strokeStyle = C('--bad'); ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(U(V4U.clamp(um, -20, IW + 20)), sy + 21); ctx.lineTo(U(V4U.clamp(up, -20, IW + 20)), sy + 21); ctx.stroke(); }
+        if (up != null && up >= -20 && up <= IW + 20) { ctx.strokeStyle = C('--c1'); ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(U(up), sy + 6); ctx.lineTo(U(up), sy + 36); ctx.stroke(); }
+        if (um != null) { ctx.fillStyle = C('--c2'); ctx.beginPath(); ctx.arc(U(um), sy + 21, 4.5, 0, 2 * Math.PI); ctx.fill(); ctx.fillStyle = C('--ink-2'); ctx.font = mono(10.5); ctx.fillText(String(k + 1), U(um) - 3, sy + 4); }
+      });
+      const vis = r.filter((v) => v != null), c = cost(est);
+      const dth = Math.abs(PG.wrap(est[2] - TRUE[2])) * 180 / Math.PI;
+      rd.innerHTML = `<span>可用观测 <b>${vis.length}</b> / ${LM.length}</span><span>Σr² <b>${c.toFixed(1)}</b> px²</span><span>RMS <b>${fmt(Math.sqrt(c / Math.max(1, vis.length)), 2)}</b> px</span><span>位置误差 <b>${fmt(Math.hypot(est[0] - TRUE[0], est[1] - TRUE[1]), 3)}</b> m</span><span>朝向误差 <b>${dth.toFixed(2)}°</b></span><span>迭代 <b>${iters}</b>，λ = <b>${lambda.toExponential(0)}</b></span>`;
+    });
+    const stop = () => { if (timer) { clearTimeout(timer); timer = null; } };
+    $('bt-pnp-step').addEventListener('click', () => { stop(); lmStep(); draw(); });
+    $('bt-pnp-run').addEventListener('click', () => { stop(); let k = 0; const go = () => { const c0 = cost(est); lmStep(); draw(); k++; if (k < 30 && Math.abs(c0 - cost(est)) > 1e-4) timer = setTimeout(go, reduced ? 0 : 220); }; go(); });
+    $('bt-pnp-reset').addEventListener('click', () => { stop(); ii = (ii + 1) % inits.length; est = inits[ii].slice(); iters = 0; lambda = 1e-3; draw(); });
+    slN.addEventListener('input', () => { remeasure(); draw(); });
+    V4U.drag(cv, (px, py, ph) => {
+      if (!geo) return;
+      const wx = geo.B.x0 + (px - geo.ox) / geo.S, wy = geo.B.y0 + (geo.wh - geo.pad - py) / geo.S;
+      if (ph === 'down') {
+        const [a, b] = geo.X(est), hp = geo.X([est[0] + 1.25 * Math.cos(est[2]), est[1] + 1.25 * Math.sin(est[2])]);
+        dragMode = Math.hypot(hp[0] - px, hp[1] - py) < 16 ? 'rot' : Math.hypot(a - px, b - py) < 22 ? 'pos' : null;
+        if (dragMode) stop();
+      }
+      if (ph === 'move' && dragMode === 'pos') { est = [V4U.clamp(wx, -3.4, 3.4), V4U.clamp(wy, -1.4, 2.6), est[2]]; iters = 0; lambda = 1e-3; draw(); }
+      if (ph === 'move' && dragMode === 'rot') { est = [est[0], est[1], Math.atan2(wy - est[1], wx - est[0])]; iters = 0; lambda = 1e-3; draw(); }
+      if (ph === 'up') dragMode = null;
+    });
+    cv.style.touchAction = 'pan-y';
+  })();
+
+  /* =====================================================================
+     V5: 1D photometric alignment — basin of convergence, pyramid, affine brightness
+     ===================================================================== */
+  (function () {
+    const cv = $('cv-photo'), rd = $('rd-ph'), slT0 = $('sl-ph-t0'), slA = $('sl-ph-a');
+    const TSTAR = 9, XS = 200, LEVELS = [0, 3, 6, 12];
+    const r = rng(8), bumps = [];
+    for (let k = 0; k < 50; k++) bumps.push({ mu: -20 + r() * 240, w: 1.0 + r() * 2.0, A: (r() < 0.5 ? -1 : 1) * (0.12 + r() * 0.3) });
+    const noise = [...Array(XS + 1)].map(() => 0.012 * gauss(r));
+    const I = (x, sg) => { let v = 0.5, d = 0; for (const b of bumps) { const w2 = Math.sqrt(b.w * b.w + sg * sg), A = b.A * b.w / w2, q = (x - b.mu) / w2, g = A * Math.exp(-0.5 * q * q); v += g; d += -g * q / w2; } return [v, d]; };
+    let lv = 0, aff = false, est = { t: -6, a: 1, b: 0 }, trail = [], timer = null;
+    const exposure = () => +slA.value;
+    // I2(x) = (1+e) * I1(x - t*) + 0.3 e + noise
+    const I2 = (x, sg) => { const [v, d] = I(x - TSTAR, sg), e = exposure(); return [(1 + e) * v + 0.3 * e, (1 + e) * d]; };
+    const xsGrid = []; for (let x = 30; x <= 170; x++) xsGrid.push(x);
+    const residuals = (t, a, b, sg) => xsGrid.map((x) => { const [v2, d2] = I2(x + t, sg), [v1] = I(x, sg); return { r: v2 + noise[x] - (a * v1 + b), g: d2, v1 }; });
+    const E = (t, a, b, sg) => residuals(t, a, b, sg).reduce((s, q) => s + q.r * q.r, 0) / xsGrid.length;
+    const gnStep = (sg) => {
+      const R = residuals(est.t, est.a, est.b, sg);
+      if (!aff) { let num = 0, den = 0; for (const q of R) { num += q.g * q.r; den += q.g * q.g; } est.t -= V4U.clamp(num / Math.max(den, 1e-9), -6, 6); }
+      else {
+        const H = [[0, 0, 0], [0, 0, 0], [0, 0, 0]], g = [0, 0, 0];
+        for (const q of R) { const J = [q.g, -q.v1, -1]; for (let i = 0; i < 3; i++) { g[i] += J[i] * q.r; for (let j = 0; j < 3; j++) H[i][j] += J[i] * J[j]; } }
+        for (let i = 0; i < 3; i++) H[i][i] *= 1.0001;
+        const det3 = (m) => m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+        const D = det3(H), sol = [0, 1, 2].map((c) => { const m = H.map((rw) => rw.slice()); for (let i = 0; i < 3; i++) m[i][c] = g[i]; return det3(m) / D; });
+        est.t -= V4U.clamp(sol[0], -6, 6); est.a -= sol[1]; est.b -= sol[2];
+      }
+      trail.push({ t: est.t, lv });
+    };
+    const draw = V4U.canvas(cv, (w) => Math.round(Math.min(420, Math.max(330, w * 0.5))), (ctx, w, h) => {
+      $('o-ph-t0').textContent = (+slT0.value).toFixed(1); $('o-ph-a').textContent = fmt(exposure());
+      const sg = LEVELS[lv], L = 44, Rm = 12, ph1 = h * 0.42, top2 = ph1 + 26, ph2 = h - top2 - 26;
+      const line = C('--line'), ink2 = C('--ink-2');
+      ctx.font = mono(11.5);
+      // panel 1: signals over x
+      const Xs = (x) => L + (x - 30) / 140 * (w - L - Rm);
+      ctx.strokeStyle = line; ctx.lineWidth = 1; ctx.strokeRect(L, 6, w - L - Rm, ph1);
+      ctx.fillStyle = ink2; ctx.textAlign = 'right'; ctx.fillText('I', L - 8, 6 + ph1 / 2);
+      let vmin = 1e9, vmax = -1e9;
+      for (let x = 30; x <= 170; x += 0.5) { const v = est.a * I(x, sg)[0] + est.b, v2 = I2(x + est.t, sg)[0]; vmin = Math.min(vmin, v, v2); vmax = Math.max(vmax, v, v2); }
+      const vpad = 0.12 * (vmax - vmin + 1e-6), Yv = (v) => 6 + ph1 - (v - vmin + vpad) / (vmax - vmin + 2 * vpad) * ph1;
+      const sig = (fn, col, lw) => { ctx.strokeStyle = col; ctx.lineWidth = lw; ctx.beginPath(); for (let i = 0; i <= 280; i++) { const x = 30 + i / 2; const y = Yv(fn(x)); i ? ctx.lineTo(Xs(x), y) : ctx.moveTo(Xs(x), y); } ctx.stroke(); };
+      ctx.save(); ctx.beginPath(); ctx.rect(L, 6, w - L - Rm, ph1); ctx.clip();
+      sig((x) => est.a * I(x, sg)[0] + est.b, C('--c1'), 2);
+      sig((x) => I2(x + est.t, sg)[0] + (sg === 0 ? noise[Math.round(x)] : 0), C('--c2'), 1.6);
+      ctx.restore();
+      ctx.textAlign = 'right'; ctx.fillStyle = ink2; ctx.fillText('x (px)', w - Rm, ph1 + 20);
+      // panel 2: cost vs t
+      const T0 = -25, T1 = 35, Xt = (t) => L + (t - T0) / (T1 - T0) * (w - L - Rm);
+      const curve = (s) => { const out = []; for (let i = 0; i <= 240; i++) { const t = T0 + i / 240 * (T1 - T0); out.push([t, E(t, aff ? est.a : 1, aff ? est.b : 0, s)]); } return out; };
+      const cc = curve(sg), cf = lv ? curve(0) : null, emax = Math.max(...cc.map((q) => q[1]), ...(cf ? cf.map((q) => q[1]) : [0])) * 1.05;
+      const Ye = (e) => top2 + ph2 - e / emax * ph2;
+      ctx.strokeStyle = line; ctx.strokeRect(L, top2, w - L - Rm, ph2);
+      ctx.fillStyle = ink2; ctx.textAlign = 'right'; ctx.fillText('E', L - 8, top2 + ph2 / 2);
+      ctx.setLineDash([3, 3]); ctx.strokeStyle = C('--muted'); ctx.beginPath(); ctx.moveTo(Xt(TSTAR), top2); ctx.lineTo(Xt(TSTAR), top2 + ph2); ctx.stroke(); ctx.setLineDash([]);
+      if (cf) { ctx.strokeStyle = C('--line-2'); ctx.lineWidth = 1.2; ctx.beginPath(); cf.forEach(([t, e], i) => (i ? ctx.lineTo(Xt(t), Ye(e)) : ctx.moveTo(Xt(t), Ye(e)))); ctx.stroke(); }
+      ctx.strokeStyle = ink2; ctx.lineWidth = 2; ctx.beginPath(); cc.forEach(([t, e], i) => (i ? ctx.lineTo(Xt(t), Ye(e)) : ctx.moveTo(Xt(t), Ye(e)))); ctx.stroke();
+      const c4 = C('--c4');
+      trail.forEach((q, i) => { const t = V4U.clamp(q.t, T0, T1), e = E(q.t, aff ? est.a : 1, aff ? est.b : 0, sg); ctx.fillStyle = c4; ctx.globalAlpha = 0.35 + 0.65 * (i + 1) / trail.length; ctx.beginPath(); ctx.arc(Xt(t), Ye(Math.min(e, emax)), i === trail.length - 1 ? 6 : 3.5, 0, 2 * Math.PI); ctx.fill(); });
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = ink2; ctx.textAlign = 'center';
+      for (let t = -20; t <= 30; t += 10) ctx.fillText(String(t), Xt(t), top2 + ph2 + 16);
+      ctx.textAlign = 'left'; ctx.fillText('t* = ' + TSTAR, Xt(TSTAR) + 4, top2 + 14);
+      ctx.textAlign = 'left';
+      const ok = Math.abs(est.t - TSTAR) < 0.5;
+      rd.innerHTML = `<span>当前层 σ = <b>${sg}</b> px</span><span>t̂ = <b>${est.t.toFixed(2)}</b> px（真值 ${TSTAR}）</span><span>${ok ? '收敛到真值' : '未到真值'}</span><span>原图上的 E(t̂) = <b>${E(est.t, aff ? est.a : 1, aff ? est.b : 0, 0).toExponential(2)}</b></span>` + (aff ? `<span>â = <b>${fmt(est.a)}</b>，b̂ = <b>${fmt(est.b)}</b></span>` : '') + `<span>迭代 <b>${trail.length - 1}</b></span>`;
+    });
+    const reset = () => { if (timer) { clearTimeout(timer); timer = null; } est = { t: +slT0.value, a: 1, b: 0 }; trail = [{ t: est.t, lv }]; draw(); };
+    const run = (plan) => { if (timer) clearTimeout(timer); let k = 0; const go = () => { if (k >= plan.length) { timer = null; return; } lv = plan[k]; setSeg(String(lv), true); gnStep(LEVELS[lv]); draw(); k++; timer = setTimeout(go, reduced ? 0 : 140); }; go(); };
+    let quiet = false;
+    const setSeg = (v, q) => { quiet = q; segSet(v); quiet = false; };
+    const segSet = V4U.seg($('sg-ph-lv'), (v) => { lv = +v; if (!quiet && trail.length) { trail = [{ t: est.t, lv }]; } draw(); });
+    V4U.seg($('sg-ph-aff'), (v) => { aff = v === '1'; reset(); });
+    slT0.addEventListener('input', reset);
+    slA.addEventListener('input', reset);
+    $('bt-ph-gn').addEventListener('click', () => run(Array(15).fill(lv)));
+    $('bt-ph-pyr').addEventListener('click', () => { est = { t: +slT0.value, a: 1, b: 0 }; trail = [{ t: est.t, lv: 3 }]; run([3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0]); });
+    reset();
+    for (let k = 0; k < 15; k++) gnStep(0);
+    draw();
+  })();
+
+  /* =====================================================================
+     V6: BA sparsity — J, H = JᵀJ, Schur complement S
+     ===================================================================== */
+  (function () {
+    const cv = $('cv-ba'), rd = $('rd-ba'), slC = $('sl-ba-c'), slP = $('sl-ba-p'), slW = $('sl-ba-w');
+    let sel = 0, geo = null;
+    const build = () => {
+      const nc = +slC.value, np = +slP.value, wv = Math.min(+slW.value, nc);
+      $('o-ba-c').textContent = nc; $('o-ba-p').textContent = np; $('o-ba-w').textContent = wv;
+      const obs = [];
+      for (let j = 0; j < np; j++) { const k = np === 1 ? 0 : Math.round(j * (nc - wv) / (np - 1)); for (let i = k; i < k + wv; i++) obs.push([i, j]); }
+      return { nc, np, obs };
+    };
+    const layout = (w) => {
+      const { nc, np, obs } = build(), D = 6 * nc + 3 * np, R = 2 * obs.length;
+      if (w >= 640) {
+        const h = 360, avail = w - 40, csJ = Math.min((h - 40) / R, (avail * 0.42) / D), csH = Math.min((h - 40) / D, (avail * 0.36) / D);
+        const csS = Math.min((h - 40) / (6 * nc), (avail * 0.2) / (6 * nc), csH * 1.6);
+        const J = { x: 8, y: 24, cs: csJ }, Hm = { x: J.x + D * csJ + 20, y: 24, cs: csH }, Sm = { x: Hm.x + D * csH + 20, y: 24, cs: csS };
+        return { h, J, Hm, Sm };
+      }
+      const csJ = Math.min((w - 16) / D, 300 / R), csH = (w - 16) / D * 0.9, csS = Math.min((w - 16) / (6 * nc) * 0.6, 7);
+      const J = { x: 8, y: 22, cs: csJ }, Hm = { x: 8, y: J.y + R * csJ + 30, cs: csH }, Sm = { x: 8, y: Hm.y + D * csH + 30, cs: csS };
+      return { h: Math.ceil(Sm.y + 6 * nc * csS + 10), J, Hm, Sm };
+    };
+    const draw = V4U.canvas(cv, (w) => layout(w).h, (ctx, w, h) => {
+      const { nc, np, obs } = build();
+      if (sel >= obs.length) sel = 0;
+      const D = 6 * nc + 3 * np, R = 2 * obs.length;
+      const c1 = RGB('--c1'), c2 = RGB('--c2'), c3 = RGB('--c3'), c4 = RGB('--c4'), ink = C('--ink'), surf2 = C('--surface-2');
+      const { J, Hm, Sm } = layout(w);
+      geo = { J, R, obsN: obs.length };
+      const box = (M, rows, cols) => { ctx.fillStyle = surf2; ctx.fillRect(M.x, M.y, cols * M.cs, rows * M.cs); ctx.strokeStyle = C('--line-2'); ctx.lineWidth = 1; ctx.strokeRect(M.x, M.y, cols * M.cs, rows * M.cs); };
+      const blk = (M, r0, c0, nr, ncol, col, a = 0.9) => { ctx.fillStyle = rgba(col, a); ctx.fillRect(M.x + c0 * M.cs, M.y + r0 * M.cs, ncol * M.cs, nr * M.cs); };
+      const hl = (M, r0, c0, nr, ncol) => { ctx.strokeStyle = ink; ctx.lineWidth = 2; ctx.strokeRect(M.x + c0 * M.cs - 1, M.y + r0 * M.cs - 1, ncol * M.cs + 2, nr * M.cs + 2); };
+      const cam = (i) => 6 * i, pt = (j) => 6 * nc + 3 * j;
+      // J
+      box(J, R, D);
+      obs.forEach(([i, j], k) => { blk(J, 2 * k, cam(i), 2, 6, c1); blk(J, 2 * k, pt(j), 2, 3, c3); });
+      // H
+      box(Hm, D, D);
+      for (let i = 0; i < nc; i++) blk(Hm, cam(i), cam(i), 6, 6, c1);
+      for (let j = 0; j < np; j++) blk(Hm, pt(j), pt(j), 3, 3, c3);
+      obs.forEach(([i, j]) => { blk(Hm, cam(i), pt(j), 6, 3, c2); blk(Hm, pt(j), cam(i), 3, 6, c2); });
+      ctx.strokeStyle = C('--ink-2'); ctx.lineWidth = 1; ctx.setLineDash([3, 3]); ctx.beginPath();
+      ctx.moveTo(Hm.x + 6 * nc * Hm.cs, Hm.y); ctx.lineTo(Hm.x + 6 * nc * Hm.cs, Hm.y + D * Hm.cs); ctx.moveTo(Hm.x, Hm.y + 6 * nc * Hm.cs); ctx.lineTo(Hm.x + D * Hm.cs, Hm.y + 6 * nc * Hm.cs); ctx.stroke(); ctx.setLineDash([]);
+      // S
+      const S = [...Array(nc)].map(() => Array(nc).fill(false));
+      const byPt = {}; obs.forEach(([i, j]) => (byPt[j] = byPt[j] || []).push(i));
+      for (const j in byPt) for (const a of byPt[j]) for (const b of byPt[j]) S[a][b] = true;
+      for (let a = 0; a < nc; a++) S[a][a] = true;
+      box(Sm, 6 * nc, 6 * nc);
+      let nzS = 0;
+      for (let a = 0; a < nc; a++) for (let b = 0; b < nc; b++) if (S[a][b]) { nzS++; blk(Sm, 6 * a, 6 * b, 6, 6, c4); }
+      // highlight the selected observation
+      const [si, sj] = obs[sel];
+      hl(J, 2 * sel, 0, 2, D);
+      hl(Hm, cam(si), cam(si), 6, 6); hl(Hm, pt(sj), pt(sj), 3, 3); hl(Hm, cam(si), pt(sj), 6, 3); hl(Hm, pt(sj), cam(si), 3, 6);
+      for (const a of byPt[sj]) for (const b of byPt[sj]) hl(Sm, 6 * a, 6 * b, 6, 6);
+      ctx.fillStyle = C('--ink-2'); ctx.font = mono(12); ctx.textAlign = 'left';
+      ctx.fillText(`J  ${R}×${D}`, J.x, J.y - 7); ctx.fillText(`H  ${D}×${D}`, Hm.x, Hm.y - 7); ctx.fillText(`S  ${6 * nc}×${6 * nc}`, Sm.x, Sm.y - 7);
+      const nzHblk = nc + np + 2 * obs.length;
+      rd.innerHTML = `<span>观测 <b>${obs.length}</b></span><span>完整系统 <b>${D}</b> 维</span><span>Schur 后 <b>${6 * nc}</b> 维</span><span>H 非零块 <b>${nzHblk}</b> / ${(nc + np) ** 2}</span><span>S 非零块 <b>${nzS}</b> / ${nc * nc}</span><span>选中：相机 <b>${si + 1}</b> 看点 <b>${sj + 1}</b>（这个点被 ${byPt[sj].length} 个相机看到）</span>`;
+    });
+    [slC, slP, slW].forEach((s) => s.addEventListener('input', draw));
+    const pick = (e) => {
+      if (!geo) return;
+      const r = cv.getBoundingClientRect(), y = e.clientY - r.top, x = e.clientX - r.left, { J, R, obsN } = geo;
+      if (x < J.x - 4 || y < J.y || y > J.y + R * J.cs) return;
+      const k = Math.floor((y - J.y) / J.cs / 2);
+      if (k >= 0 && k < obsN && k !== sel) { sel = k; draw(); }
+    };
+    cv.addEventListener('click', pick);
+    cv.addEventListener('pointermove', (e) => { if (e.pointerType === 'mouse') pick(e); });
+  })();
+});
+</script>
+</body>
+</html>
