@@ -132,11 +132,6 @@
   </ul>
   <p>绕哪根轴转，那根轴上的坐标就不变，矩阵里对应的行和列只有一个 1；另外两根轴在与它垂直的平面里做二维旋转 $\begin{bmatrix}\cos&-\sin\\\sin&\cos\end{bmatrix}$。按第一节的读法，每一列是对应坐标轴转过去以后的方向：</p>
   <div class="eq trio">$$R_x(\phi)=\begin{bmatrix}1&0&0\\0&\cos\phi&-\sin\phi\\0&\sin\phi&\cos\phi\end{bmatrix}$$ $$R_y(\theta)=\begin{bmatrix}\cos\theta&0&\sin\theta\\0&1&0\\-\sin\theta&0&\cos\theta\end{bmatrix}$$ $$R_z(\psi)=\begin{bmatrix}\cos\psi&-\sin\psi&0\\\sin\psi&\cos\psi&0\\0&0&1\end{bmatrix}$$</div>
-  <ul>
-    <li><b>$R_y$ 的正负号</b>：$-\sin$ 在左下角，和另外两个正好相反，这不是笔误。按 $x\to y\to z\to x$ 的循环顺序，绕 x 的正向把 y 转向 z，绕 z 的正向把 x 转向 y，绕 y 的正向则是把 <b>z 转向 x</b>。所以 $R_y$ 的第 3 列（z 轴转过去）是 $(\sin\theta,0,\cos\theta)$，第 1 列（x 轴转过去）是 $(\cos\theta,0,-\sin\theta)$。</li>
-    <li><b>转角的正方向</b>按右手定则：拇指指向轴的正方向，四指弯曲的方向为正。在上面的坐标系里，yaw 为正是向左转（x 轴转向 +y）；pitch 为正是<b>低头</b>（x 轴转向 −z）；roll 为正是向右侧倾（y 轴转向 +z，左侧抬高）。航空常用 x 前、y 右、z 下，同一个 $R_y$ 下 pitch 为正就变成抬头。</li>
-  </ul>
-  <p>在第一节的图里选「绕 y」，读数就是 $R_y(\theta)$ 的三列。</p>
 
   <h3>轴序、内旋与外旋</h3>
   <ul>
@@ -431,7 +426,6 @@
   <details class="q"><summary>${}^{W}R_{E}$ 的第 3 列是什么？</summary><div><p>末端坐标系的 z 轴在世界系下的方向。夹爪常把 z 定义成接近方向，所以第 3 列就是「夹爪指向哪」。</p></div></details>
   <details class="q"><summary>「从单位姿态出发，先绕世界 z 转 30°，再绕自身 x 转 20°」写成矩阵是什么？</summary><div><p>第一步得 $R_z(30^\circ)$；绕自身轴是右乘，所以 $R=R_z(30^\circ)R_x(20^\circ)$。等价读法：先绕世界 x 转 20°，再绕世界 z 转 30°。</p></div></details>
   <details class="q"><summary>SciPy 的 <code>from_euler('xyz', [φ,θ,ψ])</code> 与 <code>from_euler('ZYX', [ψ,θ,φ])</code> 一样吗？</summary><div><p>一样，都是 $R_z(\psi)R_y(\theta)R_x(\phi)$：前者外旋（依次左乘），后者内旋（依次右乘），轴序和角度顺序都倒过来。</p></div></details>
-  <details class="q"><summary>x 朝前、y 朝左、z 朝上的末端坐标系里，pitch = +10° 是抬头还是低头？</summary><div><p>低头。$R_y(10^\circ)$ 的第 1 列（x 轴转过去）是 $(\cos10^\circ,0,-\sin10^\circ)\approx(0.985,0,-0.174)$，z 分量为负，朝前的轴往下偏。</p></div></details>
   <details class="q"><summary>按 wxyz 存的四元数 (0.707, 0, 0, 0.707) 是什么旋转？</summary><div><p>$w=\cos\frac\theta2=0.707$，所以 $\theta=90^\circ$；$(x,y,z)=(0,0,0.707)$ 指向 +z。绕 z 轴转 90°。</p></div></details>
   <details class="q"><summary>一个按 xyzw 存的单位旋转 <code>[0,0,0,1]</code> 被当成 wxyz 读，会得到什么？</summary><div><p>w = 0、z = 1：绕 z 轴转 180°。代码不会报错，只是姿态整个转了半圈。</p></div></details>
   <details class="q"><summary>为什么直接用 L2 回归四元数会出问题，怎么改？</summary><div><p>q 与 −q 是同一个旋转。标签不规范化时同一姿态有两个目标；规范化到 w ≥ 0 后在 180° 附近跳变。改用 $1-|q\cdot\hat q|$ 这类符号无关的损失，或改用 6D / 9D 输出。</p></div></details>
