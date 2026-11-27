@@ -322,7 +322,7 @@
   <ul>
     <li><b>定理</b>（Zhou et al., CVPR 2019）：$SO(3)$ 同胚于实射影空间 $\mathbb{RP}^3$，而 $\mathbb{RP}^3$ 能嵌入 $\mathbb{R}^5$、不能嵌入任何 $d\lt5$ 的 $\mathbb{R}^d$。所以 <b>4 维及以下</b>的表示（欧拉角 3、旋转向量 3、四元数 4）都必有不连续点；5 维（立体投影构造）和 6 维存在连续表示。</li>
     <li><b>四元数为什么也不行</b>：要么允许 $\pm q$ 两个目标（不是函数），要么规定 $w\ge0$，于是在 $w=0$（转角 $180^\circ$）处跳变。</li>
-    <li><b>6D 表示</b>：$g(R)$ 取 $R$ 的前两列 $[\mathbf a_1,\mathbf a_2]$，显然连续；从网络任意的 6 维输出还原 $R$ 用 Gram–Schmidt。</li>
+    <li><b>6D 表示</b>：训练目标取 $R$ 的前两列（6 个数），显然连续。网络输出的 6 个数拆成两根 3 维向量 $\mathbf a_1,\mathbf a_2$，不一定单位长、也不一定垂直；用 Gram–Schmidt 变成旋转矩阵的三列 $\mathbf b_1,\mathbf b_2,\mathbf b_3$，第三列不来自网络输出，由叉积得到。</li>
   </ul>
   <ol class="derive">
     <li><p>第一列只归一化：</p>$$\mathbf b_1=\frac{\mathbf a_1}{\|\mathbf a_1\|}$$</li>
@@ -356,7 +356,7 @@
     </div>
     <div class="viz-read" id="rd-gs"></div>
     <ul class="chips"><li><i style="background:var(--muted)"></i>真值 R*</li><li><i style="background:var(--c1)"></i>a₁（虚）→ b₁（实）</li><li><i style="background:var(--c2)"></i>a₂（虚）→ b₂（实）</li><li><i style="background:var(--c3)"></i>b₃ = b₁ × b₂</li><li><i style="background:var(--c5)"></i>被减掉的 (b₁·a₂)b₁</li></ul>
-    <figcaption>模拟网络输出：真值矩阵 R* 加高斯噪声得到 3×3 的 M。6D 只用 M 的前两列做 Gram–Schmidt；9D 用整个 M 做 SVD 投影。读数给出两者与真值的测地角误差。</figcaption>
+    <figcaption>灰色是真值 R* 的三根轴。模拟网络输出：R* 加高斯噪声得到 3×3 的 M。6D 只取 M 的前两列 a₁、a₂（虚线），Gram–Schmidt 得到 b₁、b₂（实线），b₃ = b₁ × b₂，三根实线就是还原出的旋转。9D 用 M 的全部 9 个数做 SVD，图里不画，只在读数里给出它与真值的角度误差。σ = 0 时所有向量与真值重合。</figcaption>
   </figure>
 
   <div class="note pit"><b>易错：前两列还是前两行</b><p>Zhou et al. 原文取前两<b>列</b>。PyTorch3D 的 <code>matrix_to_rotation_6d</code> 文档写的是 dropping the last row，即取前两<b>行</b>；UMI 代码里的 <code>mat_to_rot6d</code> 也取前两行。两种都连续，但同一个 6 维向量按两种约定解码出来是互为转置（互逆）的旋转，混用不会报错。</p></div>
@@ -902,13 +902,13 @@ V4U.ready(() => {
       const v3 = col(Vs, 2), H = I3.map((r, i) => r.map((x, j) => x - 2 * v3[i] * v3[j]));
       return mm(Q, H);
     };
-    const V = V4U.orbit3d($('cv-gs'), { height: 360, dist: 3.2, yaw: -1.0, pitch: 0.4 }, (ctx, P) => {
+    const V = V4U.orbit3d($('cv-gs'), { height: 360, dist: 3.9, yaw: -1.0, pitch: 0.4, target: [0.35, 0.16, 0.3] }, (ctx, P) => {
       const sig = +sl.value; $('o-gs').textContent = f2(sig);
       const g = gaussOf(rng(seed));
       const M = Rstar.map((r) => r.map((x) => x + sig * g()));
       const a1 = col(M, 0), a2 = col(M, 1), b1 = unit(a1), proj = sc(b1, dot(b1, a2)), b2 = unit(sub(a2, proj)), b3 = cross(b1, b2);
       const Rgs = fromCols(b1, b2, b3), Rsvd = svdProj(M);
-      frame3(ctx, P, [0, 0, 0], Rstar, 1.0, 1);
+      for (let k = 0; k < 3; k++) P.line([0, 0, 0], col(Rstar, k), C('--muted'), 1.5);
       ['x*', 'y*', 'z*'].forEach((s, k) => P.text(sc(col(Rstar, k), 1.06), s, C('--muted')));
       arrow3(ctx, P, [0, 0, 0], a1, C('--c1'), 2, [5, 4]); arrow3(ctx, P, [0, 0, 0], a2, C('--c2'), 2, [5, 4]);
       P.text(a1, 'a₁', C('--c1')); P.text(a2, 'a₂', C('--c2'));
