@@ -11,9 +11,9 @@
     {
       "id": "vision3d",
       "no": "2",
-      "title": "3D 视觉与图形学",
-      "en": "3D Vision & Graphics",
-      "summary": "三维场景用什么数据结构表示，怎样边走边建图和定位，以及前馈式的 3D 重建与生成模型。"
+      "title": "视觉基础模型与 3D 视觉",
+      "en": "Vision Foundation Models & 3D Vision",
+      "summary": "三维场景用什么数据结构表示，怎样边走边建图和定位；DINO、CLIP、SAM、Depth Anything 这类二维视觉基础模型各学到了什么、怎么接进机器人系统；以及前馈式的 3D 重建与生成模型。"
     },
     {
       "id": "agentic-rl",
@@ -104,9 +104,18 @@
       "summary": "边走边定位边建图：前端里程计、后端因子图与光束法平差、回环检测，以及学习式和高斯式 SLAM 的近年进展。"
     },
     {
-      "slug": "3d-foundation-models",
+      "slug": "vision-foundation-models",
       "section": "vision3d",
       "no": "iii",
+      "title": "视觉基础模型",
+      "short": "视觉基础模型",
+      "en": "Vision Foundation Models",
+      "summary": "ViT 特征、自监督的 DINO 系列、图文对齐的 CLIP / SigLIP、开放词表检测 Grounding DINO、可提示分割 SAM 1–3 与 Grounded SAM、单目深度 Depth Anything：各自怎么训、输出什么、在机器人里怎么组合使用。"
+    },
+    {
+      "slug": "3d-foundation-models",
+      "section": "vision3d",
+      "no": "iv",
       "title": "3D 基础模型",
       "short": "3D 基础模型",
       "en": "3D Foundation Models",

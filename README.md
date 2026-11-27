@@ -18,11 +18,12 @@ Visualize for Understanding：机器人学习研究要补的预备知识，每�
 - (v) [实时分块执行（RTC）](https://gongshukai.github.io/Vis4Und/pages/rtc/) — 推理有延迟时动作块怎么衔接：同步执行、时间集成、异步队列，推理期 RTC 的冻结前缀与软掩码引导，训练期 RTC 的前缀条件化。
 - (vi) [仿真 RL 与行为克隆](https://gongshukai.github.io/Vis4Und/pages/sim-rl/) — 仿真 RL 具体怎么做（并行环境、奖励、域随机化、教师-学生蒸馏），为什么要做，和采数据训 VLA 的行为克隆差在哪里，以及两者怎么结合。
 
-### (2) 3D 视觉与图形学
+### (2) 视觉基础模型与 3D 视觉
 
 - (i) [3D 表征](https://gongshukai.github.io/Vis4Und/pages/3d-representations/) — 深度图、点云、体素、网格、SDF、NeRF 和 3D 高斯：各自存什么、怎么互相转换、什么任务该用哪种。
 - (ii) [SLAM](https://gongshukai.github.io/Vis4Und/pages/slam/) — 边走边定位边建图：前端里程计、后端因子图与光束法平差、回环检测，以及学习式和高斯式 SLAM 的近年进展。
-- (iii) [3D 基础模型](https://gongshukai.github.io/Vis4Und/pages/3d-foundation-models/) — 前馈式重建（DUSt3R、VGGT 一系）、单目几何估计，以及 3D 物体与场景生成。
+- (iii) [视觉基础模型](https://gongshukai.github.io/Vis4Und/pages/vision-foundation-models/) — ViT 特征、自监督的 DINO 系列、图文对齐的 CLIP / SigLIP、开放词表检测 Grounding DINO、可提示分割 SAM 1–3 与 Grounded SAM、单目深度 Depth Anything：各自怎么训、输出什么、在机器人里怎么组合使用。
+- (iv) [3D 基础模型](https://gongshukai.github.io/Vis4Und/pages/3d-foundation-models/) — 前馈式重建（DUSt3R、VGGT 一系）、单目几何估计，以及 3D 物体与场景生成。
 
 ### (3) Agentic RL
 

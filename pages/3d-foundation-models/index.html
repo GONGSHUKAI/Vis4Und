@@ -29,11 +29,11 @@
 </head>
 <body>
 <!-- v4u:nav -->
-<nav class="v4u-nav" aria-label="站点导航"><div class="v4u-nav-in"><span class="v4u-crumb"><a href="../../"><b>Vis4Und</b></a><span class="v4u-sep">/</span><a href="../../#vision3d">(2) 3D 视觉与图形学</a></span><span class="v4u-links"><a href="../3d-representations/">(i) 3D 表征</a><a href="../slam/">(ii) SLAM</a><a href="../3d-foundation-models/" aria-current="page">(iii) 3D 基础模型</a><button type="button" class="v4u-theme" aria-label="切换深浅色">深色</button></span></div></nav>
+<nav class="v4u-nav" aria-label="站点导航"><div class="v4u-nav-in"><span class="v4u-crumb"><a href="../../"><b>Vis4Und</b></a><span class="v4u-sep">/</span><a href="../../#vision3d">(2) 视觉基础模型与 3D 视觉</a></span><span class="v4u-links"><a href="../3d-representations/">(i) 3D 表征</a><a href="../slam/">(ii) SLAM</a><a href="../vision-foundation-models/">(iii) 视觉基础模型</a><a href="../3d-foundation-models/" aria-current="page">(iv) 3D 基础模型</a><button type="button" class="v4u-theme" aria-label="切换深浅色">深色</button></span></div></nav>
 <!-- /v4u:nav -->
 
 <header class="hero"><div class="wrap">
-  <p class="kicker">(2) 3D 视觉与图形学 · (iii)</p>
+  <p class="kicker">(2) 视觉基础模型与 3D 视觉 · (iv)</p>
   <h1>3D 基础模型</h1>
   <p class="lede">一个前馈网络直接从图像吐出几何（相机、深度、点图），或从文字、图像直接生成 3D 物体和场景。本页按依赖顺序讲表示、损失和代表模型，近年进展截至 2026-11。</p>
   <p class="asks-h">读完能回答</p>
@@ -202,10 +202,10 @@
   <p>下一步是让网络一次看 $N$ 张图，把全局对齐吸收到注意力里。区别主要在两件事：注意力怎么在帧之间连（决定复杂度和能否流式）、输出定义在哪个坐标系（决定是否依赖参考帧）。</p>
   <ul>
     <li><b>Fast3R</b>（CVPR 2025）：DUSt3R 的多视图版，所有图的 token 做全局注意力，一次前向处理上千张无序图。</li>
-    <li><b>VGGT</b>（CVPR 2025 最佳论文）：约 12 亿参数；DINO 切 patch，每帧加一个相机 token，24 组「帧内注意力 + 全局注意力」交替。输出每帧的相机 $g_n=[\mathbf q_n,\mathbf t_n,\mathrm{fov}_n]\in\mathbb R^9$、深度图、点图和用于跟踪的特征图；第一帧定义世界系，真值按点到原点的平均距离归一化。损失 $\mathcal L=\mathcal L_{\text{cam}}+\mathcal L_{\text{depth}}+\mathcal L_{\text{pmap}}+0.05\,\mathcal L_{\text{track}}$，深度和点图项都带与 DUSt3R 同形的不确定度加权与 $-\alpha\log\Sigma$ 正则。</li>
+    <li><b>VGGT</b>（CVPR 2025 最佳论文）：约 12 亿参数；<a href="../vision-foundation-models/#dino">DINO</a> 切 patch，每帧加一个相机 token，24 组「帧内注意力 + 全局注意力」交替。输出每帧的相机 $g_n=[\mathbf q_n,\mathbf t_n,\mathrm{fov}_n]\in\mathbb R^9$、深度图、点图和用于跟踪的特征图；第一帧定义世界系，真值按点到原点的平均距离归一化。损失 $\mathcal L=\mathcal L_{\text{cam}}+\mathcal L_{\text{depth}}+\mathcal L_{\text{pmap}}+0.05\,\mathcal L_{\text{track}}$，深度和点图项都带与 DUSt3R 同形的不确定度加权与 $-\alpha\log\Sigma$ 正则。</li>
     <li><b>π³</b>（ICLR 2026）：去掉所有与顺序有关的部件（帧序号嵌入、标记参考帧的相机 token），每帧输出<b>自己相机系</b>下的局部点图、位姿 $T_n$ 和置信度。网络对输入置换等变：$\phi(P_\pi S)=P_\pi\,\phi(S)$。监督只用相对位姿 $T_{i\leftarrow j}=T_i^{-1}T_j$ 和一个全序列共享的尺度 $s^*$，结果不再随「谁是第一帧」变化。2025-12 的 Pi3X 支持可选的位姿、内参、深度输入和近似米制尺度。</li>
     <li><b>MapAnything</b>（3DV 2026）：因子化输出，每帧给射线方向 $R_n$、沿射线的无尺度深度 $\tilde D_n$、位姿 $(O_n,\tilde T_n)$，再加一个全局米制尺度 $m$，$X^{\text{metric}}_n=m\,\big(O_n(R_n\odot\tilde D_n)+\tilde T_n\big)$。内参、位姿、深度都可选地作为输入，一个模型覆盖 12 种以上任务（SfM、MVS、定位、深度补全…）。</li>
-    <li><b>Depth Anything 3</b>（ICLR 2026）：骨干就是普通 DINOv2，每帧输出深度 $D$ 和射线图（每像素射线原点 $\mathbf t$ 和方向 $\mathbf d$），点为 $P=\mathbf t+D\,\mathbf d$，相机从射线解出。作者报告相机位姿精度比 VGGT 平均高 35.7%、几何精度高 23.6%；单张图时退化为单目深度模型。</li>
+    <li><b>Depth Anything 3</b>（ICLR 2026）：骨干就是普通 <a href="../vision-foundation-models/#dino">DINOv2</a>，每帧输出深度 $D$ 和射线图（每像素射线原点 $\mathbf t$ 和方向 $\mathbf d$），点为 $P=\mathbf t+D\,\mathbf d$，相机从射线解出。作者报告相机位姿精度比 VGGT 平均高 35.7%、几何精度高 23.6%；单张图时退化为单目深度模型。</li>
     <li><b>VGGT-Ω</b>（CVPR 2026 Oral）：最大 100 亿参数；每帧 16 个寄存器 token，用「寄存器注意力」替换 25% 的全局注意力层（跨帧只在寄存器之间交换），训练显存约为 VGGT 的 30%，监督数据量约 15 倍，并用无标注视频做自监督；支持动态场景，输出深度和相机。</li>
     <li><b>D4RT</b>（CVPR 2026 最佳论文）：编码器把整段视频编码一次，轻量解码器回答「像素 $p$ 在时刻 $t$、从相机 $c$ 看的 3D 位置」这样的查询；深度、点跟踪、点云和相机都由查询得到，相机用闭式 Umeyama 对齐求出，面向动态场景。</li>
   </ul>
@@ -539,7 +539,7 @@
 </div>
 
 <!-- v4u:foot -->
-<footer class="v4u-foot"><div class="v4u-foot-in"><a class="pv" href="../slam/"><span>上一篇</span>SLAM</a><a class="nx" href="../llm-rl-basics/"><span>下一篇</span>LLM 强化学习基础</a></div></footer>
+<footer class="v4u-foot"><div class="v4u-foot-in"><a class="pv" href="../vision-foundation-models/"><span>上一篇</span>视觉基础模型</a><a class="nx" href="../llm-rl-basics/"><span>下一篇</span>LLM 强化学习基础</a></div></footer>
 <!-- /v4u:foot -->
 
 <script>

@@ -1,0 +1,1952 @@
+<!doctype html>
+<html lang="zh-CN" data-sec="vision3d">
+<head>
+<!-- v4u:head -->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="icon" href="data:,">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700&family=Inter+Tight:wght@700&family=JetBrains+Mono:wght@400;700&family=Noto+Sans+SC:wght@400;700&display=swap">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<link rel="stylesheet" href="../../assets/v4u.css?v=691854ab">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
+<script src="../../assets/v4u.js?v=d6640e00"></script>
+<!-- /v4u:head -->
+<title>视觉基础模型 · Vis4Und</title>
+<meta name="description" content="ViT 特征、自监督的 DINO 系列、图文对齐的 CLIP / SigLIP、开放词表检测 Grounding DINO、可提示分割 SAM 1–3 与 Grounded SAM、单目深度 Depth Anything：训练监督、输出接口、名字辨析与机器人用法。">
+<style>
+.katex,.tbl,.not-scroll{position:relative}
+.not-scroll{overflow-x:auto;max-width:52em}
+.not-scroll .notation{margin:14px 0}
+.viz-stage canvas{touch-action:pan-y}
+.viz-stage canvas.drag-x{touch-action:none;cursor:grab}
+.viz-stage canvas.drag-x:active{cursor:grabbing}
+.viz-stage canvas.pick{cursor:crosshair}
+.viz-ctrl .chk{gap:6px;cursor:pointer}
+.viz-ctrl .chk input{margin:0}
+.pane-t{font:700 13px/1.4 var(--f-body);color:var(--ink-2);margin:0 0 6px}
+.tbl.wide table{min-width:860px}
+.tbl.mid table{min-width:680px}
+.tbl td small{color:var(--muted)}
+</style>
+</head>
+<body>
+<!-- v4u:nav -->
+<nav class="v4u-nav" aria-label="站点导航"><div class="v4u-nav-in"><span class="v4u-crumb"><a href="../../"><b>Vis4Und</b></a><span class="v4u-sep">/</span><a href="../../#vision3d">(2) 视觉基础模型与 3D 视觉</a></span><span class="v4u-links"><a href="../3d-representations/">(i) 3D 表征</a><a href="../slam/">(ii) SLAM</a><a href="../vision-foundation-models/" aria-current="page">(iii) 视觉基础模型</a><a href="../3d-foundation-models/">(iv) 3D 基础模型</a><button type="button" class="v4u-theme" aria-label="切换深浅色">深色</button></span></div></nav>
+<!-- /v4u:nav -->
+
+<header class="hero"><div class="wrap">
+  <p class="kicker">(2) 视觉基础模型与 3D 视觉 · (iii)</p>
+  <h1>视觉基础模型</h1>
+  <p class="lede">在进入 3D 重建和 VLA 策略之前，先理清 2D 视觉基础模型：DINO、CLIP / SigLIP、Grounding DINO、SAM 1–3 与 Grounded SAM、Depth Anything 各自吃什么输入、吐什么输出、靠什么监督训出来、名字撞车的几个模型究竟是什么关系，以及机器人系统里怎么挑、怎么拼。近年进展截至 2026-11。</p>
+  <p class="asks-h">读完能回答</p>
+  <ul class="asks">
+    <li>自监督的 DINO、检测器 DINO-DETR、Grounding DINO 和 Grounded SAM 分别是什么，为什么名字容易混？</li>
+    <li>DINO 靠什么防塌缩？CLIP 的 InfoNCE 和 SigLIP 的逐对 sigmoid 在梯度与大批量上差在哪？</li>
+    <li>Grounding DINO 怎样把检测做成框与文本 token 匹配，SAM 1 → 2 → 3 和 Grounded SAM 的边界在哪？</li>
+    <li>Depth Anything 的「教师–伪标签–学生」数据引擎为什么有效，V2 为什么改用纯合成图训教师？</li>
+    <li>做 VLA 视觉骨干、按语言抠点云、关键点迁移和自动标注时，分别该选哪些模型、有哪些工程坑？</li>
+  </ul>
+</div></header>
+
+<div class="wrap layout">
+<nav class="toc" id="toc" aria-label="本页目录"></nav>
+<main>
+
+<!-- ============================================================ -->
+<section id="overview">
+  <h2 data-toc="总览与名字辨析">总览：六类模型与名字辨析</h2>
+  <p>机器人感知里常被一起提到的「视觉基础模型」分属五种不同的输出接口（表征、图文对齐、开放词表检测、可提示分割、单目深度），再加一套把检测和分割串起来的组合流程。</p>
+
+  <div class="tbl wide"><table>
+    <thead><tr><th>模型族</th><th>输入</th><th>输出</th><th>训练监督</th><th>典型用法</th></tr></thead>
+    <tbody>
+      <tr><td>DINO / DINOv2 / DINOv3</td><td>RGB 图像</td><td>全局 <code>[CLS]</code> + 稠密 patch 特征</td><td>纯图像自蒸馏（无文本、无人工标签）；V2/V3 加掩码 patch 预测</td><td>跨图关键点对应、3D/VLA 视觉骨干、冻结特征接轻量任务头</td></tr>
+      <tr><td>CLIP / SigLIP / SigLIP 2</td><td>图像 + 文本</td><td>对齐的图像 / 文本嵌入向量</td><td>海量图文对对比学习（InfoNCE / 逐对 sigmoid）；SigLIP 2 加 caption 与自蒸馏</td><td>零样本分类、图文检索、VLM / VLA 语义视觉编码器（如 $\pi_0$）</td></tr>
+      <tr><td>Grounding DINO<br><small>及 1.5 / 1.6 / DINO-X</small></td><td>图像 + 开放词表文本提示</td><td>带短语标签的 2D 边界框与得分</td><td>目标检测 + 短语定位（phrase grounding）数据</td><td>按自然语言找桌面物体框、给示教数据自动打框</td></tr>
+      <tr><td>SAM / SAM 2 / SAM 3<br><small>含 SAM 3.1</small></td><td>图（或视频）+ 提示（点/框/掩码；SAM 3 支持概念短语与示例框）</td><td>像素级掩码（SAM 2/3 带跨帧跟踪）</td><td>人机循环数据引擎（SA-1B / SA-V / SA-Co）监督掩码</td><td>交互抠图、视频目标跟踪；SAM 3 单模型直接做文本→全实例掩码</td></tr>
+      <tr><td>Grounded SAM<br><small>及 Grounded-SAM-2</small></td><td>图像（或视频）+ 文本提示</td><td>带文本标签的实例掩码（与视频轨迹）</td><td><b>不单独训练</b>：串联 Grounding DINO + SAM / SAM 2</td><td>按语言指令抠目标点云、real2sim 前景分割、6D 位姿初始化</td></tr>
+      <tr><td>Depth Anything<br><small>V1 / V2 / Video / DA3</small></td><td>单张 RGB 图（Video 为视频；DA3 为 1–N 张图）</td><td>稠密相对视差图（另有度量微调版；DA3 输出深度 + 射线）</td><td>有标注 / 合成图训教师 → 给 6200 万真实无标注图打伪标签 → 训学生</td><td>无深度相机时的几何估计、补全玻璃与反光区域的 RGB-D 深度空洞</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="note pit"><b>易错：名字撞车与组合关系</b>
+    <p><b>① 两个 DINO 毫不相干</b>：自监督表征模型 <b>DINO</b>（self-<b>di</b>stillation with <b>no</b> labels，Caron et al., ICCV 2021）用 ViT 学图像特征；目标检测器 <b>DINO-DETR</b>（<b>D</b>ETR with <b>I</b>mproved de<b>N</b>oising anch<b>O</b>r boxes，Zhang et al., ICLR 2023）是 DETR 架构的检测器，两者毫无继承关系。</p>
+    <p><b>② Grounding DINO 的骨干不是 DINO ViT</b>：Grounding DINO 里的「DINO」指检测器 DINO-DETR。原文用的图像骨干是 <b>Swin Transformer</b>，文本编码器是 <b>BERT</b>。</p>
+    <p><b>③ 「Grounding SAM」正式名是 Grounded SAM，且不是单个模型</b>：它是把 Grounding DINO（文本 → 框）和 SAM（框 → 掩码）拼起来的推理流程；视频版 <b>Grounded-SAM-2</b> 再接 SAM 2 跟踪。把「文本短语 → 图里所有实例的掩码与跟踪」做成单一模型的是 <b>SAM 3</b>（2025-11）。</p>
+  </div>
+
+  <div class="not-scroll"><table class="notation">
+    <caption>全页记号（单符号单义；带下标区分同名参数）</caption>
+    <thead><tr><th>符号</th><th>含义</th><th>形状 / 单位</th></tr></thead>
+    <tbody>
+      <tr><td>$I$</td><td>输入 RGB 图像</td><td>$H\times W\times 3$</td></tr>
+      <tr><td>$p,\ H_p,\ W_p,\ N_p$</td><td>ViT patch 边长；特征图高宽 $H/p,\ W/p$；patch 总数 $H_p W_p$</td><td>像素；整数</td></tr>
+      <tr><td>$d$</td><td>视觉或文本 token 的特征维度</td><td>整数</td></tr>
+      <tr><td>$g_{\theta_s},\ g_{\theta_t},\ \lambda_{\text{ema}}$</td><td>DINO 学生、教师网络；教师权重 EMA 动量</td><td>网络；标量</td></tr>
+      <tr><td>$K,\ \mathbf{c},\ m_c$</td><td>DINO 原型维数（65,536）；教师中心向量；中心更新动量</td><td>整数；$\mathbb R^K$；标量</td></tr>
+      <tr><td>$\tau_s,\ \tau_t$</td><td>DINO 学生、教师 softmax 温度（$\tau_t &lt; \tau_s$ 实现锐化）</td><td>正标量</td></tr>
+      <tr><td>$P_s,\ P_t,\ \bar P_t$</td><td>DINO 学生、教师输出概率分布，及批平均教师分布</td><td>$\Delta^{K-1}$</td></tr>
+      <tr><td>$B,\ \mathbf{u}_i,\ \mathbf{v}_j,\ s_{ij}$</td><td>图文对比批大小；单位归一化图像/文本嵌入；余弦相似度 $\mathbf{u}_i^\top \mathbf{v}_j$</td><td>整数；$\mathbb R^d$；$[-1,1]$</td></tr>
+      <tr><td>$\tau_{\text{cl}},\ \alpha_{ij},\ \beta_{ij}$</td><td>CLIP 可学习温度；行方向（图→文）与列方向（文→图）softmax 概率</td><td>正标量；$[0,1]$</td></tr>
+      <tr><td>$t_{\text{sig}},\ b_{\text{sig}},\ y_{ij}$</td><td>SigLIP 可学习缩放 $e^{t'}$、偏置与配对标签 $\in\{+1,-1\}$</td><td>标量</td></tr>
+      <tr><td>$\sigma(\cdot)$</td><td>Logistic sigmoid 函数 $\sigma(z)=1/(1+e^{-z})$</td><td>$(0,1)$</td></tr>
+      <tr><td>$N_q,\ \mathbf{b}_k,\ \hat{\mathbf{b}}_l$</td><td>DETR object query 数；真值框、预测框 $(c_x,c_y,w,h)$</td><td>整数；$[0,1]^4$</td></tr>
+      <tr><td>$\pi,\ C_{\text{match}}(k,l)$</td><td>匈牙利双射匹配排列；真值 $k$ 与预测 $l$ 的匹配代价</td><td>排列；标量</td></tr>
+      <tr><td>$\theta_{\text{box}},\ \theta_{\text{text}}$</td><td>Grounding DINO 推理的框得分阈值与文本 token 阈值</td><td>$[0,1]$</td></tr>
+      <tr><td>$M_r,\ \widehat{\mathrm{IoU}}_r$</td><td>SAM 单次提示输出的第 $r\in\{1,2,3\}$ 个候选掩码及预测质量分</td><td>$\{0,1\}^{H\times W}$；标量</td></tr>
+      <tr><td>$\hat D,\ \tilde D,\ D^*$</td><td>Depth Anything 预测视差、教师伪标签视差、真值视差</td><td>$H\times W$</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<!-- ============================================================ -->
+<section id="vit">
+  <h2 data-toc="ViT 视觉骨干">ViT 基础：patch、分辨率与注意力代价</h2>
+  <p class="def"><b>Vision Transformer（ViT，Dosovitskiy et al., ICLR 2021）</b>把图像 $I\in\mathbb R^{H\times W\times 3}$ 切成 $N_p=(H/p)(W/p)$ 个不重叠的 $p\times p$ 图像块（patch），线性投射为 $d$ 维 token，拼上位置编码和可选的全局 <code>[CLS]</code> token 后送进标准 Transformer 编码器。</p>
+  <p>后面几乎所有视觉基础模型都用 ViT（或其层级变体 Swin / Hiera）作骨干，选型时看四个数字：</p>
+  <ul>
+    <li><b>特征图分辨率 $H_p\times W_p=(H/p)\times(W/p)$</b>：每个 patch 只对应一个特征向量。$p=14$ 或 $16$ 意味着输出特征图比原图小 14–16 倍，小零件在低分辨率输入下可能不到一个 patch。</li>
+    <li><b>patch 14 vs 16</b>：224×224 输入下，$p=16$ 得到 $14\times 14=196$ 个 patch token；$p=14$ 得到 $16\times 16=256$ 个 token。DINOv2、CLIP ViT-L/14、SigLIP-So400m、SAM 3 常用 $p=14$；ViT 原版、SAM 1、DINOv3 用 $p=16$。</li>
+    <li><b>位置编码与变分辨率</b>：学习式绝对位置编码（ViT、DINOv2、CLIP、SigLIP）在换输入尺寸时需对位置编码网格做双三次插值；2D 轴向 RoPE（DINOv3）按相对坐标旋转 query/key，可直接推到远高于训练尺寸的分辨率。</li>
+    <li><b>$O(N_p^2)$ 注意力代价</b>：长宽同时翻倍，$N_p$ 变 4 倍，全局自注意力矩阵元素数 $N_p^2$ 变 <b>16 倍</b>。高分辨率骨干（如 SAM 1 在 1024×1024 下的 4,096 个 token）常把多数层换成局部窗口注意力，只保留少数全局注意力层，并配合 FlashAttention 降显存读写（见 <a href="../flash-attention/">FlashAttention</a>）。</li>
+  </ul>
+
+  <figure class="viz" id="viz-vit">
+    <div class="viz-h"><b>切 patch、看小物体覆盖与注意力规模</b><span>左：场景与 patch 网格（可点击选中） / 右：注意力矩阵规模（对数轴）</span></div>
+    <div class="viz-grid">
+      <div class="viz-stage"><canvas id="cv-vit-grid" class="pick" aria-label="桌面机器人场景叠加 ViT patch 网格，高亮选中 patch 与小零件位置"></canvas></div>
+      <div class="viz-stage"><canvas id="cv-vit-cost" aria-label="不同分辨率和 patch 大小下的注意力矩阵元素数对比"></canvas></div>
+    </div>
+    <div class="viz-ctrl">
+      <div class="seg" id="sg-vit-p" role="group" aria-label="patch 边长">
+        <button type="button" data-v="8" aria-pressed="false">p = 8</button>
+        <button type="button" data-v="14" aria-pressed="true">p = 14</button>
+        <button type="button" data-v="16" aria-pressed="false">p = 16</button>
+        <button type="button" data-v="32" aria-pressed="false">p = 32</button>
+      </div>
+      <label for="sl-vit-res">输入边长 <input type="range" id="sl-vit-res" min="224" max="1024" step="14" value="224"><output id="o-vit-res">224</output></label>
+      <button type="button" class="btn ghost" id="bt-vit-dv2">DINOv2 518/14</button>
+      <button type="button" class="btn ghost" id="bt-vit-sam">SAM 1024/16</button>
+    </div>
+    <div class="viz-read" id="rd-vit"></div>
+    <ul class="chips">
+      <li><i style="background:var(--c1)"></i>马克杯（含把手）</li>
+      <li><i style="background:var(--c2)"></i>小螺母（目标占图宽约 4%）</li>
+      <li><i style="background:var(--c3)"></i>当前点选 patch</li>
+      <li><i style="background:var(--c4)"></i>当前配置注意力规模</li>
+    </ul>
+    <figcaption>调大输入边长或调小 patch 边长 $p$，左图小螺母覆盖的 patch 数从不足 1 格涨到十余格，同时右图单头注意力矩阵元素数 $N_p^2$ 呈四次方暴涨。224/14（SigLIP / OpenVLA 默认）下只有 256 个 patch，小螺母几乎落进单个 patch 的平均特征里。</figcaption>
+  </figure>
+
+  <div class="tbl mid"><table>
+    <thead><tr><th>模型</th><th>骨干</th><th>默认输入 $H\times W$</th><th>patch $p$</th><th>特征图 $H_p\times W_p$</th><th>patch 数 $N_p$</th></tr></thead>
+    <tbody>
+      <tr><td>DINOv2</td><td>ViT-S/B/L/g</td><td class="num">224² / 518²</td><td class="num">14</td><td class="num">16×16 / 37×37</td><td class="num">256 / 1,369</td></tr>
+      <tr><td>DINOv3</td><td>ViT-S..7B（RoPE）</td><td class="num">256² 起（多尺寸）</td><td class="num">16</td><td class="num">16×16 起</td><td class="num">256 起（可推至 4096²）</td></tr>
+      <tr><td>CLIP ViT-L/14@336</td><td>ViT-L</td><td class="num">336×336</td><td class="num">14</td><td class="num">24×24</td><td class="num">576</td></tr>
+      <tr><td>SigLIP-So400m（PaliGemma）</td><td>ViT-So400m</td><td class="num">224² / 448² / 896²</td><td class="num">14</td><td class="num">16² / 32² / 64²</td><td class="num">256 / 1,024 / 4,096</td></tr>
+      <tr><td>SAM 1</td><td>MAE ViT-B/L/H</td><td class="num">1024×1024</td><td class="num">16</td><td class="num">64×64</td><td class="num">4,096（窗口+全局）</td></tr>
+      <tr><td>SAM 2</td><td>Hiera（层级）</td><td class="num">1024×1024</td><td class="num">层级</td><td class="num">256² / 128² / 64²</td><td class="num">多尺度 FPN 特征</td></tr>
+      <tr><td>SAM 3</td><td>Perception Encoder ViT</td><td class="num">1008×1008</td><td class="num">14</td><td class="num">72×72</td><td class="num">5,184（窗口+全局）</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<!-- ============================================================ -->
+<section id="dino">
+  <h2 data-toc="DINO 自监督系列">自监督特征：DINO → DINOv2 → DINOv3</h2>
+  <p class="def"><b>DINO（Caron et al., ICCV 2021）</b>用同一个架构的两个网络做无标签自蒸馏：学生 $g_{\theta_s}$ 梯度更新，教师 $g_{\theta_t}$ 是学生权重的指数滑动平均（EMA），训练学生从局部裁剪预测教师对全局裁剪的输出分布。</p>
+  <p>输入一张图做多裁剪（multi-crop）：2 张全局大图（如 $224^2$）和若干张局部小图（如 $96^2$）。教师只看全局视图，学生看全部视图，强迫网络学会「局部部件属于哪个整体」。教师权重按 $\theta_t\leftarrow\lambda_{\text{ema}}\theta_t+(1-\lambda_{\text{ema}})\theta_s$ 更新（$\lambda_{\text{ema}}$ 从 0.996 余弦升到 1），推理和训练时教师端截断梯度。</p>
+
+  <h3>推导：中心化与锐化如何防塌缩</h3>
+  <p>没有负样本的自蒸馏存在平凡解（塌缩）：无论输入什么图，学生和教师都输出同一个常向量，损失立刻归零。DINO 只在教师输出端加两步操作就稳住了训练：</p>
+  <ol class="derive">
+    <li><p>学生和教师各自输出 $K$ 维 logits（原文 $K=65{,}536$），学生用温度 $\tau_s=0.1$ 做 softmax，教师先减中心 $\mathbf c$ 再用更低的温度 $\tau_t\in[0.04,0.07]$ 做 softmax：</p>
+    $$P_s(x)_k=\frac{\exp(g_{\theta_s}(x)_k/\tau_s)}{\sum_{j=1}^K \exp(g_{\theta_s}(x)_j/\tau_s)},\qquad P_t(x)_k=\frac{\exp\!\big((g_{\theta_t}(x)_k-c_k)/\tau_t\big)}{\sum_{j=1}^K \exp\!\big((g_{\theta_t}(x)_j-c_j)/\tau_t\big)}$$</li>
+    <li><p>跨视图最小化交叉熵（全局视图集合 $V_g$，全部视图集合 $V$）：</p>
+    $$\mathcal L_{\text{DINO}}=\sum_{x_g\in V_g}\sum_{\substack{x'\in V\\ x'\neq x_g}} H\big(P_t(x_g),\,P_s(x')\big),\qquad H(a,b)=-\sum_{k=1}^K a_k\log b_k$$</li>
+    <li><p>中心向量 $\mathbf c$ 追踪教师在一批样本上的平均输出（动量 $m_c=0.9$）：</p>
+    $$\mathbf c\leftarrow m_c\,\mathbf c+(1-m_c)\frac{1}{B}\sum_{i=1}^B g_{\theta_t}(x_i)$$</li>
+    <li><p>考察两种指标：单样本熵 $\overline{H(P_t)}=\frac{1}{B}\sum_i H(P_t(x_i))$ 衡量单张图的分布有多尖锐；批平均分布 $\bar P_t=\frac{1}{B}\sum_i P_t(x_i)$ 的熵 $H(\bar P_t)$ 衡量整批样本用到了多少不同原型。两者之差 $H(\bar P_t)-\overline{H(P_t)}$ 正好是样本编号与原型编号之间的互信息，塌缩时它归零：</p>
+    $$\begin{aligned}\text{只留中心化（}\tau_t\text{ 大）}&\Rightarrow P_t(x_i)\to\tfrac{1}{K}\mathbf{1}\quad(\overline{H}\to\log K\text{，均匀塌缩})\\ \text{只留锐化（去掉 }\mathbf c\text{）}&\Rightarrow P_t(x_i)\to\mathbf{e}_{k^*}\quad(H(\bar P_t)\to 0\text{，单模塌缩})\end{aligned}$$
+    <p>中心化把批均值拉向零，阻止某一维垄断全部样本（保 $H(\bar P_t)$ 高）；锐化用低 $\tau_t$ 压低单样本熵（保 $\overline{H(P_t)}$ 低）。两股力互相拉扯，逼出有区分度的聚类原型。</p></li>
+  </ol>
+
+  <figure class="viz" id="viz-dino-col">
+    <div class="viz-h"><b>DINO 防塌缩：中心化 vs 锐化的动态博弈</b><span>K = 16 个原型，B = 12 个样本，真实 EMA 迭代</span></div>
+    <div class="viz-grid">
+      <div class="viz-stage"><p class="pane-t">各样本教师输出 $P_t(x_i)$（行=样本，列=原型）</p><canvas id="cv-dino-mat" aria-label="12 个样本在 16 个原型维度上的教师 softmax 概率热图"></canvas></div>
+      <div class="viz-stage"><p class="pane-t">批平均分布 $\bar P_t$（虚线为均匀分布 $1/K$）</p><canvas id="cv-dino-bar" aria-label="批平均教师输出分布在 16 个原型维度上的柱状图"></canvas></div>
+    </div>
+    <div class="viz-ctrl">
+      <div class="seg" id="sg-dino-mode" role="group" aria-label="防塌缩组合">
+        <button type="button" data-v="both" aria-pressed="true">中心化 + 锐化</button>
+        <button type="button" data-v="sharp" aria-pressed="false">只锐化</button>
+        <button type="button" data-v="center" aria-pressed="false">只中心化</button>
+      </div>
+      <label for="sl-dino-tau"><span>τ<sub>t</sub></span> <input type="range" id="sl-dino-tau" min="0.04" max="1.6" step="0.02" value="0.10"><output id="o-dino-tau">0.10</output></label>
+      <label for="sl-dino-mc"><span>m<sub>c</sub></span> <input type="range" id="sl-dino-mc" min="0.5" max="0.98" step="0.02" value="0.86"><output id="o-dino-mc">0.86</output></label>
+      <button type="button" class="btn" id="bt-dino-play">播放迭代</button>
+      <button type="button" class="btn ghost" id="bt-dino-step">跑 1 步</button>
+      <button type="button" class="btn ghost" id="bt-dino-rst">重置</button>
+    </div>
+    <div class="viz-read" id="rd-dino-col"></div>
+    <ul class="chips">
+      <li><i style="background:var(--c1)"></i>样本在原型上的概率权重</li>
+      <li><i style="background:var(--c3)"></i>健康（高批熵 + 低单样熵）</li>
+      <li><i style="background:var(--bad)"></i>塌缩态（单模或均匀）</li>
+    </ul>
+    <figcaption>每步按真实 EMA 更新中心 $\mathbf c$ 并模拟学生向教师分布靠拢（带微小初始通道偏置）。切到「只锐化」点播放：微小偏置被指数放大，12 个样本迅速全部挤到同一个原型维，$H(\bar P_t)\to 0$。切到「只中心化」（高 $\tau_t$）：批平均虽均匀，但每张图也趋向 $1/16$，信息差 $H(\bar P_t)-\overline{H(P_t)}\to 0$。</figcaption>
+  </figure>
+
+  <p>DINO 训练出的 ViT 出现涌现现象：最后一层 <code>[CLS]</code> token 对各 patch 的自注意力头无需任何掩码标注就能勾出前景物体轮廓。</p>
+
+  <h3>DINOv2、Registers 与 DINOv3</h3>
+  <ul>
+    <li><b>DINOv2（Oquab et al., TMLR 2024）</b>：用自动去重 + 检索管线构造 1.42 亿张图的数据集 <b>LVD-142M</b>。损失上把图像级 DINO 和 patch 级掩码预测 <b>iBOT</b>（Zhou et al., ICLR 2022，随机掩码部分 patch，学生从上下文预测教师对应 patch 的原型分布）合在一起，但拆开投影头；用 3 步 <b>Sinkhorn-Knopp</b> 替代中心化；加 <b>KoLeo 正则</b>（$-\frac{1}{n}\sum_i\log\min_{j\neq i}\|\mathbf x_i-\mathbf x_j\|$）把批内特征在超球面上推匀。先训 11 亿参数的 ViT-g/14，再蒸馏出 ViT-S/14（21M）、B/14（86M）、L/14（304M），全部 Apache 2.0 开源。冻结骨干只训线性头就能在分类、分割和深度上拿到强基线。</li>
+    <li><b>Registers（Darcet et al., ICLR 2024）</b>：放大 ViT 后，DINOv2、CLIP 等模型都会在低纹理背景 patch 上出现范数高出正常值一个量级的「伪影 token」——网络把冗余背景块挪作全局草稿纸，丢弃局部信息去存全局摘要，污染注意力图。在输入序列里加几个可学习<b>寄存器 token（registers）</b>专门承接全局计算，背景伪影立刻消失，特征图变干净。</li>
+    <li><b>DINOv3（Siméoni et al., 2025）</b>：把无监督训练推到 <b>70 亿参数 ViT-7B</b>（$p=16$，2D 轴向 RoPE）和 <b>16.89 亿张图 LVD-1689M</b>（另有 4.93 亿张遥感图 SAT-493M 版本）。长时间训练会出现全局分类继续涨、稠密分割/深度却倒退的退化现象；DINOv3 提出 <b>Gram anchoring</b>，用训练早期教师的 patch 间 Gram 矩阵（成对相似度 $X_G X_G^\top$）锚定后期学生的 Gram 矩阵 $X_S X_S^\top$，稳住局部结构。随后做高分辨率适配（训练最高 768 px，论文观察到 4K 以上输入的特征图仍稳定），蒸馏出 ViT-S/S+/B/L/H+ 与 ConvNeXt-T/S/B/L 全套小模型。采用自定义 DINOv3 License（允许商用，但禁止 ITAR 管制及军事、核、间谍、武器等用途）。截至 2026-11 尚无 DINOv4 发布。</li>
+  </ul>
+
+  <h3>为什么机器人常用 DINO</h3>
+  <p>DINOv2 / DINOv3 的 patch 特征天然具备<b>跨实例、跨视角的语义对应</b>：杯子 A 的把手和另一只不同颜色、不同朝向的杯子 B 的把手在特征空间里余弦相似度最高，可直接用于一次示教的关键点迁移，也是 VGGT、LRM、TRELLIS 等 3D 模型（见 <a href="../3d-foundation-models/#multiview">3D 基础模型 · 多视图</a>、<a href="../3d-foundation-models/#lrm">LRM</a>、<a href="../3d-foundation-models/#native">原生 3D</a>）和 OpenVLA 的视觉骨干。与 <a href="../slam/#frontend">SLAM 前端</a> 的 ORB / SuperPoint 特征点相比：SLAM 特征追求<b>同一场景</b>上的亚像素重复率以便几何求解；DINO 以 14–16 像素的粗粒度换取<b>跨物体、跨外观</b>的部件级语义对应。</p>
+
+  <figure class="viz" id="viz-dino-corr">
+    <div class="viz-h"><b>稠密 patch 对应与寄存器去伪影（示意特征）</b><span>点击左图任意 patch，看右图相似度热图与最近邻</span></div>
+    <div class="viz-stage"><canvas id="cv-dino-corr" class="pick" aria-label="两张不同视角的杯子图像，点选左图 patch 显示右图余弦相似度热图和对应点"></canvas></div>
+    <div class="viz-ctrl">
+      <div class="seg" id="sg-dino-scene" role="group" aria-label="物体对">
+        <button type="button" data-v="mug" aria-pressed="true">马克杯（换视角与比例）</button>
+        <button type="button" data-v="tool" aria-pressed="false">扳手（旋转与缩放）</button>
+      </div>
+      <label class="chk" for="ck-dino-reg"><input type="checkbox" id="ck-dino-reg" checked>启用 Register token（关闭可看背景高范数伪影）</label>
+    </div>
+    <div class="viz-read" id="rd-dino-corr"></div>
+    <ul class="chips">
+      <li><i style="background:var(--c2)"></i>左图点选的查询 patch</li>
+      <li><i style="background:var(--c3)"></i>右图最近邻匹配 patch</li>
+      <li><i style="background:var(--c1)"></i>高余弦相似度区域</li>
+      <li><i style="background:var(--bad)"></i>无 Register 时的背景伪影块</li>
+    </ul>
+    <figcaption>示意演示（非真实 DINO 前向输出）：每个 $12\times 12$ 网格块的特征由人工构造的部件原型向量（杯口、杯身、把手、底座、桌面）叠加平滑相对坐标和小噪声生成。关闭「启用 Register token」会在背景注入几个吸收全局均值的伪影块，查询时容易把背景误拉成高相似热点。</figcaption>
+  </figure>
+</section>
+
+<!-- ============================================================ -->
+<section id="clip">
+  <h2 data-toc="CLIP 与 SigLIP">图文对齐：CLIP → SigLIP → SigLIP 2</h2>
+  <p class="def"><b>CLIP（Radford et al., ICML 2021）</b>用图像编码器和文本编码器把图文各自映射到同一单位球面，在 4 亿对互联网图文上用对称 InfoNCE 对比损失拉近配对图文、推远批内其余组合。<b>SigLIP（Zhai et al., ICCV 2023）</b>把批内全局 softmax 换成每个 $(i,j)$ 对独立的二分类 sigmoid 损失。</p>
+
+  <h3>推导：InfoNCE 与逐对 Sigmoid 的梯度差别</h3>
+  <ol class="derive">
+    <li><p>批内 $B$ 对图文经编码与 $\ell_2$ 归一化得 $\mathbf u_i,\mathbf v_j\in\mathbb R^d$，余弦相似度矩阵 $s_{ij}=\mathbf u_i^\top\mathbf v_j$。</p></li>
+    <li><p>CLIP 在相似度矩阵的行（图→文）与列（文→图）两个方向各做一次 softmax，温度 $\tau_{\text{cl}}$ 可学习：</p>
+    $$\alpha_{ij}=\frac{\exp(s_{ij}/\tau_{\text{cl}})}{\sum_{k=1}^B \exp(s_{ik}/\tau_{\text{cl}})},\qquad \beta_{ij}=\frac{\exp(s_{ij}/\tau_{\text{cl}})}{\sum_{k=1}^B \exp(s_{kj}/\tau_{\text{cl}})},\qquad \mathcal L_{\text{CLIP}}=-\frac{1}{2B}\sum_{i=1}^B(\log\alpha_{ii}+\log\beta_{ii})$$</li>
+    <li><p>对缩放 logit $z_{ij}=s_{ij}/\tau_{\text{cl}}$ 求偏导，得到每个格子的梯度：</p>
+    $$\frac{\partial\mathcal L_{\text{CLIP}}}{\partial z_{ij}}=\frac{1}{2B}\big(\alpha_{ij}+\beta_{ij}-2\delta_{ij}\big)$$
+    <p>关键性质：因为 $\sum_k \alpha_{ik}=1$，同一行里所有格子互相抢概率质量。分布式训练时必须做跨卡 all-gather 凑齐整行整列才能算分母；若批内两张图恰好配了语义相同的文本，非对角格 $(1,2)$ 会被硬当负样本压低，且 $\alpha_{11}$ 和 $\alpha_{12}$ 不可同时接近 1。</p></li>
+    <li><p>SigLIP 取消 softmax 归一化，对每一对 $(i,j)$ 独立算二元交叉熵（正对 $y_{ij}=+1$，负对 $y_{ij}=-1$），用可学习缩放 $t_{\text{sig}}=e^{t'}$ 和偏置 $b_{\text{sig}}$ 构造 logit $\tilde z_{ij}=t_{\text{sig}}\,s_{ij}+b_{\text{sig}}$：</p>
+    $$\mathcal L_{\text{SigLIP}}=-\frac{1}{B}\sum_{i=1}^B\sum_{j=1}^B \log\sigma\!\big(y_{ij}\,\tilde z_{ij}\big)$$
+    <p>批内负样本对的数量是正样本对的 $B-1$ 倍，训练初期负样本梯度会压垮模型；原文初始化 $t'=\log 10$（即 $t_{\text{sig}}=10$）和 $b_{\text{sig}}=-10$，让初始预测默认偏向负类，开局平稳。</p></li>
+    <li><p>对 $\tilde z_{ij}$ 求偏导，第 $(i,j)$ 格的梯度<b>只依赖这一对自身</b>，与同行的其他样本完全解耦：</p>
+    $$\frac{\partial\mathcal L_{\text{SigLIP}}}{\partial \tilde z_{ij}}=-\frac{y_{ij}}{B}\big(1-\sigma(y_{ij}\tilde z_{ij})\big)=\begin{cases}-\tfrac{1}{B}\big(1-\sigma(\tilde z_{ij})\big), & y_{ij}=+1\\ +\tfrac{1}{B}\,\sigma(\tilde z_{ij}), & y_{ij}=-1\end{cases}$$
+    <p>解耦带来两个收益：跨卡训练可分块轮转计算而不必攒出完整的 $B\times B$ 显存矩阵（论文测到 $B=10^6$，32k 时即接近饱和）；多正样本（两图同文）之间没有求和为 1 的互斥上限。</p></li>
+  </ol>
+
+  <figure class="viz" id="viz-clip">
+    <div class="viz-h"><b>CLIP InfoNCE vs SigLIP 逐对 Sigmoid（可拖动单位圆上的向量）</b><span>左：4 对图文嵌入 / 右：4×4 相似度与梯度矩阵</span></div>
+    <div class="viz-grid">
+      <div class="viz-stage"><canvas id="cv-clip-circle" class="drag-x" aria-label="单位圆上可拖动的 4 个图像嵌入点和 4 个文本嵌入点"></canvas></div>
+      <div class="viz-stage"><canvas id="cv-clip-mat" aria-label="4x4 图文相似度矩阵及每个格子对损失的梯度贡献"></canvas></div>
+    </div>
+    <div class="viz-ctrl">
+      <div class="seg" id="sg-clip-loss" role="group" aria-label="损失函数">
+        <button type="button" data-v="clip" aria-pressed="true">CLIP (InfoNCE)</button>
+        <button type="button" data-v="siglip" aria-pressed="false">SigLIP (Sigmoid)</button>
+      </div>
+      <label for="sl-clip-t"><span>逆温度 t</span> <input type="range" id="sl-clip-t" min="1" max="14" step="0.5" value="6"><output id="o-clip-t">6.0</output></label>
+      <label for="sl-clip-b"><span>偏置 b<sub>sig</sub></span> <input type="range" id="sl-clip-b" min="-10" max="0" step="0.5" value="-3.5"><output id="o-clip-b">-3.5</output></label>
+      <label class="chk" for="ck-clip-dup"><input type="checkbox" id="ck-clip-dup"><span>图 1 与图 2 配同一句话（重复正样本）</span></label>
+    </div>
+    <div class="viz-read" id="rd-clip"></div>
+    <ul class="chips">
+      <li><i style="background:var(--c1)"></i>图像嵌入 $\mathbf u_i$（实心圆，可拖）</li>
+      <li><i style="background:var(--c2)"></i>文本嵌入 $\mathbf v_j$（方框，可拖）</li>
+      <li><i style="background:var(--ok)"></i>正样本格（拉近，负梯度）</li>
+      <li><i style="background:var(--bad)"></i>负样本格（推远，正梯度）</li>
+    </ul>
+    <figcaption>拖动圆上任意 $\mathbf u_i$ 或 $\mathbf v_j$，右侧实时按真实公式重算 $s_{ij}$ 与每格梯度 $\partial\mathcal L/\partial z_{ij}$。勾选「图 1 与图 2 配同一句话」把第 1、2 组嵌入叠到同方向：CLIP 下即使两个都对，行 softmax 仍强制 $\alpha_{11}+\alpha_{12}\le 1$，把 $(1,2)$ 当强负样本推出巨大反向梯度；第 1、2 行和第 1、2 列的 $-\log\alpha_{ii}$、$-\log\beta_{ii}$ 都不低于 $\log 2$，读数里的总损失因此不会低于 $\tfrac{4\log 2}{2B}\approx 0.347$（$B=4$）；切到 SigLIP 且允许 $(1,2)$ 标为正对时，两格同时高置信、互相不打架。</figcaption>
+  </figure>
+
+  <h3>零样本分类、语义与空间取舍、SigLIP 2</h3>
+  <ul>
+    <li><b>零样本分类</b>：把类别名填入模板（如 <code>"a photo of a {class}"</code>）经文本编码器算出原型向量 $\mathbf v_1,\dots,\mathbf v_C$，直接拿它们当线性分类头权重，取 $\arg\max_c\,\mathbf u^\top\mathbf v_c$。</li>
+    <li><b>全局强、稠密弱</b>：图文对比只监督整张图的全局向量，文本描述很少写清每个像素的精确边界，因此 CLIP / SigLIP 擅长开放语义识别，但在跨图几何对应和细粒度定位上明显弱于 DINO——这正是两者互补的原因。</li>
+    <li><b>SigLIP 2（Tschannen et al., 2025）</b>：在 sigmoid 对比损失之外同时加入三类信号：① 接轻量文本解码器做 <b>captioning 与指代定位</b>（LocCa 配方），补齐细粒度定位和 OCR；② 图像端加 <b>EMA 自蒸馏与掩码 patch 预测</b>，强化稠密特征；③ 多语言数据训练，并推出 <b>NaFlex</b> 变体保留原始长宽比与可变分辨率。Google 的 PaliGemma 与 <a href="../pi-series/#pi0">$\pi_0$</a> 使用的正是 SigLIP-So400m/14。</li>
+  </ul>
+</section>
+
+<!-- ============================================================ -->
+<section id="grounding">
+  <h2 data-toc="开放词表检测">开放词表检测：DETR → DINO-DETR → Grounding DINO</h2>
+  <p class="def"><b>DETR（Carion et al., ECCV 2020）</b>把目标检测写成集合预测：解码器用 $N_q$ 个可学习 object query 交叉注意图像特征，直接输出 $N_q$ 个（类别, 框），训练用<b>匈牙利算法</b>做真值与预测的最优一一匹配，推理无需锚框与 NMS。</p>
+  <p>设图中有 $M$ 个真值物体，补 $N_q-M$ 个「无物体 $\varnothing$」凑成 $N_q$ 个。匈牙利匹配寻找排列 $\hat\pi\in\mathfrak S_{N_q}$ 最小化总匹配代价：</p>
+  <div class="eq">$$\begin{aligned}\hat\pi&=\arg\min_{\pi\in\mathfrak S_{N_q}}\sum_{k=1}^{M} C_{\text{match}}\big(k,\,\pi(k)\big)\\ C_{\text{match}}(k,l)&=-\hat p_l(c_k)+\lambda_{\text{L1}}\|\mathbf b_k-\hat{\mathbf b}_l\|_1+\lambda_{\text{GIoU}}\big(1-\mathrm{GIoU}(\mathbf b_k,\hat{\mathbf b}_l)\big)\end{aligned}$$</div>
+  <p>每个真值恰好只分到一个预测框，其余 $N_q-M$ 个预测被监督推向 $\varnothing$，所以训练完模型自己抑制重复框，省掉 NMS。</p>
+
+  <figure class="viz" id="viz-hung">
+    <div class="viz-h"><b>匈牙利最优一一匹配（真实代价矩阵与最优指派）</b><span>左：拖动实线预测框 P1–P4 / 右：3×4 代价矩阵</span></div>
+    <div class="viz-grid">
+      <div class="viz-stage"><canvas id="cv-hung-scene" class="drag-x" aria-label="包含 3 个虚线真值框和 4 个可拖动实线预测框的检测场景"></canvas></div>
+      <div class="viz-stage"><canvas id="cv-hung-mat" aria-label="3 个真值框与 4 个预测框的匈牙利匹配代价矩阵"></canvas></div>
+    </div>
+    <div class="viz-ctrl">
+      <label for="sl-hg-l1"><span>λ<sub>L1</sub></span> <input type="range" id="sl-hg-l1" min="0" max="8" step="0.5" value="5"><output id="o-hg-l1">5.0</output></label>
+      <label for="sl-hg-giou"><span>λ<sub>GIoU</sub></span> <input type="range" id="sl-hg-giou" min="0" max="5" step="0.5" value="2"><output id="o-hg-giou">2.0</output></label>
+      <button type="button" class="btn ghost" id="bt-hg-comp">演示双框抢同一目标</button>
+      <button type="button" class="btn ghost" id="bt-hg-rst">重置位置</button>
+    </div>
+    <div class="viz-read" id="rd-hung"></div>
+    <ul class="chips">
+      <li><i style="background:var(--c1)"></i>真值框 GT1–GT3（虚线）</li>
+      <li><i style="background:var(--c2)"></i>已匹配预测框与连线</li>
+      <li><i style="background:var(--muted)"></i>落选预测框（监督为 $\varnothing$）</li>
+    </ul>
+    <figcaption>左图拖动 P1–P4 中心移动预测框，右侧精确枚举全部 24 种一对一指派，给出最小总代价的唯一匹配（采用 DETR 常见默认权重 $\lambda_{\text{L1}}=5,\ \lambda_{\text{GIoU}}=2$）。点「演示双框抢同一目标」把两个预测框叠到 GT1 上：匈牙利匹配强制只留代价更低的一个，另一个立刻转去匹配远处目标或落选为 $\varnothing$。</figcaption>
+  </figure>
+
+  <h3>DINO-DETR：把 DETR 训快、训准</h3>
+  <p>原版 DETR 早期匈牙利匹配抖动大，要训 500 个 epoch。<b>DINO-DETR（Zhang et al., ICLR 2023）</b>——再次强调，它与自监督的 DINO ViT 无关——靠三处改动将训练压到 12–36 epoch 并刷新 COCO 精度：</p>
+  <ul>
+    <li><b>对比去噪训练（CDN）</b>：训练时额外喂给解码器一批「真值框加小噪声（正 query）」和「加大噪声（负 query）」，绕开不稳定的匈牙利匹配直接教解码器既会微调真框又会拒绝近处重复框。</li>
+    <li><b>混合 query 选择</b>：编码器输出得分最高的 $N_q$ 个位置特征用来初始化解码器的<b>4D 锚框坐标</b>，而 query 的<b>内容向量</b>保持可学习，避免编码器误选导致的语义混淆。</li>
+    <li><b>Look Forward Twice</b>：解码器第 $l+1$ 层微调框的梯度同时回传更新第 $l$ 层的框预测参数，让后层监督前层。</li>
+  </ul>
+
+  <h3>Grounding DINO：把检测变成「框与文本 token 匹配」</h3>
+  <p class="def"><b>Grounding DINO（Liu et al., ECCV 2024）</b>把 DINO-DETR 的固定类别分类头换成框特征与输入文本 token 的点积相似度，在 O365 + GoldG + Cap4M 等检测与短语定位数据（沿用 GLIP 配方）上联合训练，实现任意文本开放词表检测。</p>
+  <p>它的四个模块全程做模态融合：<b>图像骨干（Swin-T / Swin-L）+ 文本骨干（BERT-base）</b> → <b>特征增强器</b>（多层图像↔文本双向交叉注意力）→ <b>语言引导的 query 选择</b>（按与文本的相似度从图像特征里挑前 $N_q$ 个 token 初始化位置 query）→ <b>跨模态解码器</b>（每层依次做 query 自注意力、图像交叉注意力、文本交叉注意力）。</p>
+  <p>推理时把要找的类别用 <code>" . "</code> 拼成一条提示词（如 <code>"red mug . wrench ."</code>），模型对每个预测框输出它与提示词里每个子词 token 的 sigmoid 得分，再用两个阈值过滤：</p>
+  <ul>
+    <li><b><code>box_threshold</code>（$\theta_{\text{box}}$）</b>：只保留「对所有文本 token 的最高得分 $\ge\theta_{\text{box}}$」的候选框；调低会放出背景假框，调高容易漏检。</li>
+    <li><b><code>text_threshold</code>（$\theta_{\text{text}}$）</b>：对保留下来的框，把得分 $\ge\theta_{\text{text}}$ 的文本 token 拼成它的输出短语标签；调过高会把修饰词（如 <code>red</code>）切掉甚至变成空标签。</li>
+  </ul>
+
+  <figure class="viz" id="viz-gdino">
+    <div class="viz-h"><b>Grounding DINO 的两个阈值怎么筛框、拼短语（示意得分）</b><span>左：过滤后的检测框 / 右：候选框对各文本 token 的得分</span></div>
+    <div class="viz-grid">
+      <div class="viz-stage"><canvas id="cv-gd-scene" aria-label="桌面场景及按 box_threshold 和 text_threshold 过滤后的检测框"></canvas></div>
+      <div class="viz-stage"><canvas id="cv-gd-tok" aria-label="各候选框对提示词中每个文本 token 的得分柱状与阈值线"></canvas></div>
+    </div>
+    <div class="viz-ctrl">
+      <div class="seg" id="sg-gd-pr" role="group" aria-label="提示词">
+        <button type="button" data-v="p1" aria-pressed="true">red mug . wrench .</button>
+        <button type="button" data-v="p2" aria-pressed="false">mug . block . gripper .</button>
+        <button type="button" data-v="p3" aria-pressed="false">cup . metal tool .</button>
+      </div>
+      <label for="sl-gd-box"><span>θ<sub>box</sub></span> <input type="range" id="sl-gd-box" min="0.10" max="0.75" step="0.01" value="0.35"><output id="o-gd-box">0.35</output></label>
+      <label for="sl-gd-txt"><span>θ<sub>text</sub></span> <input type="range" id="sl-gd-txt" min="0.10" max="0.75" step="0.01" value="0.25"><output id="o-gd-txt">0.25</output></label>
+    </div>
+    <div class="viz-read" id="rd-gd"></div>
+    <ul class="chips">
+      <li><i style="background:var(--c3)"></i>通过 $\theta_{\text{box}}$ 的真实目标框</li>
+      <li><i style="background:var(--bad)"></i>低阈值放出的假正例框</li>
+      <li><i style="background:var(--c1)"></i>$\theta_{\text{box}}$ 阈值线</li>
+      <li><i style="background:var(--c4)"></i>$\theta_{\text{text}}$ 阈值线</li>
+    </ul>
+    <figcaption>示意得分（非真实 Grounding DINO 推理输出）：7 个候选框各自带有对每个文本 token 的人工构造得分。把 $\theta_{\text{box}}$ 降到 0.22 以下，阴影和相似物体会混入输出；把 $\theta_{\text{text}}$ 拉到 0.55 以上，红杯子仍过框阈值，但 <code>red</code> 被截掉只剩 <code>mug</code>。</figcaption>
+  </figure>
+
+  <h3>后续系列与同类模型</h3>
+  <ul>
+    <li><b>开源现状（截至 2026-11）</b>：原版 <b>Grounding DINO</b>（Swin-T / Swin-B）完全开源（Apache 2.0）。后续的 <b>Grounding DINO 1.5</b>（20M 定位图，含 Pro 与 Edge 版）、<b>Grounding DINO 1.6</b> 与 <b>DINO-X</b>（统一输出框、掩码、关键点与区域描述）均由 IDEA Research 主导，但完整权重未作传统开放下载，主要通过 DeepDataSpace 等托管 API / 商业平台调用。</li>
+    <li><b>GLIP（CVPR 2022）</b>：最早把目标检测与短语定位统一为区域–词对齐任务（DyHead + BERT），Grounding DINO 沿用了它的定位预训练范式与数据。</li>
+    <li><b>OWL-ViT（ECCV 2022）与 OWLv2（NeurIPS 2023）</b>：不做复杂跨模态解码器，直接在 CLIP 风格 ViT 的每个 patch token 上挂轻量框回归头和分类头；OWLv2 用 100 亿网络图自训练扩展，开源 Apache 2.0，常用于机器人自动标注。</li>
+    <li><b>YOLO-World（CVPR 2024）</b>：在 YOLOv8 上加可重参数化的图文特征金字塔（RepVL-PAN），推理前可把固定词表的文本嵌入离线并入卷积权重，速度达到边缘实时级别。</li>
+  </ul>
+</section>
+
+<!-- ============================================================ -->
+<section id="sam">
+  <h2 data-toc="SAM 可提示分割">可提示分割：SAM → SAM 2 → SAM 3</h2>
+  <p class="def"><b>SAM（Kirillov et al., ICCV 2023）</b>把分割做成交互式提示任务：输入一张图和任意几何提示（正/负点击、边界框、粗掩码），输出对应的像素级掩码。<b>SAM 不认识物体类别</b>，只输出无语义标签的几何区域。</p>
+  <p><b>解耦架构</b>决定它的交互体验：重的图像编码器（MAE 预训练 ViT-B/L/H，MAE 见 He et al., CVPR 2022）对 1024×1024 图像<b>只跑一次</b>（ViT-H 在 A100 上约 0.15 s）算出 $64\times 64$ 特征图；轻的提示编码器和 2 层掩码解码器每次响应点击仅需毫秒级（导出后在浏览器 CPU 上也能约 50 ms 完成）。</p>
+  <p><b>多掩码解歧义</b>：在杯把上点一下，用户可能想要「杯把」「整个杯子」或「杯子+托盘」。SAM 因此固定同时输出 3 个嵌套候选掩码 $M_1,M_2,M_3$（子部件 / 部件 / 整体）及各自预测质量分 $\widehat{\mathrm{IoU}}_1,\widehat{\mathrm{IoU}}_2,\widehat{\mathrm{IoU}}_3$；训练时只对 3 个里与真值误差最小的那一支反传梯度，让三条分支自然分化出不同粒度。框提示歧义小，一般直接取单掩码输出。</p>
+  <p><b>SA-1B 三阶段数据引擎</b>：① 人工辅助（标注员点选，模型实时辅助，12 万图得 430 万掩码）→ ② 半自动（模型先自动标出显著物体，人工补标难例，18 万图增 590 万掩码）→ ③ 全自动（每图撒 $32\times 32$ 规则点网格批量生成并按稳定性过滤，最终产出 <b>1,100 万图、11 亿掩码</b>）。代码与权重 Apache 2.0。</p>
+
+  <figure class="viz" id="viz-sam">
+    <div class="viz-h"><b>SAM 交互式点提示：3 个嵌套候选掩码与负点排除</b><span>点击画面加正/负点（桌面可按 Shift 加负点），右侧可切换预览 3 个候选</span></div>
+    <div class="viz-grid">
+      <div class="viz-stage"><canvas id="cv-sam-main" class="pick" aria-label="托盘上带把手的马克杯与方块，支持点击添加正负提示点查看掩码"></canvas></div>
+      <div class="viz-stage"><canvas id="cv-sam-cands" class="pick" aria-label="SAM 输出的 3 个嵌套候选掩码缩略图与各自质量分"></canvas></div>
+    </div>
+    <div class="viz-ctrl">
+      <div class="seg" id="sg-sam-pt" role="group" aria-label="点击类型">
+        <button type="button" data-v="pos" aria-pressed="true">正点 (+)</button>
+        <button type="button" data-v="neg" aria-pressed="false">负点 (−)</button>
+      </div>
+      <button type="button" class="btn ghost" id="bt-sam-p1">预设：单点杯把</button>
+      <button type="button" data-v="p2" class="btn ghost" id="bt-sam-p2">预设：杯身+负点托盘</button>
+      <button type="button" class="btn ghost" id="bt-sam-clr">清空提示</button>
+    </div>
+    <div class="viz-read" id="rd-sam"></div>
+    <ul class="chips">
+      <li><i style="background:var(--c1)"></i>当前选中的输出掩码</li>
+      <li><i style="background:var(--ok)"></i>正提示点 (+)</li>
+      <li><i style="background:var(--bad)"></i>负提示点 (−)</li>
+    </ul>
+    <figcaption>基于 $160\times 120$ 合成层级标签图（杯把 $\subset$ 杯子 $\subset$ 杯子+托盘；另有独立方块）做真实计算：每个候选区域的得分 = 覆盖的正点比例 × 负点衰减（每落进一个负点乘 0.12）× 面积项 × 人为设定的先验。真实 SAM 的分数由网络的 IoU 预测头给出，这里只演示「同时输出 3 个粒度、加负点后排序翻转」的机制。点右侧缩略图可手动切看任意候选。</figcaption>
+  </figure>
+
+  <h3>SAM 2、SAM 3 / 3.1 与轻量变体</h3>
+  <ul>
+    <li><b>SAM 2（Ravi et al., ICLR 2025）</b>：把可提示分割扩展到视频。换用层级视觉骨干 <b>Hiera</b>（多尺度特征、速度大增）；新增<b>记忆库（memory bank）</b>存历史关键帧与提示帧的空间特征、<b>记忆注意力</b>在每帧把当前特征与记忆融合，以及 <b>occlusion 头</b>判断目标当前帧是否被完全遮挡。流式逐帧运行，单卡 A100 上 Hiera-B+ 约 <b>43.8 FPS</b>、Hiera-L 约 <b>30.2 FPS</b>（启用编译优化）。配套 <b>SA-V</b> 数据集含 5.09 万段视频、64.26 万条 masklet（3,550 万张掩码）。Apache 2.0 开源。</li>
+    <li><b>SAM 3 与 SAM 3.1（Carion et al., 2025-11；3.1 于 2026-03）</b>：把几何提示升级为<b>可提示概念分割（PCS）</b>——输入短名词短语（如 <code>"red mug"</code>）或示例框，单模型在图和视频里找出并跟踪<b>所有匹配实例</b>。整个模型约 8.48 亿参数，检测器和跟踪器共享一个 Perception Encoder 图像骨干（输入 1008×1008，$p=14$，只有部分层用全局注意力）；核心改动是加了全局 <b>presence head</b>，把「该概念图里有没有」和「实例在哪个位置」解耦，大幅减少图里没有目标时的幻觉输出；配套 <b>SA-Co</b> 数据引擎与基准覆盖约 400 万独特概念与难负例。H200 上单图约 30 ms。2026-03 发布的 <b>SAM 3.1</b> 保持接口兼容，引入 <b>Object Multiplex</b>：把目标分进容量为 16 的桶，每桶只做一次记忆编码和检索，单张 H100 上跟踪 128 个目标时比 2025-11 版快约 7 倍。两者采用 Meta 自定义 <b>SAM License</b>。截至 2026-11 为最新官方版本。3D 物体重建分支 SAM 3D Objects 见 <a href="../3d-foundation-models/#native">3D 基础模型</a>。</li>
+    <li><b>轻量 SAM 一句话</b>：边缘部署常用 <b>MobileSAM</b>（把 ViT-H 编码器蒸馏成 TinyViT）、<b>EfficientSAM</b>（CVPR 2024，用 SAMI 掩码预训练训轻量编码器）和 <b>EfficientViT-SAM</b>（CVPRW 2024，换 EfficientViT 骨干基本不掉点）。</li>
+  </ul>
+</section>
+
+<!-- ============================================================ -->
+<section id="grounded-sam">
+  <h2 data-toc="Grounded SAM 流程">文本 → 掩码 → 跟踪：Grounded SAM 与单模型对比</h2>
+  <p>SAM 1 / 2 没有语言接口，Grounding DINO 只出矩形框不出像素轮廓。<b>Grounded SAM（Ren et al., 2024）</b>把两者拼成两阶段流程，<b>Grounded-SAM-2</b> 再把第二阶段换成 SAM 2 接上视频跟踪：</p>
+  <ol>
+    <li><b>文本 → 边界框</b>：输入图像（或视频首帧）和提示词，Grounding DINO 跑完按 $\theta_{\text{box}},\ \theta_{\text{text}}$ 筛出框与短语标签。</li>
+    <li><b>边界框 → 实例掩码</b>：把每个框直接当 box prompt 喂给 SAM / SAM 2，换取贴合边缘的像素掩码。</li>
+    <li><b>首帧掩码 → 视频跟踪</b>：在 Grounded-SAM-2 里，首帧掩码写入 SAM 2 记忆库，后续帧逐帧流式传播；若新物体中途入镜，需每隔若干帧重跑一次检测器补注册。</li>
+  </ol>
+  <p><b>错误单向传递</b>：阈值全压在第一步的 Grounding DINO 上。SAM 不做类别校验——第一步漏框，掩码永久缺失；第一步把反光或桌面阴影框进来，SAM 照样抠出一个干净轮廓，SAM 2 还会把这个假掩码一路跟到视频结尾。</p>
+
+  <figure class="viz" id="viz-gsam">
+    <div class="viz-h"><b>同一个桌面对象如何被 Grounded-SAM-2 逐步加工（含误检传播）</b><span>按阶段切换或播放，看物体移动、遮挡与低阈值污染</span></div>
+    <div class="viz-stage"><canvas id="cv-gsam" aria-label="同一桌面场景从原图、检测框、首帧掩码到视频遮挡与复现跟踪的逐步演变"></canvas></div>
+    <div class="viz-ctrl">
+      <div class="seg" id="sg-gsam" role="group" aria-label="阶段">
+        <button type="button" data-v="0" aria-pressed="false">0 原图</button>
+        <button type="button" data-v="1" aria-pressed="false">1 检测框</button>
+        <button type="button" data-v="2" aria-pressed="false">2 首帧掩码</button>
+        <button type="button" data-v="3" aria-pressed="true">3 遮挡跟踪</button>
+        <button type="button" data-v="4" aria-pressed="false">4 复现跟踪</button>
+      </div>
+      <button type="button" class="btn" id="bt-gsam-play">播放</button>
+      <label class="chk" for="ck-gsam-fp"><input type="checkbox" id="ck-gsam-fp"><span>调低 θ<sub>box</sub>（混入误检框）</span></label>
+    </div>
+    <div class="viz-read" id="rd-gsam"></div>
+    <ul class="chips">
+      <li><i style="background:var(--c2)"></i>Grounding DINO 正确框 / 掩码（红杯）</li>
+      <li><i style="background:var(--bad)"></i>低阈值混入的假框 / 被持续跟踪的假掩码</li>
+      <li><i style="background:var(--muted)"></i>遮挡物（前方高瓶）</li>
+    </ul>
+    <figcaption>示意场景演示数据流与错误传播：提示词 <code>"red mug ."</code>。正常阈值下，阶段 1 框出红杯，阶段 2 抠出杯形掩码，阶段 3–4 红杯右移穿过高瓶后方被短暂遮挡再复现，SAM 2 记忆库保持同一 ID 跟踪。勾选「调低 θ<sub>box</sub>」后，阶段 1 把右侧红色桌面反光误检成 0.21 分框，SAM 不会纠错，假掩码被一路带到后续帧。</figcaption>
+  </figure>
+
+  <div class="tbl wide"><table>
+    <thead><tr><th>方案</th><th>模型数量</th><th>视频跟踪</th><th>开源与权重</th><th>速度与显存特征</th><th>典型失败</th></tr></thead>
+    <tbody>
+      <tr><td>Grounded SAM</td><td class="num">2</td><td>无（逐帧独立）</td><td>全部 Apache 2.0 开源</td><td>跑两次大模型（Swin+BERT + ViT-H），显存与耗时叠加</td><td>框错掩码必错；帧间掩码闪烁无 ID</td></tr>
+      <tr><td>Grounded-SAM-2</td><td class="num">2</td><td>有（SAM 2 记忆库）</td><td>全部 Apache 2.0 开源</td><td>仅关键帧跑检测，其余帧跑 SAM 2（A100 约 30–44 FPS）</td><td>中途新入镜物体漏检，除非周期性重检；假框会被持续跟踪</td></tr>
+      <tr><td>SAM 3 / SAM 3.1</td><td class="num">1</td><td>有（内置记忆 / Multiplex）</td><td>代码与权重开放，<b>SAM License</b></td><td>单骨干共享特征（单图 ~30 ms H200；3.1 在 128 个目标时比 SAM 3 快约 7 倍，H100）</td><td>极冷门工业术语仍需示例框辅助；许可证非 Apache 2.0</td></tr>
+      <tr><td>DINO-X</td><td class="num">1</td><td>API / 配合跟踪器</td><td>核心权重未开放，主要走托管 API</td><td>云端推理受网络往返延迟限制</td><td>无法离线本地部署、不适合实时闭环控制</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<!-- ============================================================ -->
+<section id="depth">
+  <h2 data-toc="Depth Anything 数据引擎">单目深度：Depth Anything 的数据引擎</h2>
+  <p>相对深度与度量深度的区别、焦距–距离歧义、尺度-平移不变损失推导及单目模型总表已在 <a href="../3d-foundation-models/#mono">3D 基础模型 · 单目几何</a> 讲过，这里不重复，只拆解 Depth Anything 系列最关键的设计：<b>为什么「教师–伪标签–学生」这套数据引擎让同一个网络结构精度大涨</b>。</p>
+  <p><b>模型结构极简</b>：编码器直接用预训练 <b>DINOv2</b> ViT，解码器接 <b>DPT（Ranftl et al., ICCV 2021）</b>——抽取编码器 4 个中间层特征，经卷积重排成多尺度金字塔并逐级上采样融合，输出逐像素相对视差 $\hat D$。与 <a href="../sim-rl/#teacher-student">仿真 RL 里的教师–学生蒸馏</a> 不同，RL 蒸馏是把仿真特权状态压进无特权学生，而 Depth Anything 的教师和学生都只看 RGB，教师靠更大容量或更干净的数据源把海量无标注真实图变成伪监督。</p>
+
+  <h3>V1 → V2：为什么扔掉真实深度标签训教师</h3>
+  <ul>
+    <li><b>Depth Anything V1（Yang et al., CVPR 2024）</b>：先在 150 万张有深度标注的图上训教师，再用教师给 <b>6,200 万张无标注真实图</b>打伪视差标签 $\tilde D$。训学生时两招缺一不可：① 对无标注图施加<b>强扰动</b>（强颜色抖动、高斯模糊、CutMix 拼图），逼学生从困难视角对齐干净图上的伪标签，避免学生退化成教师的简单复读机；② <b>语义特征对齐损失</b>：把学生编码器特征 $f_{\text{enc}}$ 与冻结的原始 DINOv2 特征 $f_{\text{frozen}}$ 做余弦对齐，但<b>只在余弦相似度低于 0.85 的像素上惩罚</b>（$\alpha=0.85$ 容忍度），既保住 DINOv2 的高层语义，又留出空间让特征去适应几何深度。</li>
+    <li><b>Depth Anything V2（Yang et al., NeurIPS 2024）</b>：发现 V1 的瓶颈不在架构，而在<b>真实深度标注本身很脏</b>——LiDAR 稀疏、双目匹配在弱纹理和遮挡边缘出飞点、RGB-D 红外结构光遇到玻璃、反光金属和细杆直接变空洞（<code>NaN</code>）。用脏数据训出来的教师，会把边缘发糊和玻璃空洞写进 6,200 万张伪标签。V2 干脆<b>只用 59.5 万张纯合成图</b>（精确无噪、细杆与透明物体完整）训出最大的 <b>DINOv2-Giant（1.3B）</b>教师，再用它给 <b>6,200 万张真实无标注图</b>打伪标签，最后蒸馏成 4 个尺度的学生：Small（24.8M）、Base（97.5M）、Large（335.3M）、Giant（1.3B）。合成数据保证细节锐利，海量真实伪标签弥合合成到真实的视觉域差；另有在室内（Hypersim）/ 室外（Virtual KITTI）微调的度量深度版本。</li>
+    <li><b>Video Depth Anything（CVPR 2025 Highlight）</b>：在 V2 编码器上把 DPT 换成轻量时空头，配合重叠关键帧对齐策略，消除逐帧单目深度在超长视频里的闪烁漂移。</li>
+    <li><b>Depth Anything 3（ICLR 2026）</b>：普通 DINOv2 骨干同时预测深度图与每像素射线，单图退化为强单目深度、多图直接做多视图重建（详见 <a href="../3d-foundation-models/#multiview">3D 基础模型 · 多视图</a>）。截至 2026-11 为该系列最新版本。</li>
+  </ul>
+
+  <figure class="viz" id="viz-depth">
+    <div class="viz-h"><b>一条扫描线对比三种监督标签：真实传感器 vs 纯合成 vs V2 伪标签（示意）</b><span>横轴：扫描线像素（穿过多类难材质） / 纵轴：相对视差</span></div>
+    <div class="viz-stage"><canvas id="cv-depth" aria-label="穿过桌面边缘、细金属杆、透明玻璃杯和背景墙的一条扫描线上的三种深度标签对比"></canvas></div>
+    <div class="viz-ctrl">
+      <div class="seg" id="sg-depth" role="group" aria-label="标签来源">
+        <button type="button" data-v="real" aria-pressed="true">真实传感器标注</button>
+        <button type="button" data-v="syn" aria-pressed="false">纯合成模型直接推真实图</button>
+        <button type="button" data-v="v2" aria-pressed="false">V2 合成教师→真实伪标签</button>
+      </div>
+      <label for="sl-dep-h">材质与反光干扰 <input type="range" id="sl-dep-h" min="0.2" max="1.0" step="0.05" value="0.75"><output id="o-dep-h">0.75</output></label>
+    </div>
+    <div class="viz-read" id="rd-depth"></div>
+    <ul class="chips">
+      <li><i style="background:var(--c1)"></i>真实几何视差参考曲线</li>
+      <li><i style="background:var(--c2)"></i>当前监督来源给出的标签曲线</li>
+      <li><i style="background:var(--bad)"></i>传感器无效空洞 / 边缘飞点区</li>
+    </ul>
+    <figcaption>示意信号（人工构造，非真实传感器或模型输出）：扫描线依次穿过前景桌沿、细金属杆（宽仅数像素）、透明玻璃杯与远背景墙。真实深度传感器在玻璃区失锁成空洞、细杆被平滑吞掉、边缘出现飞点；只在合成图上训的小模型直接看真实材质会整体偏移；V2 用 1.3B 合成教师在 6,200 万真实图上打伪标签再蒸馏，同时保住细杆、边缘锐度与真实材质鲁棒性。</figcaption>
+  </figure>
+</section>
+
+<!-- ============================================================ -->
+<section id="combine">
+  <h2 data-toc="编码器选择与融合">视觉编码器怎么选、怎么合</h2>
+  <p>三类视觉骨干各有所长，也各有硬伤：<b>CLIP / SigLIP</b> 懂语言语义但定位粗；<b>DINOv2 / DINOv3</b> 几何与局部对应强但不认词；<b>SAM</b> 边界锐利但缺类别语义。近年有三条融合路线把这些能力凑到一起：</p>
+  <ol>
+    <li><b>推理时双编码器拼接</b>：<b>Prismatic VLMs（ICML 2024）</b>系统对比发现把 <b>DINOv2 ViT-L/14</b> 和 <b>SigLIP ViT-So400m/14</b> 在同分辨率（224×224，各出 $16\times 16=256$ 个 patch token）上按通道拼在一起再投影给 LLM，空间与语义双赢。<b>OpenVLA（CoRL 2024）</b>直接沿用这套双骨干，代价是视觉前端算力翻倍。</li>
+    <li><b>多教师蒸馏成单编码器</b>：<b>AM-RADIO（CVPR 2024）</b>把 CLIP、DINOv2、SAM 蒸馏进同一个学生 ViT（用轻量适配头分别对齐各教师），推理只需跑一次；<b>RADIOv2.5（CVPR 2025）</b>用多分辨率训练和教师损失重平衡解决分辨率切换时的特征跳变与教师失衡。面向机器人的 <b>Theia（CoRL 2024）</b>把 CLIP、ViT、DINOv2、SAM、Depth Anything 五个视觉基础模型的空间 token 蒸馏进轻量单编码器（只用 ImageNet 的 120 万张图，H100 上约 150 GPU 小时），在仿真（CortexBench）和真机操作任务上超过单一教师。</li>
+    <li><b>挖掘对比模型的中间层</b>：<b>Perception Encoder（Meta, NeurIPS 2025 Oral）</b>发现纯图文对比训练其实已经学到了强稠密与空间特征，只是最后几层为了匹配全局文本把空间细节压扁了；取出<b>中间层特征</b>再做轻量空间/语言对齐，单个编码器即可同时胜任分类、定位与密集任务（SAM 3 的图像骨干就是它）。</li>
+  </ol>
+
+  <div class="tbl wide"><table>
+    <thead><tr><th>编码器</th><th>监督信号</th><th>擅长</th><th>短板</th><th>常见用户</th></tr></thead>
+    <tbody>
+      <tr><td>DINOv2 / DINOv3</td><td>纯图像自蒸馏 + 掩码 patch（+ Gram anchoring）</td><td>稠密对应、深度与几何先验、3D 特征</td><td>无原生语言对齐，不认新词</td><td>VGGT、LRM、TRELLIS、DA2/DA3、DINOBot、OpenVLA</td></tr>
+      <tr><td>CLIP / SigLIP</td><td>海量图文对比（InfoNCE / Sigmoid）</td><td>开放词表语义、长尾概念、VLM 对齐</td><td>空间定位粗、跨视角对应弱</td><td>PaliGemma、$\pi_0$ / $\pi_{0.5}$、LLaVA、OWLv2</td></tr>
+      <tr><td>SigLIP 2</td><td>Sigmoid 对比 + Caption 解码 + 自蒸馏 + 掩码</td><td>语义、OCR、局部定位与任意长宽比（NaFlex）</td><td>纯几何 3D 仍略逊专用 DINO</td><td>新一代多模态 VLM / VLA 骨干</td></tr>
+      <tr><td>SAM / Hiera</td><td>大规模几何掩码提示（SA-1B / SA-V）</td><td>精准物体边界、像素级部件分离</td><td>无类别语义（SAM 3 换 PE 补齐）</td><td>Grounded SAM、ReKep、real2sim 分割</td></tr>
+      <tr><td>DINOv2 + SigLIP 拼接</td><td>双教师并行特征通道拼接</td><td>语义 + 空间同时兼顾，改动简单</td><td>推理要跑两套 ViT，显存与时延翻倍</td><td>Prismatic VLMs、OpenVLA</td></tr>
+      <tr><td>AM-RADIO / Theia</td><td>多视觉基础模型离线蒸馏</td><td>单次前向拿齐多域特征、轻量高效</td><td>受限于所选教师版本与分辨率适配</td><td>端到端策略编码器、多任务视觉底座</td></tr>
+      <tr><td>Perception Encoder</td><td>大规模图文对比 + 中间层对齐提取</td><td>单模型兼顾全局语义与稠密定位</td><td>生态和社区微调权重较 DINOv2 年轻</td><td>SAM 3、Meta Perception LM</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<!-- ============================================================ -->
+<section id="robot">
+  <h2 data-toc="机器人用法与避坑">在机器人里怎么用与工程避坑</h2>
+  <p>把上面六类模型放回机器人学习与操控系统，最常见的六种落法如下：</p>
+
+  <div class="tbl wide"><table>
+    <thead><tr><th>需求</th><th>常用模型组合</th><th>代表工作</th><th>主要工程坑</th></tr></thead>
+    <tbody>
+      <tr><td>VLA 视觉骨干</td><td>SigLIP-So400m/14；或 DINOv2 + SigLIP 拼接；或 Theia 轻量单骨干</td><td><a href="../pi-series/#pi0">$\pi_0$</a>（PaliGemma）、OpenVLA、Theia</td><td>224×224 下小物体不足 1 个 patch；微调时防预训练知识退化（见 <a href="../pi-series/#ki">知识隔离</a>）</td></tr>
+      <tr><td>语言找物体 → 抠点云 → 抓取 / 规划</td><td>Grounded SAM / SAM 3 + 深度图 → 内参反投影 3D 点云（见 <a href="../camera/#depth">深度反投影</a>、<a href="../3d-representations/#points">点云</a>）</td><td>开放词表抓取 / 规划管线的常见前端</td><td>掩码多包 2 像素背景就混进远景飞点，需腐蚀掩码 + 统计滤波；坐标经 <a href="../camera/#handeye">手眼标定</a> 变到基座系</td></tr>
+      <tr><td>一次示教的关键点迁移 / 约束操作</td><td>DINOv2 稠密匹配；或 DINOv2 + SAM 提候选点 → VLM 写空间约束</td><td>DINOBot（ICRA 2024）、ReKep（CoRL 2024）</td><td>旋转对称或无纹理物体特征歧义，关键点易左右翻转</td></tr>
+      <tr><td>给示教数据自动打框 / 掩码 / 轨迹</td><td>Prismatic 描述 + Grounding DINO 标物体框 + OWLv2/SAM 找夹爪；视频用 SAM 2 或 CoTracker3</td><td>ECoT（CoRL 2024）；CoTracker / CoTracker3</td><td>自动标注错误直接污染 SFT 数据，需按置信度与时序跳变清洗</td></tr>
+      <tr><td>Real2Sim 资产重建</td><td>Grounded SAM / SAM 2 / SAM 3 抠单物体前景 → 3D 生成或重建</td><td>见 <a href="../3d-foundation-models/#robot">3D 基础模型 · 机器人</a></td><td>被遮挡物体掩码残缺，送进单图 3D 生成易补出错误背面</td></tr>
+      <tr><td>6D 物体位姿估计与跟踪</td><td>Grounded SAM / SAM 2 出首帧掩码 + RGB-D + 网格 → 位姿估计</td><td>FoundationPose（CVPR 2024）</td><td>首帧掩码把桌面或机械臂手指框进去会直接带偏初始 6D 位姿</td></tr>
+    </tbody>
+  </table></div>
+  <p><b>点跟踪补充</b>：如果任务只需要跟踪物体表面若干 2D 关键点的运动轨迹（如拉布料、做视觉伺服或给策略建光流监督），不必维护整张掩码，可直接用 <b>CoTracker（ECCV 2024）</b>或 <b>CoTracker3（2024，用真实视频伪标签简化架构）</b>，联合跟踪一组稠密 2D 点且在短暂遮挡时保持估计。</p>
+
+  <div class="note pit"><b>部署时最常踩的五个坑</b>
+    <p><b>① 分辨率与小物体</b>：VLA 默认的 224×224 / $p=14$ 只有 $16\times 16$ 格，桌面上的螺丝、线缆、杯把可能还不到一格。拉高分辨率或切局部裁剪能立竿见影，但全局注意力成本随分辨率四次方涨。</p>
+    <p><b>② 机械臂自身入镜</b>：机械臂连杆与反光夹爪常被 SAM 和桌面物体粘成同一块掩码，或被 <code>"metal tool"</code> 误检。工程上常用机器人 URDF + 当前关节角正运动学渲染出机械臂自身掩码，在分割结果里显式减去。</p>
+    <p><b>③ 阈值换环境就飘</b>：官方示例默认 $\theta_{\text{box}}=0.35$、$\theta_{\text{text}}=0.25$，换了光照、相机或桌面后可能大面积漏检或狂出假框；务必在目标相机和真实背景上留一小批验证图标定阈值。</p>
+    <p><b>④ 推理时延与控制频率失配</b>：已核对的典型单次耗时——SAM 1 ViT-H 编码 ~150 ms（A100），掩码解码 ~50 ms（浏览器 CPU）；SAM 2 Hiera-B+ ~43.8 FPS、Hiera-L ~30.2 FPS（A100，编译优化）；SAM 3 单图 ~30 ms（H200），SAM 3.1 跟踪 128 个目标时比 SAM 3 快约 7 倍（H100）；Depth Anything V2 Small（24.8M，518×518）在 A100 上不到 10 ms。把检测、分割、深度、位姿串起来很容易超过 50–100 ms，不能塞进 50 Hz 同步控制环，应放异步感知线程或只在任务关键帧触发。</p>
+    <p><b>⑤ 许可证红线（商用必核对）</b>：同名系列不同版本、甚至同一版本不同尺寸的许可证都可能不同，上生产前必须核对具体权重卡片（见下表）。</p>
+  </div>
+
+  <div class="tbl mid"><table>
+    <thead><tr><th>模型与版本</th><th>官方权重许可证（截至 2026-11）</th><th>商用注意</th></tr></thead>
+    <tbody>
+      <tr><td>DINOv2 / SigLIP / SigLIP 2 / CLIP</td><td>Apache 2.0（CLIP 为 MIT）</td><td>宽松开源，可直接商用</td></tr>
+      <tr><td>Grounding DINO 1.0（Swin-T/B）</td><td>Apache 2.0</td><td>宽松开源；1.5 / 1.6 / DINO-X 权重未开放，走托管 API</td></tr>
+      <tr><td>SAM 1 / SAM 2</td><td>Apache 2.0</td><td>代码与权重宽松开源（SA-1B / SA-V 数据集有各自研究条款）</td></tr>
+      <tr><td>SAM 3 / SAM 3.1</td><td>Meta SAM License</td><td>自定义条款，商用前需逐条核对合规边界</td></tr>
+      <tr><td>DINOv3</td><td>Meta DINOv3 License</td><td>允许商用；禁止 ITAR 管制及军事、核、间谍、武器等用途</td></tr>
+      <tr><td>Depth Anything V1</td><td>Apache 2.0</td><td>宽松开源</td></tr>
+      <tr><td>Depth Anything V2</td><td><b>Small：Apache 2.0</b>；<b>Base / Large / Giant：CC-BY-NC-4.0</b></td><td>按尺寸拆许可证——商用不可直接用 Base 以上权重</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<!-- ============================================================ -->
+<section id="quiz">
+  <h2>自测</h2>
+  <details class="q"><summary>1. DINO（Caron 2021）和 Grounding DINO 是什么关系？Grounding DINO 的视觉骨干是 DINO ViT 吗？</summary><div><p>两者没有继承关系，只是名字撞车。自监督的 DINO 是「self-distillation with no labels」，训图像表征；Grounding DINO 里的 DINO 指检测器 DINO-DETR（DETR with Improved deNoising anchOr boxes）。Grounding DINO 原文用 Swin Transformer 做图像骨干、BERT 做文本编码器，并未使用 DINO ViT。</p></div></details>
+  <details class="q"><summary>2. Grounded SAM 和 SAM 3 差在哪？在视频里如果 Grounding DINO 首帧框错了，SAM 2 会自动纠正吗？</summary><div><p>Grounded SAM 是 Grounding DINO（文本→框）+ SAM（框→掩码）两模型串联的推理流程；SAM 3 用单个统一模型（Perception Encoder + presence head + 跟踪记忆）直接完成「短语/示例框 → 图和视频里所有实例的掩码」。SAM / SAM 2 不懂语义类别，首帧框错了就会抠出错误区域的掩码，并靠视觉记忆把错掩码一路跟下去，不会纠正类别。</p></div></details>
+  <details class="q"><summary>3. 做 VLA 视觉骨干，选 DINOv2 还是 SigLIP？为什么 OpenVLA 要把两者拼起来，而 $\pi_0$ 只用 SigLIP？</summary><div><p>SigLIP 经图文对齐，开放语义和指令理解强，但空间局部定位不如 DINOv2；DINOv2 的稠密 patch 特征擅长空间几何与部件对应，却没有语言对齐。OpenVLA 为在 224×224 下兼得两者，并行跑 DINOv2 + SigLIP 按通道拼接；$\pi_0$ 直接继承 PaliGemma（SigLIP-So400m + Gemma）整套 VLM 权重，只有一个视觉编码器，省去双骨干开销，空间能力靠机器人数据上的联合训练补。</p></div></details>
+  <details class="q"><summary>4. DINO 训练中，只留锐化去掉中心化会塌缩到哪种解？反过来只留中心化去掉锐化呢？</summary><div><p>只留锐化（低温 $\tau_t$、无中心化）会让微小偏置被指数放大，所有样本都输出同一个 one-hot 维度，发生单模塌缩（批平均熵 $H(\bar P_t)\to 0$）。只留中心化去掉锐化（高温 $\tau_t$）会把每张图的输出压平到均匀分布 $1/K$，发生均匀塌缩（单样本熵 $\overline{H(P_t)}\to\log K$）。两者合力才能保持低单样熵与高批平均熵。</p></div></details>
+  <details class="q"><summary>5. CLIP 的 InfoNCE 和 SigLIP 的逐对 sigmoid 损失，在「批内出现两条同义图文对」和「超大 batch 训练」上差在哪？</summary><div><p>InfoNCE 在行和列上做全局 softmax，概率和固定为 1：批内出现同义图文对时，非对角格被硬当负样本且与正对抢概率，同时分布式训练必须跨卡通信算完整分母。SigLIP 每个 $(i,j)$ 对独立做二分类，梯度与其他样本完全解耦，不仅允许分块跨卡扩展到极大 batch，而且多正样本之间不存在和为 1 的互斥冲突。</p></div></details>
+  <details class="q"><summary>6. Depth Anything V2 为什么只用 59.5 万张合成图训教师，反而比 V1 用 150 万真实深度图训教师更准？</summary><div><p>真实深度传感器在透明玻璃、反光表面、细杆和物体边缘有大量空洞与飞点，用脏标签训出的教师会把这些系统缺陷复制进 6,200 万张伪标签里。合成图的深度逐像素精确无空洞，用 1.3B 的 DINOv2-G 教师从合成图学到锐利几何，再给 6,200 万张真实无标注图打伪标签，既避开了真实传感器噪声，又借海量真实图消除了合成到真实的视觉域差。</p></div></details>
+  <details class="q"><summary>7. 要把「开放词表抠点云 + 单目深度」上线到商用机械臂产品，选权重时有哪些容易漏掉的坑？</summary><div><p>一是许可证：Depth Anything V2 只有 Small（24.8M）是 Apache 2.0，Base/Large/Giant 是 CC-BY-NC-4.0 禁商用；SAM 3 和 DINOv3 是自定义许可证，需审合规条款；Grounding DINO 1.5+/DINO-X 没给开放本地权重。二是几何与系统坑：低分辨率漏小零件、反光机械臂连杆被并入掩码（需 URDF 渲染减除）、掩码边缘 2 像素背景导致点云飞点（需腐蚀掩码 + 滤波），以及串联时延超控制周期需异步运行。</p></div></details>
+</section>
+
+<!-- ============================================================ -->
+<section id="refs">
+  <h2>延伸阅读</h2>
+  <ol class="refs">
+    <li><b>Dosovitskiy et al., An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale (ViT)</b>, ICLR 2021. <a href="https://arxiv.org/abs/2010.11929">arXiv:2010.11929</a></li>
+    <li><b>Caron et al., Emerging Properties in Self-Supervised Vision Transformers (DINO)</b>, ICCV 2021. <a href="https://arxiv.org/abs/2104.14294">arXiv:2104.14294</a>，代码 <a href="https://github.com/facebookresearch/dino">facebookresearch/dino</a></li>
+    <li><b>Zhou et al., iBOT: Image BERT Pre-Training with Online Tokenizer</b>, ICLR 2022. <a href="https://arxiv.org/abs/2111.07832">arXiv:2111.07832</a></li>
+    <li><b>He et al., Masked Autoencoders Are Scalable Vision Learners (MAE)</b>, CVPR 2022. <a href="https://arxiv.org/abs/2111.06377">arXiv:2111.06377</a></li>
+    <li><b>Oquab et al., DINOv2: Learning Robust Visual Features without Supervision</b>, TMLR 2024. <a href="https://arxiv.org/abs/2304.07193">arXiv:2304.07193</a>，代码 <a href="https://github.com/facebookresearch/dinov2">facebookresearch/dinov2</a></li>
+    <li><b>Darcet, Oquab, Mairal, Bojanowski, Vision Transformers Need Registers</b>, ICLR 2024. <a href="https://arxiv.org/abs/2309.16588">arXiv:2309.16588</a></li>
+    <li><b>Siméoni et al., DINOv3</b>, 2025. <a href="https://arxiv.org/abs/2508.10104">arXiv:2508.10104</a>，代码 <a href="https://github.com/facebookresearch/dinov3">facebookresearch/dinov3</a></li>
+    <li><b>Radford et al., Learning Transferable Visual Models From Natural Language Supervision (CLIP)</b>, ICML 2021. <a href="https://arxiv.org/abs/2103.00020">arXiv:2103.00020</a></li>
+    <li><b>Zhai, Mustafa, Kolesnikov, Beyer, Sigmoid Loss for Language Image Pre-Training (SigLIP)</b>, ICCV 2023. <a href="https://arxiv.org/abs/2303.15343">arXiv:2303.15343</a></li>
+    <li><b>Tschannen et al., SigLIP 2: Multilingual Vision-Language Encoders with Improved Semantic Understanding, Localization, and Dense Features</b>, 2025. <a href="https://arxiv.org/abs/2502.14786">arXiv:2502.14786</a></li>
+    <li><b>Carion et al., End-to-End Object Detection with Transformers (DETR)</b>, ECCV 2020. <a href="https://arxiv.org/abs/2005.12872">arXiv:2005.12872</a></li>
+    <li><b>Zhang et al., DINO: DETR with Improved DeNoising Anchor Boxes for End-to-End Object Detection</b>, ICLR 2023. <a href="https://arxiv.org/abs/2203.03605">arXiv:2203.03605</a></li>
+    <li><b>Li et al., Grounded Language-Image Pre-training (GLIP)</b>, CVPR 2022. <a href="https://arxiv.org/abs/2112.03857">arXiv:2112.03857</a></li>
+    <li><b>Liu et al., Grounding DINO: Marrying DINO with Grounded Pre-Training for Open-Set Object Detection</b>, ECCV 2024. <a href="https://arxiv.org/abs/2303.05499">arXiv:2303.05499</a>，代码 <a href="https://github.com/IDEA-Research/GroundingDINO">IDEA-Research/GroundingDINO</a></li>
+    <li><b>Ren et al., Grounding DINO 1.5: Advance the "Edge" of Open-Set Object Detection</b>, 2024. <a href="https://arxiv.org/abs/2405.10300">arXiv:2405.10300</a>；<b>DINO-X</b> <a href="https://arxiv.org/abs/2411.14347">arXiv:2411.14347</a></li>
+    <li><b>Minderer et al., Simple Open-Vocabulary Object Detection with Vision Transformers (OWL-ViT)</b>, ECCV 2022. <a href="https://arxiv.org/abs/2205.06230">arXiv:2205.06230</a>；<b>OWLv2</b>, NeurIPS 2023, <a href="https://arxiv.org/abs/2306.09683">arXiv:2306.09683</a></li>
+    <li><b>Cheng et al., YOLO-World: Real-Time Open-Vocabulary Object Detection</b>, CVPR 2024. <a href="https://arxiv.org/abs/2401.17270">arXiv:2401.17270</a></li>
+    <li><b>Kirillov et al., Segment Anything (SAM)</b>, ICCV 2023. <a href="https://arxiv.org/abs/2304.02643">arXiv:2304.02643</a>，代码 <a href="https://github.com/facebookresearch/segment-anything">facebookresearch/segment-anything</a></li>
+    <li><b>Ravi et al., SAM 2: Segment Anything in Images and Videos</b>, ICLR 2025. <a href="https://arxiv.org/abs/2408.00714">arXiv:2408.00714</a>，代码 <a href="https://github.com/facebookresearch/sam2">facebookresearch/sam2</a></li>
+    <li><b>Carion et al., SAM 3: Segment Anything with Concepts</b>, 2025. <a href="https://arxiv.org/abs/2511.16719">arXiv:2511.16719</a>，代码 <a href="https://github.com/facebookresearch/sam3">facebookresearch/sam3</a></li>
+    <li><b>Zhang et al., Faster Segment Anything (MobileSAM)</b>, 2023. <a href="https://arxiv.org/abs/2306.14289">arXiv:2306.14289</a>；<b>Xiong et al., EfficientSAM</b>, CVPR 2024, <a href="https://arxiv.org/abs/2312.00863">arXiv:2312.00863</a>；<b>Zhang et al., EfficientViT-SAM</b>, CVPRW 2024, <a href="https://arxiv.org/abs/2402.05008">arXiv:2402.05008</a></li>
+    <li><b>Ren et al., Grounded SAM: Assembling Open-World Models for Diverse Visual Tasks</b>, 2024. <a href="https://arxiv.org/abs/2401.14159">arXiv:2401.14159</a>；视频版代码 <a href="https://github.com/IDEA-Research/Grounded-SAM-2">IDEA-Research/Grounded-SAM-2</a></li>
+    <li><b>Ranftl, Bochkovskiy, Koltun, Vision Transformers for Dense Prediction (DPT)</b>, ICCV 2021. <a href="https://arxiv.org/abs/2103.13413">arXiv:2103.13413</a></li>
+    <li><b>Yang et al., Depth Anything: Unleashing the Power of Large-Scale Unlabeled Data</b>, CVPR 2024. <a href="https://arxiv.org/abs/2401.10891">arXiv:2401.10891</a></li>
+    <li><b>Yang et al., Depth Anything V2</b>, NeurIPS 2024. <a href="https://arxiv.org/abs/2406.09414">arXiv:2406.09414</a>，代码 <a href="https://github.com/DepthAnything/Depth-Anything-V2">DepthAnything/Depth-Anything-V2</a></li>
+    <li><b>Chen et al., Video Depth Anything: Consistent Depth Estimation for Super-Long Videos</b>, CVPR 2025 (Highlight). <a href="https://arxiv.org/abs/2501.12375">arXiv:2501.12375</a>；<b>Depth Anything 3</b>, ICLR 2026, <a href="https://arxiv.org/abs/2511.10647">arXiv:2511.10647</a></li>
+    <li><b>Ranzinger et al., AM-RADIO: Agglomerative Vision Foundation Model — Reduce All Domains Into One</b>, CVPR 2024. <a href="https://arxiv.org/abs/2312.06709">arXiv:2312.06709</a>；<b>RADIOv2.5</b>, CVPR 2025, <a href="https://arxiv.org/abs/2412.07679">arXiv:2412.07679</a></li>
+    <li><b>Shang et al., Theia: Distilling Diverse Vision Foundation Models for Robot Learning</b>, CoRL 2024. <a href="https://arxiv.org/abs/2407.20179">arXiv:2407.20179</a></li>
+    <li><b>Bolya et al., Perception Encoder: The best visual embeddings are not at the output of the network</b>, NeurIPS 2025 (Oral). <a href="https://arxiv.org/abs/2504.13181">arXiv:2504.13181</a></li>
+    <li><b>Karamcheti et al., Prismatic VLMs: Investigating the Design Space of Visually-Conditioned Language Models</b>, ICML 2024. <a href="https://arxiv.org/abs/2402.07865">arXiv:2402.07865</a></li>
+    <li><b>Kim et al., OpenVLA: An Open-Source Vision-Language-Action Model</b>, CoRL 2024. <a href="https://arxiv.org/abs/2406.09246">arXiv:2406.09246</a>；<b>Beyer et al., PaliGemma</b>, 2024, <a href="https://arxiv.org/abs/2407.07726">arXiv:2407.07726</a></li>
+    <li><b>Di Palo, Johns, DINOBot: Robot Manipulation via Retrieval and Alignment with Vision Foundation Models</b>, ICRA 2024. <a href="https://arxiv.org/abs/2402.13181">arXiv:2402.13181</a></li>
+    <li><b>Huang et al., ReKep: Spatio-Temporal Reasoning of Relational Keypoint Constraints for Robotic Manipulation</b>, CoRL 2024. <a href="https://arxiv.org/abs/2409.01652">arXiv:2409.01652</a></li>
+    <li><b>Wen et al., FoundationPose: Unified 6D Pose Estimation and Tracking of Novel Objects</b>, CVPR 2024. <a href="https://arxiv.org/abs/2312.08344">arXiv:2312.08344</a></li>
+    <li><b>Zawalski et al., Robotic Control via Embodied Chain-of-Thought Reasoning (ECoT)</b>, CoRL 2024. <a href="https://arxiv.org/abs/2407.08693">arXiv:2407.08693</a></li>
+    <li><b>Karaev et al., CoTracker: It is Better to Track Together</b>, ECCV 2024. <a href="https://arxiv.org/abs/2307.07635">arXiv:2307.07635</a>；<b>CoTracker3</b> <a href="https://arxiv.org/abs/2410.11831">arXiv:2410.11831</a></li>
+  </ol>
+</section>
+
+</main>
+</div>
+
+<!-- v4u:foot -->
+<footer class="v4u-foot"><div class="v4u-foot-in"><a class="pv" href="../slam/"><span>上一篇</span>SLAM</a><a class="nx" href="../3d-foundation-models/"><span>下一篇</span>3D 基础模型</a></div></footer>
+<!-- /v4u:foot -->
+
+<script>
+/* ---------- shared helpers (all colours from CSS tokens) ---------- */
+const $ = (id) => document.getElementById(id);
+const TOK = (n) => V4U.css(n);
+const hexRgb = (h) => {
+  h = (h || '').trim().replace('#', '');
+  if (h.length === 3) h = h.split('').map((c) => c + c).join('');
+  const n = parseInt(h.slice(0, 6), 16) || 0;
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+};
+const mixTok = (a, b, t) => {
+  const A = hexRgb(TOK(a)), B = hexRgb(TOK(b)), u = V4U.clamp(t, 0, 1);
+  return 'rgb(' + A.map((v, i) => Math.round(v + (B[i] - v) * u)).join(',') + ')';
+};
+const alphaTok = (a, t) => 'rgba(' + hexRgb(TOK(a)).join(',') + ',' + V4U.clamp(t, 0, 1) + ')';
+const monoFont = (px, bold) => (bold ? '700 ' : '') + (px || 12) + 'px ' + TOK('--f-mono');
+const bodyFont = (px, bold) => (bold ? '700 ' : '') + (px || 12) + 'px ' + TOK('--f-body');
+const mulberry = (seed) => () => {
+  seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+  let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+};
+const sigmoid = (z) => 1 / (1 + Math.exp(-V4U.clamp(z, -40, 40)));
+const fmtSci = (n) => {
+  if (n < 1e4) return Math.round(n).toLocaleString('en-US');
+  const e = Math.floor(Math.log10(n));
+  return V4U.fmt(n / 10 ** e, 2) + '×10^' + e;
+};
+function roundRect(ctx, x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+</script>
+
+<script>
+/* ---------- 1. ViT patch grid & attention cost ---------- */
+V4U.ready(() => {
+  const cvG = $('cv-vit-grid'), cvC = $('cv-vit-cost'), slR = $('sl-vit-res'), rd = $('rd-vit');
+  let patch = 14, selU = 0.72, selV = 0.66;
+  const nut = { x: 0.73, y: 0.67, r: 0.022 }; // small nut (~4.4% width)
+
+  const syncSlider = () => {
+    slR.step = patch;
+    const minV = Math.ceil(224 / patch) * patch;
+    const maxV = Math.floor(1024 / patch) * patch;
+    slR.min = minV; slR.max = maxV;
+    let v = Math.round(+slR.value / patch) * patch;
+    v = V4U.clamp(v, minV, maxV);
+    slR.value = v;
+    $('o-vit-res').textContent = v + '²';
+  };
+
+  let geo = null;
+  const drawGrid = V4U.canvas(cvG, (w) => Math.round(Math.min(310, Math.max(230, w * 0.82))), (ctx, w, h) => {
+    const res = +slR.value, G = Math.max(1, Math.floor(res / patch));
+    const side = Math.min(w - 16, h - 16), x0 = (w - side) / 2, y0 = (h - side) / 2;
+    geo = { x0, y0, side, G };
+    // Tabletop scene background
+    ctx.fillStyle = TOK('--surface-2'); ctx.fillRect(x0, y0, side, side);
+    ctx.fillStyle = alphaTok('--line-2', 0.35); ctx.fillRect(x0, y0 + side * 0.56, side, side * 0.44);
+    ctx.strokeStyle = TOK('--line-2'); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x0, y0 + side * 0.56); ctx.lineTo(x0 + side, y0 + side * 0.56); ctx.stroke();
+    // Mug (body + handle + rim)
+    const mx = x0 + side * 0.25, my = y0 + side * 0.38, mw = side * 0.24, mh = side * 0.34;
+    ctx.strokeStyle = TOK('--c1'); ctx.lineWidth = Math.max(4, side * 0.028);
+    ctx.beginPath(); ctx.arc(mx + mw, my + mh * 0.48, mh * 0.24, -Math.PI * 0.45, Math.PI * 0.45); ctx.stroke();
+    ctx.fillStyle = alphaTok('--c1', 0.78); roundRect(ctx, mx, my, mw, mh, 6); ctx.fill();
+    ctx.fillStyle = mixTok('--c1', '--surface', 0.35);
+    ctx.beginPath(); ctx.ellipse(mx + mw / 2, my + 2, mw / 2, mh * 0.1, 0, 0, Math.PI * 2); ctx.fill();
+    // Block
+    ctx.fillStyle = alphaTok('--c5', 0.78);
+    roundRect(ctx, x0 + side * 0.10, y0 + side * 0.68, side * 0.13, side * 0.13, 3); ctx.fill();
+    // Gripper top-right
+    ctx.fillStyle = alphaTok('--muted', 0.7);
+    ctx.fillRect(x0 + side * 0.64, y0, side * 0.14, side * 0.14);
+    ctx.fillRect(x0 + side * 0.64, y0 + side * 0.14, side * 0.032, side * 0.13);
+    ctx.fillRect(x0 + side * 0.748, y0 + side * 0.14, side * 0.032, side * 0.13);
+    // Small nut
+    ctx.fillStyle = TOK('--c2');
+    ctx.beginPath(); ctx.arc(x0 + nut.x * side, y0 + nut.y * side, nut.r * side, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = TOK('--surface-2');
+    ctx.beginPath(); ctx.arc(x0 + nut.x * side, y0 + nut.y * side, nut.r * side * 0.42, 0, Math.PI * 2); ctx.fill();
+
+    // Patch grid overlay
+    const cs = side / G;
+    const drawLines = G <= 64;
+    if (drawLines) {
+      ctx.strokeStyle = alphaTok('--ink', G > 32 ? 0.18 : 0.28);
+      ctx.lineWidth = G > 32 ? 0.6 : 0.9;
+      ctx.beginPath();
+      for (let i = 1; i < G; i++) {
+        ctx.moveTo(x0 + i * cs, y0); ctx.lineTo(x0 + i * cs, y0 + side);
+        ctx.moveTo(x0, y0 + i * cs); ctx.lineTo(x0 + side, y0 + i * cs);
+      }
+      ctx.stroke();
+    } else {
+      ctx.strokeStyle = alphaTok('--ink', 0.16); ctx.lineWidth = 0.5;
+      const st = Math.ceil(G / 48);
+      ctx.beginPath();
+      for (let i = st; i < G; i += st) {
+        ctx.moveTo(x0 + i * cs, y0); ctx.lineTo(x0 + i * cs, y0 + side);
+        ctx.moveTo(x0, y0 + i * cs); ctx.lineTo(x0 + side, y0 + i * cs);
+      }
+      ctx.stroke();
+    }
+    // Highlight selected patch
+    const ci = V4U.clamp(Math.floor(selU * G), 0, G - 1);
+    const cj = V4U.clamp(Math.floor(selV * G), 0, G - 1);
+    ctx.fillStyle = alphaTok('--c3', 0.34);
+    ctx.fillRect(x0 + ci * cs, y0 + cj * cs, cs, cs);
+    ctx.strokeStyle = TOK('--c3'); ctx.lineWidth = 2;
+    ctx.strokeRect(x0 + ci * cs, y0 + cj * cs, cs, cs);
+    ctx.strokeStyle = TOK('--line-2'); ctx.lineWidth = 1;
+    ctx.strokeRect(x0 + 0.5, y0 + 0.5, side - 1, side - 1);
+
+    // Count patches intersecting the small nut
+    let nutCnt = 0;
+    for (let r = 0; r < G; r++) for (let c = 0; c < G; c++) {
+      const cx = V4U.clamp(nut.x, c / G, (c + 1) / G), cy = V4U.clamp(nut.y, r / G, (r + 1) / G);
+      if (Math.hypot(cx - nut.x, cy - nut.y) <= nut.r) nutCnt++;
+    }
+    const np = G * G, att = np * np, baseAtt = 196 * 196;
+    const ratio = att / baseAtt;
+    rd.innerHTML =
+      `<span>特征图 <b>${G}×${G}</b></span>` +
+      `<span>token 数 N<sub>p</sub> = <b>${np.toLocaleString('en-US')}</b></span>` +
+      `<span>注意力元素 N<sub>p</sub>² = <b>${fmtSci(att)}</b></span>` +
+      `<span>相对 224/16：<b>${ratio >= 10 ? Math.round(ratio) : V4U.fmt(ratio, 1)}×</b></span>` +
+      `<span>小螺母占 <b>${nutCnt}</b> 格</span>`;
+  });
+
+  const drawCost = V4U.canvas(cvC, (w) => Math.round(Math.min(310, Math.max(230, w * 0.82))), (ctx, w, h) => {
+    const res = +slR.value, G = Math.max(1, Math.floor(res / patch)), curAtt = (G * G) ** 2;
+    const refs = [
+      { name: '224/16', val: 196 ** 2, col: '--muted' },
+      { name: '224/14', val: 256 ** 2, col: '--muted' },
+      { name: '518/14', val: 1369 ** 2, col: '--muted' },
+      { name: '1024/16', val: 4096 ** 2, col: '--muted' },
+      { name: `当前 ${res}/${patch}`, val: curAtt, col: '--c4' },
+    ];
+    const lo = 3.5, hi = 9.8; // log10 range
+    const L = 86, R = 16, T = 18, B = 28;
+    const bw = w - L - R, bh = h - T - B;
+    const X = (v) => L + V4U.clamp((Math.log10(Math.max(1, v)) - lo) / (hi - lo), 0, 1) * bw;
+    ctx.strokeStyle = TOK('--line'); ctx.lineWidth = 1; ctx.fillStyle = TOK('--muted'); ctx.font = monoFont(10);
+    for (let e = 4; e <= 9; e++) {
+      const x = X(10 ** e);
+      ctx.beginPath(); ctx.moveTo(x, T); ctx.lineTo(x, h - B); ctx.stroke();
+      ctx.fillText('10^' + e, x - 12, h - 10);
+    }
+    const rowH = bh / refs.length;
+    refs.forEach((r, i) => {
+      const y = T + i * rowH + rowH * 0.22, barH = rowH * 0.56;
+      const xEnd = X(r.val);
+      ctx.fillStyle = i === refs.length - 1 ? TOK('--c4') : alphaTok('--c1', 0.55);
+      roundRect(ctx, L, y, Math.max(3, xEnd - L), barH, 4); ctx.fill();
+      ctx.fillStyle = i === refs.length - 1 ? TOK('--ink') : TOK('--ink-2');
+      ctx.font = monoFont(11, i === refs.length - 1);
+      ctx.textAlign = 'right';
+      ctx.fillText(r.name, L - 8, y + barH * 0.68);
+      ctx.textAlign = 'left';
+      const txt = fmtSci(r.val);
+      const fitsRight = xEnd + 5 < w - 62;
+      ctx.fillStyle = fitsRight ? TOK('--ink-2') : (i === refs.length - 1 ? TOK('--on-accent') : TOK('--ink'));
+      ctx.fillText(txt, fitsRight ? xEnd + 5 : Math.max(L + 4, xEnd - 64), y + barH * 0.68);
+    });
+  });
+
+  const upd = () => { $('o-vit-res').textContent = slR.value + '²'; drawGrid(); drawCost(); };
+  const setSeg = V4U.seg($('sg-vit-p'), (v) => { patch = +v; syncSlider(); upd(); });
+  slR.addEventListener('input', upd);
+  $('bt-vit-dv2').addEventListener('click', () => { patch = 14; setSeg('14'); slR.value = 518; upd(); });
+  $('bt-vit-sam').addEventListener('click', () => { patch = 16; setSeg('16'); slR.value = 1024; upd(); });
+  cvG.addEventListener('click', (e) => {
+    if (!geo) return;
+    const r = cvG.getBoundingClientRect();
+    const u = (e.clientX - r.left - geo.x0) / geo.side, v = (e.clientY - r.top - geo.y0) / geo.side;
+    if (u >= 0 && u <= 1 && v >= 0 && v <= 1) { selU = u; selV = v; drawGrid(); }
+  });
+});
+</script>
+
+<script>
+/* ---------- 2. DINO centering + sharpening real EMA ---------- */
+V4U.ready(() => {
+  const cvM = $('cv-dino-mat'), cvB = $('cv-dino-bar'), slT = $('sl-dino-tau'), slM = $('sl-dino-mc'), rd = $('rd-dino-col');
+  const B = 12, K = 16;
+  let mode = 'both', stepN = 0, useCenter = true, logits = [], center = [], loop = null, playing = false;
+
+  function initState() {
+    const rnd = mulberry(42);
+    logits = [];
+    for (let i = 0; i < B; i++) {
+      const row = [];
+      const pref = Math.floor((i * K) / B);
+      for (let k = 0; k < K; k++) {
+        const d = Math.min(Math.abs(k - pref), K - Math.abs(k - pref));
+        // Add a small shared bias toward prototype 3 so collapse-without-centering triggers cleanly
+        const bias = k === 3 ? 0.42 : 0;
+        row.push(bias + (d === 0 ? 0.55 : d === 1 ? 0.20 : 0) + (rnd() - 0.5) * 0.25);
+      }
+      logits.push(row);
+    }
+    center = Array(K).fill(0);
+    stepN = 0;
+  }
+
+  function teacherProbs() {
+    const tau = +slT.value;
+    const P = logits.map((row) => {
+      const z = row.map((v, k) => (v - (useCenter ? center[k] : 0)) / tau);
+      const mx = Math.max(...z);
+      const ex = z.map((v) => Math.exp(v - mx));
+      const s = ex.reduce((a, b) => a + b, 0) || 1;
+      return ex.map((v) => v / s);
+    });
+    const meanP = Array(K).fill(0);
+    P.forEach((p) => p.forEach((v, k) => (meanP[k] += v / B)));
+    return { P, meanP };
+  }
+
+  function stepEMA() {
+    const mc = +slM.value;
+    // Update center from raw teacher batch mean
+    const bMean = Array(K).fill(0);
+    logits.forEach((row) => row.forEach((v, k) => (bMean[k] += v / B)));
+    for (let k = 0; k < K; k++) center[k] = mc * center[k] + (1 - mc) * bMean[k];
+    // Simulate one gradient + EMA step: student pulls toward teacher distribution P_t,
+    // plus tiny shared channel drift toward dim 3 representing parameter drift
+    const { P } = teacherProbs();
+    logits = logits.map((row, i) => row.map((v, k) => {
+      const target = Math.log(Math.max(1e-5, P[i][k])) * 0.16;
+      const drift = k === 3 ? 0.055 : 0;
+      return 0.84 * v + 0.16 * (target + 0.7) + drift;
+    }));
+    stepN++;
+  }
+
+  const entropy = (p) => -p.reduce((a, v) => a + (v > 1e-12 ? v * Math.log(v) : 0), 0);
+
+  initState();
+  for (let s = 0; s < 4; s++) stepEMA();
+
+  const paintM = V4U.canvas(cvM, (w) => Math.round(Math.min(250, Math.max(190, w * 0.62))), (ctx, w, h) => {
+    const { P, meanP } = teacherProbs();
+    const L = 30, R = 8, T = 10, Bt = 22;
+    const cw = (w - L - R) / K, ch = (h - T - Bt) / B;
+    for (let i = 0; i < B; i++) for (let k = 0; k < K; k++) {
+      const v = V4U.clamp(P[i][k], 0, 1);
+      ctx.fillStyle = mixTok('--surface-2', '--c1', Math.pow(v, 0.55));
+      ctx.fillRect(L + k * cw + 0.5, T + i * ch + 0.5, Math.max(1, cw - 1), Math.max(1, ch - 1));
+    }
+    ctx.strokeStyle = TOK('--line-2'); ctx.lineWidth = 1;
+    ctx.strokeRect(L + 0.5, T + 0.5, w - L - R - 1, h - T - Bt - 1);
+    ctx.fillStyle = TOK('--muted'); ctx.font = monoFont(10);
+    ctx.fillText('x1', 6, T + ch * 0.8);
+    ctx.fillText('x12', 2, T + (B - 0.2) * ch);
+    for (let k = 0; k < K; k += 4) ctx.fillText(String(k + 1), L + (k + 0.3) * cw, h - 6);
+
+    const hSample = P.reduce((a, p) => a + entropy(p), 0) / B;
+    const hBatch = entropy(meanP);
+    const maxH = Math.log(K);
+    const mi = Math.max(0, hBatch - hSample);
+    let state = '健康聚类';
+    if (hBatch < 0.75) state = '单模塌缩（全挤同一维）';
+    else if (hSample > maxH * 0.86) state = '均匀塌缩（失去区分）';
+    $('o-dino-tau').textContent = V4U.fmt(+slT.value, 2);
+    $('o-dino-mc').textContent = V4U.fmt(+slM.value, 2);
+    rd.innerHTML =
+      `<span>迭代步 <b>${stepN}</b></span>` +
+      `<span>单样本熵 H̄ = <b>${V4U.fmt(hSample, 2)}</b></span>` +
+      `<span>批平均熵 H(P̄) = <b>${V4U.fmt(hBatch, 2)}</b> / ${V4U.fmt(maxH, 2)}</span>` +
+      `<span>有效信息差 <b>${V4U.fmt(mi, 2)}</b></span>` +
+      `<span>状态：<b>${state}</b></span>`;
+  });
+
+  const paintB = V4U.canvas(cvB, (w) => Math.round(Math.min(250, Math.max(190, w * 0.62))), (ctx, w, h) => {
+    const { P, meanP } = teacherProbs();
+    const hSample = P.reduce((a, p) => a + entropy(p), 0) / B;
+    const hBatch = entropy(meanP), maxH = Math.log(K);
+    const collapsed = hBatch < 0.75 || hSample > maxH * 0.86;
+    const L = 34, R = 10, T = 14, Bt = 22;
+    const ymax = Math.max(0.25, Math.min(1, Math.max(...meanP) * 1.15));
+    const X = (k) => L + k * (w - L - R) / K;
+    const Y = (v) => T + (1 - v / ymax) * (h - T - Bt);
+    ctx.strokeStyle = TOK('--line'); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(L, T); ctx.lineTo(L, h - Bt); ctx.lineTo(w - R, h - Bt); ctx.stroke();
+    // Uniform line 1/K
+    const yu = Y(1 / K);
+    ctx.strokeStyle = TOK('--muted'); ctx.setLineDash([4, 3]);
+    ctx.beginPath(); ctx.moveTo(L, yu); ctx.lineTo(w - R, yu); ctx.stroke(); ctx.setLineDash([]);
+    const bw = (w - L - R) / K;
+    ctx.fillStyle = collapsed ? TOK('--bad') : TOK('--c3');
+    meanP.forEach((v, k) => {
+      const y = Y(v);
+      ctx.fillRect(X(k) + 2, y, Math.max(2, bw - 4), h - Bt - y);
+    });
+    ctx.fillStyle = TOK('--muted'); ctx.font = monoFont(10);
+    ctx.fillText(V4U.fmt(ymax, 2), 4, T + 8);
+    ctx.fillText('0.00', 4, h - Bt + 3);
+    for (let k = 0; k < K; k += 4) ctx.fillText(String(k + 1), X(k) + 2, h - 6);
+  });
+
+  const redraw = () => { paintM(); paintB(); };
+  const stop = () => { playing = false; $('bt-dino-play').textContent = '播放迭代'; if (loop) { loop.stop(); loop = null; } };
+
+  V4U.seg($('sg-dino-mode'), (v) => {
+    stop(); mode = v;
+    if (v === 'both') { useCenter = true; slT.value = 0.10; }
+    else if (v === 'sharp') { useCenter = false; slT.value = 0.06; }
+    else { useCenter = true; slT.value = 1.40; }
+    slM.disabled = !useCenter;
+    initState();
+    for (let s = 0; s < (v === 'both' ? 4 : 18); s++) stepEMA();
+    redraw();
+  });
+  [slT, slM].forEach((el) => el.addEventListener('input', redraw));
+  $('bt-dino-step').addEventListener('click', () => { stepEMA(); redraw(); });
+  $('bt-dino-rst').addEventListener('click', () => { stop(); initState(); redraw(); });
+  $('bt-dino-play').addEventListener('click', () => {
+    if (playing) { stop(); return; }
+    playing = true; $('bt-dino-play').textContent = '暂停';
+    let acc = 0;
+    loop = V4U.loop(cvM, (tt, dt) => {
+      if (tt === 0 && dt === 0) { for (let i = 0; i < 20; i++) stepEMA(); redraw(); stop(); return; }
+      acc += dt * 7;
+      while (acc >= 1) { stepEMA(); acc -= 1; }
+      redraw();
+      if (stepN >= 80) stop();
+    });
+  });
+});
+</script>
+
+<script>
+/* ---------- 3. DINO dense patch correspondence (synthetic schematic) ---------- */
+V4U.ready(() => {
+  const cv = $('cv-dino-corr'), ckReg = $('ck-dino-reg'), rd = $('rd-dino-corr');
+  const G = 12;
+  let scene = 'mug', sel = [9, 6]; // default on mug handle
+
+  const parts = {
+    mug: ['背景', '杯口', '杯身', '把手', '底座'],
+    tool: ['背景', '开口头', '杆身', '梅花尾', '桌面'],
+  };
+
+  function labelGrid(sc, right) {
+    // Returns GxG array of part IDs (0..4)
+    const grid = Array.from({ length: G }, () => Array(G).fill(0));
+    for (let r = 0; r < G; r++) for (let c = 0; c < G; c++) {
+      const u = (c + 0.5) / G, v = (r + 0.5) / G;
+      if (sc === 'mug') {
+        if (!right) {
+          // Left: upright tall mug, handle on right
+          if (u >= 0.24 && u <= 0.66 && v >= 0.22 && v <= 0.30) grid[r][c] = 1;
+          else if (u >= 0.24 && u <= 0.66 && v > 0.30 && v <= 0.72) grid[r][c] = 2;
+          else if (u >= 0.24 && u <= 0.66 && v > 0.72 && v <= 0.82) grid[r][c] = 4;
+          else if (u > 0.66 && u <= 0.84 && v >= 0.36 && v <= 0.68 && !(u < 0.76 && v > 0.44 && v < 0.60)) grid[r][c] = 3;
+        } else {
+          // Right: wider shorter mug shifted, handle on LEFT (different viewpoint!)
+          if (u >= 0.36 && u <= 0.84 && v >= 0.34 && v <= 0.42) grid[r][c] = 1;
+          else if (u >= 0.36 && u <= 0.84 && v > 0.42 && v <= 0.76) grid[r][c] = 2;
+          else if (u >= 0.36 && u <= 0.84 && v > 0.76 && v <= 0.84) grid[r][c] = 4;
+          else if (u >= 0.16 && u < 0.36 && v >= 0.44 && v <= 0.70 && !(u > 0.24 && v > 0.51 && v < 0.63)) grid[r][c] = 3;
+        }
+      } else {
+        // Wrench: left horizontal, right rotated ~35 deg
+        const cx = right ? 0.52 : 0.50, cy = right ? 0.52 : 0.50;
+        const ang = right ? -0.58 : 0.08;
+        const dx = u - cx, dy = v - cy;
+        const lx = dx * Math.cos(ang) - dy * Math.sin(ang);
+        const ly = dx * Math.sin(ang) + dy * Math.cos(ang);
+        if (Math.hypot(lx + 0.28, ly) < 0.13 && !(lx < -0.32 && Math.abs(ly) < 0.055)) grid[r][c] = 1;
+        else if (Math.hypot(lx - 0.28, ly) < 0.11) grid[r][c] = 3;
+        else if (lx >= -0.22 && lx <= 0.22 && Math.abs(ly) < 0.065) grid[r][c] = 2;
+        else if (v > 0.78) grid[r][c] = 4;
+      }
+    }
+    return grid;
+  }
+
+  // Build synthetic normalized 8D features per patch
+  const rndF = mulberry(91);
+  const noiseTable = Array.from({ length: 2 * G * G }, () => Array.from({ length: 8 }, () => (rndF() - 0.5) * 0.22));
+  const proto = [
+    [1, 0, 0, 0, 0, 0.1, 0.1, 0],
+    [0, 1, 0, 0, 0, 0.2, -0.1, 0.2],
+    [0, 0, 1, 0, 0, -0.1, 0.2, 0.1],
+    [0, 0, 0, 1, 0, 0.15, 0.15, -0.2],
+    [0, 0, 0, 0, 1, -0.2, 0.1, 0.15],
+  ];
+  const artifactCells = [[1, 1], [10, 1], [1, 10]]; // high-norm background artifact locations when registers disabled
+
+  function feat(partId, r, c, sideIdx, useReg) {
+    const base = proto[partId].slice();
+    const nz = noiseTable[sideIdx * G * G + r * G + c];
+    for (let k = 0; k < 8; k++) base[k] += nz[k];
+    if (!useReg && partId === 0 && artifactCells.some(([ac, ar]) => ac === c && ar === r)) {
+      // Artifact patch absorbs global summary across all parts -> correlates spuriously with foreground
+      return [0.45, 0.48, 0.48, 0.52, 0.45, 0.1, 0.1, 0.1];
+    }
+    const n = Math.hypot(...base) || 1;
+    return base.map((v) => v / n);
+  }
+  const dot = (a, b) => a.reduce((s, v, i) => s + v * b[i], 0);
+
+  let geo = null;
+  const redraw = V4U.canvas(cv, (w) => Math.round(Math.min(310, Math.max(210, w * 0.48))), (ctx, w, h) => {
+    const useReg = ckReg.checked;
+    const gap = Math.max(16, Math.min(34, w * 0.05));
+    const side = Math.min((w - gap - 16) / 2, h - 30);
+    const xL = (w - (2 * side + gap)) / 2, xR = xL + side + gap, y0 = 22, cs = side / G;
+    geo = { xL, y0, side, cs };
+
+    const gL = labelGrid(scene, false), gR = labelGrid(scene, true);
+    const qPart = gL[sel[1]][sel[0]];
+    const qFeat = feat(qPart, sel[1], sel[0], 0, useReg);
+
+    // Compute similarity to every right patch
+    let best = { c: 0, r: 0, sim: -2 };
+    const sims = Array.from({ length: G }, (_, r) => Array.from({ length: G }, (_, c) => {
+      const f = feat(gR[r][c], r, c, 1, useReg);
+      const nf = Math.hypot(...f) || 1;
+      // Without register, unnormalized high-norm artifact spikes hijack dot product / cosine
+      const s = dot(qFeat, f) / (useReg ? 1 : (nf > 1.05 ? 0.92 : 1));
+      if (s > best.sim) best = { c, r, sim: s };
+      return s;
+    }));
+
+    const partCol = ['--surface-2', '--c4', '--c1', '--c5', '--c3'];
+    const drawPane = (ox, grid, isRight) => {
+      for (let r = 0; r < G; r++) for (let c = 0; c < G; c++) {
+        const pid = grid[r][c];
+        if (!isRight) {
+          ctx.fillStyle = pid === 0 ? TOK('--surface-2') : alphaTok(partCol[pid], 0.72);
+        } else {
+          const base = pid === 0 ? TOK('--surface-2') : alphaTok(partCol[pid], 0.24);
+          ctx.fillStyle = base;
+        }
+        ctx.fillRect(ox + c * cs, y0 + r * cs, cs, cs);
+        if (isRight) {
+          const t = V4U.clamp((sims[r][c] - 0.1) / 0.9, 0, 1);
+          ctx.fillStyle = alphaTok('--c1', t * 0.78);
+          ctx.fillRect(ox + c * cs, y0 + r * cs, cs, cs);
+        }
+        if (!useReg && pid === 0 && artifactCells.some(([ac, ar]) => ac === c && ar === r)) {
+          ctx.strokeStyle = TOK('--bad'); ctx.lineWidth = 1.8;
+          ctx.strokeRect(ox + c * cs + 1.5, y0 + r * cs + 1.5, cs - 3, cs - 3);
+        }
+      }
+      ctx.strokeStyle = alphaTok('--ink', 0.16); ctx.lineWidth = 0.6;
+      for (let i = 1; i < G; i++) {
+        ctx.beginPath(); ctx.moveTo(ox + i * cs, y0); ctx.lineTo(ox + i * cs, y0 + side); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(ox, y0 + i * cs); ctx.lineTo(ox + side, y0 + i * cs); ctx.stroke();
+      }
+      ctx.strokeStyle = TOK('--line-2'); ctx.lineWidth = 1;
+      ctx.strokeRect(ox + 0.5, y0 + 0.5, side - 1, side - 1);
+    };
+
+    drawPane(xL, gL, false);
+    drawPane(xR, gR, true);
+    ctx.fillStyle = TOK('--ink-2'); ctx.font = monoFont(11);
+    ctx.fillText('图 A（点击选 patch）', xL, 14);
+    ctx.fillText('图 B（相似度热图）', xR, 14);
+
+    // Highlight query & nearest neighbor + connecting arc
+    const qx = xL + (sel[0] + 0.5) * cs, qy = y0 + (sel[1] + 0.5) * cs;
+    const bx = xR + (best.c + 0.5) * cs, by = y0 + (best.r + 0.5) * cs;
+    ctx.strokeStyle = TOK('--c2'); ctx.lineWidth = 2.5;
+    ctx.strokeRect(xL + sel[0] * cs, y0 + sel[1] * cs, cs, cs);
+    ctx.strokeStyle = TOK('--c3'); ctx.lineWidth = 2.5;
+    ctx.strokeRect(xR + best.c * cs, y0 + best.r * cs, cs, cs);
+    ctx.strokeStyle = TOK('--c3'); ctx.lineWidth = 1.6; ctx.setLineDash([5, 3]);
+    ctx.beginPath(); ctx.moveTo(qx, qy); ctx.quadraticCurveTo((qx + bx) / 2, Math.min(qy, by) - 18, bx, by); ctx.stroke();
+    ctx.setLineDash([]);
+
+    const bPart = gR[best.r][best.c];
+    const ok = qPart === bPart;
+    rd.innerHTML =
+      `<span>查询 (${sel[0]},${sel[1]})：<b>${parts[scene][qPart]}</b></span>` +
+      `<span>最近邻 (${best.c},${best.r})：<b>${parts[scene][bPart]}</b></span>` +
+      `<span>最高相似度 <b>${V4U.fmt(Math.min(1, best.sim), 2)}</b></span>` +
+      `<span>部件对齐：<b>${ok ? '一致' : '被伪影拉偏'}</b></span>`;
+  });
+
+  V4U.seg($('sg-dino-scene'), (v) => { scene = v; sel = v === 'mug' ? [9, 6] : [3, 6]; redraw(); });
+  ckReg.addEventListener('change', redraw);
+  cv.addEventListener('click', (e) => {
+    if (!geo) return;
+    const r = cv.getBoundingClientRect();
+    const c = Math.floor((e.clientX - r.left - geo.xL) / geo.cs);
+    const rr = Math.floor((e.clientY - r.top - geo.y0) / geo.cs);
+    if (c >= 0 && c < G && rr >= 0 && rr < G) { sel = [c, rr]; redraw(); }
+  });
+});
+</script>
+
+<script>
+/* ---------- 4. CLIP InfoNCE vs SigLIP pairwise sigmoid ---------- */
+V4U.ready(() => {
+  const cvC = $('cv-clip-circle'), cvM = $('cv-clip-mat'), slT = $('sl-clip-t'), slB = $('sl-clip-b'), ckDup = $('ck-clip-dup'), rd = $('rd-clip');
+  const N = 4;
+  let lossMode = 'clip';
+  // Angles on unit circle for u_0..u_3 (images) and v_0..v_3 (texts)
+  const initU = [0.25, 1.75, 3.25, 4.80], initV = [0.42, 1.92, 3.12, 4.96];
+  let angU = initU.slice(), angV = initV.slice();
+  let dragTarget = null, cGeo = null;
+
+  function compute() {
+    const invT = +slT.value, bias = +slB.value, dup = ckDup.checked;
+    const U = angU.map((a) => [Math.cos(a), Math.sin(a)]);
+    const V = angV.map((a) => [Math.cos(a), Math.sin(a)]);
+    const S = U.map((u) => V.map((v) => u[0] * v[0] + u[1] * v[1]));
+    const grad = Array.from({ length: N }, () => Array(N).fill(0));
+    const prob = Array.from({ length: N }, () => Array(N).fill(0));
+    let loss = 0;
+
+    if (lossMode === 'clip') {
+      const alpha = [], beta = Array.from({ length: N }, () => Array(N).fill(0));
+      for (let i = 0; i < N; i++) {
+        const z = S[i].map((s) => s * invT), mx = Math.max(...z);
+        const ex = z.map((v) => Math.exp(v - mx)), sm = ex.reduce((a, b) => a + b, 0);
+        alpha.push(ex.map((v) => v / sm));
+      }
+      for (let j = 0; j < N; j++) {
+        const z = S.map((r) => r[j] * invT), mx = Math.max(...z);
+        const ex = z.map((v) => Math.exp(v - mx)), sm = ex.reduce((a, b) => a + b, 0);
+        for (let i = 0; i < N; i++) beta[i][j] = ex[i] / sm;
+      }
+      for (let i = 0; i < N; i++) {
+        loss += -(Math.log(Math.max(1e-12, alpha[i][i])) + Math.log(Math.max(1e-12, beta[i][i]))) / (2 * N);
+        for (let j = 0; j < N; j++) {
+          prob[i][j] = alpha[i][j];
+          grad[i][j] = (alpha[i][j] + beta[i][j] - (i === j ? 2 : 0)) / (2 * N);
+        }
+      }
+    } else {
+      for (let i = 0; i < N; i++) for (let j = 0; j < N; j++) {
+        const isPos = i === j || (dup && ((i === 0 && j === 1) || (i === 1 && j === 0)));
+        const y = isPos ? 1 : -1;
+        const z = invT * S[i][j] + bias;
+        const p = sigmoid(z);
+        prob[i][j] = p;
+        loss += -Math.log(Math.max(1e-12, sigmoid(y * z))) / N;
+        grad[i][j] = -y * (1 - sigmoid(y * z)) / N;
+      }
+    }
+    return { U, V, S, grad, prob, loss, dup };
+  }
+
+  const paintC = V4U.canvas(cvC, (w) => Math.round(Math.min(280, Math.max(220, w * 0.78))), (ctx, w, h) => {
+    const D = compute();
+    const ox = w / 2, oy = h / 2, R = Math.min(w, h) * 0.37;
+    cGeo = { ox, oy, R };
+    ctx.strokeStyle = TOK('--line-2'); ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.arc(ox, oy, R, 0, Math.PI * 2); ctx.stroke();
+    ctx.strokeStyle = TOK('--line'); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(ox - R - 10, oy); ctx.lineTo(ox + R + 10, oy); ctx.moveTo(ox, oy - R - 10); ctx.lineTo(ox, oy + R + 10); ctx.stroke();
+
+    for (let i = 0; i < N; i++) {
+      const ux = ox + R * D.U[i][0], uy = oy - R * D.U[i][1];
+      const vx = ox + R * D.V[i][0], vy = oy - R * D.V[i][1];
+      ctx.strokeStyle = alphaTok('--line-2', 0.9); ctx.lineWidth = 1.2; ctx.setLineDash([3, 3]);
+      ctx.beginPath(); ctx.moveTo(ux, uy); ctx.lineTo(vx, vy); ctx.stroke(); ctx.setLineDash([]);
+      // Image dot u_i
+      ctx.fillStyle = TOK('--c1'); ctx.beginPath(); ctx.arc(ux, uy, 7, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = TOK('--on-accent'); ctx.font = monoFont(9, true); ctx.textAlign = 'center';
+      ctx.fillText('u' + (i + 1), ux, uy + 3);
+      // Text square v_i
+      ctx.fillStyle = TOK('--c2'); ctx.fillRect(vx - 6.5, vy - 6.5, 13, 13);
+      ctx.fillStyle = TOK('--on-accent'); ctx.fillText('v' + (i + 1), vx, vy + 3);
+    }
+    ctx.textAlign = 'left';
+  });
+
+  const paintM = V4U.canvas(cvM, (w) => Math.round(Math.min(280, Math.max(220, w * 0.78))), (ctx, w, h) => {
+    const D = compute();
+    const padL = 34, padT = 24, side = Math.min(w - padL - 12, h - padT - 12);
+    const x0 = padL + Math.max(0, (w - padL - 12 - side) / 2), y0 = padT, cs = side / N;
+    ctx.font = monoFont(11); ctx.fillStyle = TOK('--ink-2'); ctx.textAlign = 'center';
+    for (let k = 0; k < N; k++) {
+      ctx.fillText('v' + (k + 1), x0 + (k + 0.5) * cs, y0 - 7);
+      ctx.fillText('u' + (k + 1), x0 - 16, y0 + (k + 0.55) * cs);
+    }
+    for (let i = 0; i < N; i++) for (let j = 0; j < N; j++) {
+      const isPos = i === j || (D.dup && lossMode === 'siglip' && ((i === 0 && j === 1) || (i === 1 && j === 0)));
+      const g = D.grad[i][j], mag = V4U.clamp(Math.abs(g) * N * 1.4, 0, 1);
+      ctx.fillStyle = mixTok('--surface-2', isPos ? '--ok' : '--bad', 0.14 + 0.55 * mag);
+      ctx.fillRect(x0 + j * cs + 1, y0 + i * cs + 1, cs - 2, cs - 2);
+      if (D.dup && ((i === 0 && j === 1) || (i === 1 && j === 0))) {
+        ctx.strokeStyle = TOK('--c4'); ctx.lineWidth = 2;
+        ctx.strokeRect(x0 + j * cs + 2, y0 + i * cs + 2, cs - 4, cs - 4);
+      }
+      ctx.fillStyle = TOK('--ink'); ctx.font = monoFont(10.5, i === j);
+      ctx.fillText(V4U.fmt(D.S[i][j], 2), x0 + (j + 0.5) * cs, y0 + (i + 0.42) * cs);
+      ctx.fillStyle = TOK('--ink-2'); ctx.font = monoFont(9.5);
+      const gs = (g >= 0 ? '+' : '') + V4U.fmt(g, 2);
+      ctx.fillText('∂' + gs, x0 + (j + 0.5) * cs, y0 + (i + 0.78) * cs);
+    }
+    ctx.textAlign = 'left';
+
+    const diagP = [0, 1, 2, 3].reduce((a, i) => a + D.prob[i][i], 0) / N;
+    $('o-clip-t').textContent = V4U.fmt(+slT.value, 1);
+    $('o-clip-b').textContent = V4U.fmt(+slB.value, 1);
+    rd.innerHTML =
+      `<span>总损失 L = <b>${V4U.fmt(D.loss, 3)}</b></span>` +
+      `<span>对角均值 p<sub>ii</sub> = <b>${V4U.fmt(diagP, 2)}</b></span>` +
+      `<span>格 (1,2) 梯度 <b>${(D.grad[0][1] >= 0 ? '+' : '') + V4U.fmt(D.grad[0][1], 3)}</b></span>` +
+      `<span>${D.dup ? (lossMode === 'clip' ? '同义对被 softmax 强推远' : '同义对同标 +1 无冲突') : '拖动圆上点观察梯度'}</span>`;
+  });
+
+  const redraw = () => { paintC(); paintM(); };
+  V4U.seg($('sg-clip-loss'), (v) => { lossMode = v; slB.disabled = v === 'clip'; redraw(); });
+  [slT, slB].forEach((el) => el.addEventListener('input', redraw));
+  ckDup.addEventListener('change', () => {
+    if (ckDup.checked) { angU = [0.35, 0.48, 3.25, 4.80]; angV = [0.40, 0.43, 3.12, 4.96]; }
+    else { angU = initU.slice(); angV = initV.slice(); }
+    redraw();
+  });
+
+  V4U.drag(cvC, (x, y, phase) => {
+    if (!cGeo) return;
+    if (phase === 'down') {
+      let best = null, bd = 26;
+      for (let i = 0; i < N; i++) {
+        const d1 = Math.hypot(x - (cGeo.ox + cGeo.R * Math.cos(angU[i])), y - (cGeo.oy - cGeo.R * Math.sin(angU[i])));
+        if (d1 < bd) { bd = d1; best = ['u', i]; }
+        const d2 = Math.hypot(x - (cGeo.ox + cGeo.R * Math.cos(angV[i])), y - (cGeo.oy - cGeo.R * Math.sin(angV[i])));
+        if (d2 < bd) { bd = d2; best = ['v', i]; }
+      }
+      dragTarget = best;
+    } else if (phase === 'move' && dragTarget) {
+      const a = Math.atan2(-(y - cGeo.oy), x - cGeo.ox);
+      if (dragTarget[0] === 'u') angU[dragTarget[1]] = a;
+      else angV[dragTarget[1]] = a;
+      redraw();
+    } else if (phase === 'up') {
+      dragTarget = null;
+    }
+  });
+});
+</script>
+
+<script>
+/* ---------- 5. Hungarian matching (exact optimal assignment) ---------- */
+V4U.ready(() => {
+  const cvS = $('cv-hung-scene'), cvM = $('cv-hung-mat'), slL1 = $('sl-hg-l1'), slG = $('sl-hg-giou'), rd = $('rd-hung');
+  const gts = [
+    { name: '杯', cx: 0.24, cy: 0.46, w: 0.22, h: 0.34, cls: 0 },
+    { name: '碗', cx: 0.56, cy: 0.62, w: 0.26, h: 0.22, cls: 1 },
+    { name: '块', cx: 0.80, cy: 0.34, w: 0.18, h: 0.22, cls: 2 },
+  ];
+  const initPreds = [
+    { cx: 0.27, cy: 0.49, w: 0.24, h: 0.32, probs: [0.88, 0.08, 0.04] },
+    { cx: 0.53, cy: 0.60, w: 0.24, h: 0.24, probs: [0.06, 0.84, 0.10] },
+    { cx: 0.77, cy: 0.37, w: 0.20, h: 0.22, probs: [0.05, 0.11, 0.84] },
+    { cx: 0.42, cy: 0.32, w: 0.20, h: 0.24, probs: [0.46, 0.30, 0.24] },
+  ];
+  let preds = initPreds.map((p) => ({ ...p })), dragIdx = -1, sGeo = null;
+
+  function giou(a, b) {
+    const ax1 = a.cx - a.w / 2, ay1 = a.cy - a.h / 2, ax2 = a.cx + a.w / 2, ay2 = a.cy + a.h / 2;
+    const bx1 = b.cx - b.w / 2, by1 = b.cy - b.h / 2, bx2 = b.cx + b.w / 2, by2 = b.cy + b.h / 2;
+    const ix = Math.max(0, Math.min(ax2, bx2) - Math.max(ax1, bx1));
+    const iy = Math.max(0, Math.min(ay2, by2) - Math.max(ay1, by1));
+    const inter = ix * iy;
+    const union = a.w * a.h + b.w * b.h - inter;
+    const iou = inter / (union || 1e-9);
+    const cx1 = Math.min(ax1, bx1), cy1 = Math.min(ay1, by1), cx2 = Math.max(ax2, bx2), cy2 = Math.max(ay2, by2);
+    const enc = (cx2 - cx1) * (cy2 - cy1);
+    return iou - (enc - union) / (enc || 1e-9);
+  }
+
+  function solve() {
+    const wL1 = +slL1.value, wG = +slG.value;
+    const C = gts.map((g) => preds.map((p) => {
+      const l1 = Math.abs(g.cx - p.cx) + Math.abs(g.cy - p.cy) + Math.abs(g.w - p.w) + Math.abs(g.h - p.h);
+      const gi = giou(g, p);
+      return -p.probs[g.cls] + wL1 * l1 + wG * (1 - gi);
+    }));
+    // Exact brute-force over all 4*3*2 = 24 injections {0,1,2} -> {0,1,2,3}
+    let best = null, bestVal = Infinity;
+    for (let a = 0; a < 4; a++) for (let b = 0; b < 4; b++) {
+      if (b === a) continue;
+      for (let c = 0; c < 4; c++) {
+        if (c === a || c === b) continue;
+        const val = C[0][a] + C[1][b] + C[2][c];
+        if (val < bestVal) { bestVal = val; best = [a, b, c]; }
+      }
+    }
+    const unmatched = [0, 1, 2, 3].find((i) => !best.includes(i));
+    const avgG = best.reduce((s, pi, k) => s + giou(gts[k], preds[pi]), 0) / 3;
+    return { C, best, bestVal, unmatched, avgG };
+  }
+
+  const paintS = V4U.canvas(cvS, (w) => Math.round(Math.min(270, Math.max(210, w * 0.72))), (ctx, w, h) => {
+    const R = solve(), pad = 12, iw = w - 2 * pad, ih = h - 2 * pad;
+    sGeo = { pad, iw, ih };
+    ctx.fillStyle = TOK('--surface-2'); ctx.fillRect(pad, pad, iw, ih);
+    ctx.strokeStyle = TOK('--line-2'); ctx.strokeRect(pad + 0.5, pad + 0.5, iw - 1, ih - 1);
+    const boxRect = (b) => [pad + (b.cx - b.w / 2) * iw, pad + (b.cy - b.h / 2) * ih, b.w * iw, b.h * ih];
+
+    // GT boxes
+    gts.forEach((g, k) => {
+      const [x, y, bw, bh] = boxRect(g);
+      ctx.fillStyle = alphaTok('--c1', 0.14); ctx.fillRect(x, y, bw, bh);
+      ctx.strokeStyle = TOK('--c1'); ctx.lineWidth = 2; ctx.setLineDash([5, 3]);
+      ctx.strokeRect(x, y, bw, bh); ctx.setLineDash([]);
+      ctx.fillStyle = TOK('--c1'); ctx.font = monoFont(11, true);
+      ctx.fillText(`GT${k + 1} ${g.name}`, x + 3, y + 13);
+    });
+    // Match connectors
+    R.best.forEach((pi, k) => {
+      const g = gts[k], p = preds[pi];
+      ctx.strokeStyle = TOK('--c2'); ctx.lineWidth = 1.6; ctx.setLineDash([3, 3]);
+      ctx.beginPath(); ctx.moveTo(pad + g.cx * iw, pad + g.cy * ih); ctx.lineTo(pad + p.cx * iw, pad + p.cy * ih); ctx.stroke(); ctx.setLineDash([]);
+    });
+    // Pred boxes
+    preds.forEach((p, i) => {
+      const [x, y, bw, bh] = boxRect(p);
+      const matched = i !== R.unmatched;
+      const col = matched ? TOK('--c2') : TOK('--muted');
+      ctx.strokeStyle = col; ctx.lineWidth = matched ? 2.2 : 1.5;
+      ctx.strokeRect(x, y, bw, bh);
+      ctx.fillStyle = col;
+      ctx.beginPath(); ctx.arc(pad + p.cx * iw, pad + p.cy * ih, 5, 0, Math.PI * 2); ctx.fill();
+      ctx.font = monoFont(11, matched);
+      ctx.fillText(matched ? `P${i + 1}` : `P${i + 1}→∅`, x + 3, y + bh - 4);
+    });
+  });
+
+  const paintM = V4U.canvas(cvM, (w) => Math.round(Math.min(270, Math.max(210, w * 0.72))), (ctx, w, h) => {
+    const R = solve();
+    const padL = 50, padT = 26, cw = Math.min(68, (w - padL - 12) / 4), ch = Math.min(56, (h - padT - 16) / 3);
+    const x0 = padL + Math.max(0, (w - padL - 12 - 4 * cw) / 2), y0 = padT + Math.max(0, (h - padT - 16 - 3 * ch) / 2);
+    ctx.font = monoFont(11); ctx.fillStyle = TOK('--ink-2'); ctx.textAlign = 'center';
+    for (let j = 0; j < 4; j++) ctx.fillText('P' + (j + 1), x0 + (j + 0.5) * cw, y0 - 8);
+    ctx.textAlign = 'right';
+    for (let i = 0; i < 3; i++) ctx.fillText(`GT${i + 1}(${gts[i].name})`, x0 - 6, y0 + (i + 0.58) * ch);
+    ctx.textAlign = 'center';
+    const flat = R.C.flat(), lo = Math.min(...flat), hi = Math.max(...flat);
+    for (let i = 0; i < 3; i++) for (let j = 0; j < 4; j++) {
+      const sel = R.best[i] === j;
+      const t = (R.C[i][j] - lo) / (hi - lo + 1e-6);
+      ctx.fillStyle = sel ? alphaTok('--c2', 0.30) : mixTok('--surface-2', '--line-2', t * 0.55);
+      ctx.fillRect(x0 + j * cw + 1, y0 + i * ch + 1, cw - 2, ch - 2);
+      if (sel) { ctx.strokeStyle = TOK('--c2'); ctx.lineWidth = 2.2; ctx.strokeRect(x0 + j * cw + 2, y0 + i * ch + 2, cw - 4, ch - 4); }
+      ctx.fillStyle = sel ? TOK('--ink') : TOK('--ink-2'); ctx.font = monoFont(11.5, sel);
+      ctx.fillText(V4U.fmt(R.C[i][j], 2), x0 + (j + 0.5) * cw, y0 + (i + 0.58) * ch);
+    }
+    ctx.textAlign = 'left';
+
+    $('o-hg-l1').textContent = V4U.fmt(+slL1.value, 1);
+    $('o-hg-giou').textContent = V4U.fmt(+slG.value, 1);
+    rd.innerHTML =
+      `<span>匹配：<b>GT1↔P${R.best[0] + 1}, GT2↔P${R.best[1] + 1}, GT3↔P${R.best[2] + 1}</b></span>` +
+      `<span>落选 <b>P${R.unmatched + 1} → ∅</b></span>` +
+      `<span>总代价 <b>${V4U.fmt(R.bestVal, 2)}</b></span>` +
+      `<span>平均 GIoU <b>${V4U.fmt(R.avgG, 2)}</b></span>`;
+  });
+
+  const redraw = () => { paintS(); paintM(); };
+  [slL1, slG].forEach((el) => el.addEventListener('input', redraw));
+  $('bt-hg-rst').addEventListener('click', () => { preds = initPreds.map((p) => ({ ...p })); redraw(); });
+  $('bt-hg-comp').addEventListener('click', () => {
+    preds = initPreds.map((p) => ({ ...p }));
+    preds[3].cx = 0.25; preds[3].cy = 0.47; preds[3].probs = [0.72, 0.15, 0.13];
+    redraw();
+  });
+  V4U.drag(cvS, (x, y, phase) => {
+    if (!sGeo) return;
+    const u = (x - sGeo.pad) / sGeo.iw, v = (y - sGeo.pad) / sGeo.ih;
+    if (phase === 'down') {
+      let best = -1, bd = 0.14;
+      preds.forEach((p, i) => { const d = Math.hypot(u - p.cx, v - p.cy); if (d < bd) { bd = d; best = i; } });
+      dragIdx = best;
+    } else if (phase === 'move' && dragIdx >= 0) {
+      preds[dragIdx].cx = V4U.clamp(u, 0.1, 0.9);
+      preds[dragIdx].cy = V4U.clamp(v, 0.12, 0.88);
+      redraw();
+    } else if (phase === 'up') {
+      dragIdx = -1;
+    }
+  });
+});
+</script>
+
+<script>
+/* ---------- 6. Grounding DINO thresholds (schematic scores) ---------- */
+V4U.ready(() => {
+  const cvS = $('cv-gd-scene'), cvT = $('cv-gd-tok'), slB = $('sl-gd-box'), slT = $('sl-gd-txt'), rd = $('rd-gd');
+  const prompts = {
+    p1: { tokens: ['red', 'mug', '.', 'wrench', '.'] },
+    p2: { tokens: ['mug', '.', 'block', '.', 'gripper', '.'] },
+    p3: { tokens: ['cup', '.', 'metal', 'tool', '.'] },
+  };
+  // 7 candidate boxes (5 objects + 2 hard false positives)
+  const boxes = [
+    { id: '红杯', x: 0.11, y: 0.34, w: 0.21, h: 0.36, fp: false, col: '--c2',
+      sc: { p1: [0.51, 0.82, 0.04, 0.06, 0.03], p2: [0.85, 0.04, 0.05, 0.03, 0.04, 0.02], p3: [0.76, 0.05, 0.06, 0.05, 0.03] } },
+    { id: '绿杯', x: 0.36, y: 0.40, w: 0.17, h: 0.30, fp: false, col: '--c3',
+      sc: { p1: [0.11, 0.44, 0.03, 0.05, 0.02], p2: [0.79, 0.05, 0.08, 0.03, 0.04, 0.02], p3: [0.72, 0.04, 0.05, 0.04, 0.02] } },
+    { id: '木块', x: 0.56, y: 0.56, w: 0.14, h: 0.18, fp: false, col: '--c5',
+      sc: { p1: [0.06, 0.08, 0.02, 0.09, 0.02], p2: [0.09, 0.03, 0.81, 0.04, 0.05, 0.02], p3: [0.08, 0.03, 0.07, 0.10, 0.02] } },
+    { id: '扳手', x: 0.68, y: 0.68, w: 0.24, h: 0.14, fp: false, col: '--c1',
+      sc: { p1: [0.04, 0.05, 0.02, 0.78, 0.03], p2: [0.05, 0.02, 0.14, 0.03, 0.19, 0.02], p3: [0.06, 0.03, 0.62, 0.74, 0.04] } },
+    { id: '夹爪', x: 0.60, y: 0.06, w: 0.22, h: 0.26, fp: false, col: '--c4',
+      sc: { p1: [0.03, 0.05, 0.02, 0.26, 0.02], p2: [0.04, 0.02, 0.06, 0.02, 0.77, 0.04], p3: [0.04, 0.02, 0.48, 0.31, 0.03] } },
+    { id: '反光影', x: 0.18, y: 0.72, w: 0.20, h: 0.15, fp: true, col: '--bad',
+      sc: { p1: [0.23, 0.19, 0.02, 0.08, 0.02], p2: [0.21, 0.03, 0.17, 0.02, 0.06, 0.02], p3: [0.22, 0.03, 0.15, 0.11, 0.02] } },
+    { id: '杯+块并框', x: 0.34, y: 0.37, w: 0.37, h: 0.39, fp: true, col: '--bad',
+      sc: { p1: [0.08, 0.27, 0.03, 0.07, 0.02], p2: [0.28, 0.04, 0.26, 0.03, 0.05, 0.02], p3: [0.24, 0.03, 0.09, 0.08, 0.02] } },
+  ];
+  let prKey = 'p1';
+
+  function filterBoxes() {
+    const tb = +slB.value, tt = +slT.value, toks = prompts[prKey].tokens;
+    return boxes.map((b) => {
+      const sc = b.sc[prKey];
+      const maxS = Math.max(...sc);
+      const kept = maxS >= tb;
+      const phrase = toks.filter((tk, i) => tk !== '.' && sc[i] >= tt).join(' ') || '(空标签)';
+      return { ...b, sc, maxS, kept, phrase };
+    });
+  }
+
+  const paintS = V4U.canvas(cvS, (w) => Math.round(Math.min(265, Math.max(210, w * 0.72))), (ctx, w, h) => {
+    const pad = 10, iw = w - 2 * pad, ih = h - 2 * pad;
+    ctx.fillStyle = TOK('--surface-2'); ctx.fillRect(pad, pad, iw, ih);
+    ctx.fillStyle = alphaTok('--line-2', 0.32); ctx.fillRect(pad, pad + ih * 0.56, iw, ih * 0.44);
+    // Draw scene objects
+    const R = (b) => [pad + b.x * iw, pad + b.y * ih, b.w * iw, b.h * ih];
+    // Red mug
+    let [x, y, bw, bh] = R(boxes[0]);
+    ctx.fillStyle = alphaTok('--c2', 0.65); roundRect(ctx, x + 4, y + 6, bw * 0.75, bh - 10, 5); ctx.fill();
+    ctx.strokeStyle = TOK('--c2'); ctx.lineWidth = 4; ctx.beginPath(); ctx.arc(x + bw * 0.78, y + bh * 0.5, bh * 0.2, -1.3, 1.3); ctx.stroke();
+    // Green mug
+    [x, y, bw, bh] = R(boxes[1]);
+    ctx.fillStyle = alphaTok('--c3', 0.65); roundRect(ctx, x + 4, y + 6, bw * 0.78, bh - 10, 5); ctx.fill();
+    // Wooden block
+    [x, y, bw, bh] = R(boxes[2]);
+    ctx.fillStyle = alphaTok('--c5', 0.72); roundRect(ctx, x + 4, y + 4, bw - 8, bh - 8, 3); ctx.fill();
+    // Wrench
+    [x, y, bw, bh] = R(boxes[3]);
+    ctx.fillStyle = alphaTok('--c1', 0.68); roundRect(ctx, x + 6, y + bh * 0.35, bw - 12, bh * 0.32, 4); ctx.fill();
+    ctx.beginPath(); ctx.arc(x + 10, y + bh * 0.5, bh * 0.36, 0, Math.PI * 2); ctx.fill();
+    // Gripper
+    [x, y, bw, bh] = R(boxes[4]);
+    ctx.fillStyle = alphaTok('--muted', 0.68);
+    ctx.fillRect(x + bw * 0.25, y, bw * 0.5, bh * 0.45);
+    ctx.fillRect(x + bw * 0.22, y + bh * 0.45, bw * 0.14, bh * 0.5);
+    ctx.fillRect(x + bw * 0.64, y + bh * 0.45, bw * 0.14, bh * 0.5);
+    // Faint red reflection on table
+    [x, y, bw, bh] = R(boxes[5]);
+    ctx.fillStyle = alphaTok('--c2', 0.18); ctx.beginPath(); ctx.ellipse(x + bw / 2, y + bh / 2, bw * 0.42, bh * 0.32, 0, 0, Math.PI * 2); ctx.fill();
+
+    // Draw kept boxes
+    const res = filterBoxes();
+    res.forEach((b) => {
+      if (!b.kept) return;
+      const [bx, by, bbw, bbh] = R(b);
+      const col = b.fp ? TOK('--bad') : TOK('--c3');
+      ctx.strokeStyle = col; ctx.lineWidth = 2.2;
+      if (b.fp) ctx.setLineDash([5, 3]);
+      ctx.strokeRect(bx, by, bbw, bbh); ctx.setLineDash([]);
+      const lbl = `${b.phrase} ${V4U.fmt(b.maxS, 2)}`;
+      ctx.font = monoFont(10.5, true);
+      const tw = ctx.measureText(lbl).width + 8;
+      const ly = by > pad + 18 ? by - 16 : by + 2;
+      ctx.fillStyle = col; ctx.fillRect(bx, ly, tw, 15);
+      ctx.fillStyle = TOK('--on-accent'); ctx.fillText(lbl, bx + 4, ly + 11);
+    });
+    ctx.strokeStyle = TOK('--line-2'); ctx.lineWidth = 1; ctx.strokeRect(pad + 0.5, pad + 0.5, iw - 1, ih - 1);
+  });
+
+  const paintT = V4U.canvas(cvT, (w) => Math.round(Math.min(265, Math.max(210, w * 0.72))), (ctx, w, h) => {
+    const res = filterBoxes(), tb = +slB.value, tt = +slT.value, toks = prompts[prKey].tokens;
+    const L = 68, R = 14, T = 22, B = 18;
+    const X = (v) => L + v * (w - L - R);
+    const rowH = (h - T - B) / res.length;
+    ctx.fillStyle = TOK('--muted'); ctx.font = monoFont(10);
+    for (let v = 0; v <= 1.001; v += 0.25) {
+      const x = X(v);
+      ctx.strokeStyle = TOK('--line'); ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x, T); ctx.lineTo(x, h - B); ctx.stroke();
+      ctx.fillText(V4U.fmt(v, 2), x - 11, T - 6);
+    }
+    res.forEach((b, i) => {
+      const y = T + i * rowH;
+      ctx.fillStyle = b.kept ? (b.fp ? TOK('--bad') : TOK('--ink')) : TOK('--muted');
+      ctx.font = bodyFont(11, b.kept); ctx.textAlign = 'right';
+      ctx.fillText(b.id, L - 6, y + rowH * 0.65); ctx.textAlign = 'left';
+      // Bar for max score + individual token dots
+      ctx.fillStyle = b.kept ? alphaTok(b.fp ? '--bad' : '--c3', 0.25) : alphaTok('--line-2', 0.45);
+      ctx.fillRect(L, y + rowH * 0.22, X(b.maxS) - L, rowH * 0.56);
+      b.sc.forEach((s, ti) => {
+        if (toks[ti] === '.') return;
+        const passT = s >= tt;
+        ctx.fillStyle = passT ? (b.fp ? TOK('--bad') : TOK('--c3')) : TOK('--muted');
+        ctx.beginPath(); ctx.arc(X(s), y + rowH * 0.5, passT ? 4 : 2.5, 0, Math.PI * 2); ctx.fill();
+      });
+    });
+    // Threshold lines
+    const drawTh = (val, col, lbl, dy) => {
+      const x = X(val);
+      ctx.strokeStyle = col; ctx.lineWidth = 1.8; ctx.setLineDash([4, 3]);
+      ctx.beginPath(); ctx.moveTo(x, T); ctx.lineTo(x, h - B); ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle = col; ctx.font = monoFont(10, true); ctx.fillText(lbl, Math.min(w - 34, x + 3), h - dy);
+    };
+    drawTh(tb, TOK('--c1'), 'θb', 4);
+    drawTh(tt, TOK('--c4'), 'θt', 4);
+
+    const keptCnt = res.filter((b) => b.kept).length;
+    const fpCnt = res.filter((b) => b.kept && b.fp).length;
+    $('o-gd-box').textContent = V4U.fmt(tb, 2);
+    $('o-gd-txt').textContent = V4U.fmt(tt, 2);
+    rd.innerHTML =
+      `<span>候选 7 框 → 保留 <b>${keptCnt}</b> 框</span>` +
+      `<span>其中误检 <b>${fpCnt}</b> 个</span>` +
+      `<span>红杯短语：<b>${res[0].kept ? res[0].phrase : '(被滤掉)'}</b></span>`;
+  });
+
+  const redraw = () => { paintS(); paintT(); };
+  V4U.seg($('sg-gd-pr'), (v) => { prKey = v; redraw(); });
+  [slB, slT].forEach((el) => el.addEventListener('input', redraw));
+});
+</script>
+
+<script>
+/* ---------- 7. SAM 3-mask hierarchical ambiguity (real calc on label map) ---------- */
+V4U.ready(() => {
+  const cvM = $('cv-sam-main'), cvC = $('cv-sam-cands'), rd = $('rd-sam');
+  const W = 160, H = 120;
+  // Synthetic hierarchical pixel label map:
+  // 0=bg, 1=tray, 2=mug body, 3=mug handle, 4=block
+  const map = new Uint8Array(W * H);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const u = x / W, v = y / H;
+    let id = 0;
+    // Tray ellipse
+    if (((u - 0.44) / 0.34) ** 2 + ((v - 0.72) / 0.18) ** 2 <= 1) id = 1;
+    // Mug handle (ring on right side of mug)
+    const hd = Math.hypot((u - 0.56) * 1.15, v - 0.48);
+    if (u >= 0.52 && hd <= 0.13 && hd >= 0.068) id = 3;
+    // Mug body
+    if (u >= 0.30 && u <= 0.55 && v >= 0.25 && v <= 0.70) id = 2;
+    // Separate cube on far right
+    if (u >= 0.78 && u <= 0.92 && v >= 0.56 && v <= 0.78) id = 4;
+    map[y * W + x] = id;
+  }
+
+  // Candidate masks (hierarchical definitions)
+  const candDefs = [
+    { name: '子部件 · 杯把', set: new Set([3]), prior: 0.90 },
+    { name: '物体 · 整只杯子', set: new Set([2, 3]), prior: 0.96 },
+    { name: '整体 · 杯子 + 托盘', set: new Set([1, 2, 3]), prior: 0.88 },
+    { name: '独立物体 · 方块', set: new Set([4]), prior: 0.94 },
+    { name: '托盘（不含杯）', set: new Set([1]), prior: 0.84 },
+  ];
+  const candArea = candDefs.map((d) => { let a = 0; for (let i = 0; i < map.length; i++) if (d.set.has(map[i])) a++; return a; });
+
+  let ptType = 'pos', pts = [{ u: 0.63, v: 0.48, pos: true }], manualPick = -1;
+
+  function rankCandidates() {
+    const posPts = pts.filter((p) => p.pos), negPts = pts.filter((p) => !p.pos);
+    const scored = candDefs.map((d, idx) => {
+      const hitPos = posPts.filter((p) => d.set.has(map[Math.floor(p.v * H) * W + Math.floor(p.u * W)])).length;
+      const hitNeg = negPts.filter((p) => d.set.has(map[Math.floor(p.v * H) * W + Math.floor(p.u * W)])).length;
+      const posCov = posPts.length ? hitPos / posPts.length : 0;
+      const negPen = Math.pow(0.12, hitNeg);
+      // Slight specificity bonus if all positive points sit tightly in a smaller region
+      const spec = posCov > 0 ? 1 - 0.14 * (candArea[idx] / (W * H)) : 0;
+      const score = posPts.length ? V4U.clamp(posCov * negPen * d.prior * spec, 0.02, 0.99) : 0;
+      return { ...d, idx, area: candArea[idx], score, hitPos, hitNeg };
+    });
+    // Pick top 3 candidates (always keep the 3 mug-hierarchy levels if any point hits mug/tray)
+    const hitsMugTray = posPts.some((p) => { const v = map[Math.floor(p.v * H) * W + Math.floor(p.u * W)]; return v >= 1 && v <= 3; });
+    let top3;
+    if (hitsMugTray || !posPts.length) {
+      top3 = [scored[0], scored[1], scored[2]];
+    } else {
+      top3 = scored.slice().sort((a, b) => b.score - a.score).slice(0, 3);
+    }
+    let bestLocal = 0;
+    for (let i = 1; i < 3; i++) if (top3[i].score > top3[bestLocal].score) bestLocal = i;
+    const active = manualPick >= 0 && manualPick < 3 ? manualPick : bestLocal;
+    return { top3, bestLocal, active };
+  }
+
+  function paintScene(ctx, ox, oy, sw, sh, maskSet) {
+    // Draw clean vector shapes corresponding to the exact same normalized coordinates
+    ctx.fillStyle = TOK('--surface-2'); ctx.fillRect(ox, oy, sw, sh);
+    // Tray
+    ctx.fillStyle = maskSet && maskSet.has(1) ? alphaTok('--c1', 0.55) : alphaTok('--c5', 0.42);
+    ctx.beginPath(); ctx.ellipse(ox + 0.44 * sw, oy + 0.72 * sh, 0.34 * sw, 0.18 * sh, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = maskSet && maskSet.has(1) ? TOK('--c1') : TOK('--line-2'); ctx.lineWidth = maskSet && maskSet.has(1) ? 2 : 1; ctx.stroke();
+    // Handle
+    ctx.strokeStyle = maskSet && maskSet.has(3) ? TOK('--c1') : TOK('--c4');
+    ctx.lineWidth = Math.max(4, sh * 0.062);
+    ctx.beginPath(); ctx.arc(ox + 0.55 * sw, oy + 0.48 * sh, 0.10 * sh, -Math.PI * 0.48, Math.PI * 0.48); ctx.stroke();
+    // Mug body
+    ctx.fillStyle = maskSet && maskSet.has(2) ? alphaTok('--c1', 0.65) : alphaTok('--c4', 0.45);
+    ctx.fillRect(ox + 0.30 * sw, oy + 0.25 * sh, 0.25 * sw, 0.45 * sh);
+    ctx.strokeStyle = maskSet && maskSet.has(2) ? TOK('--c1') : TOK('--line-2'); ctx.lineWidth = maskSet && maskSet.has(2) ? 2 : 1;
+    ctx.strokeRect(ox + 0.30 * sw, oy + 0.25 * sh, 0.25 * sw, 0.45 * sh);
+    // Cube
+    ctx.fillStyle = maskSet && maskSet.has(4) ? alphaTok('--c1', 0.65) : alphaTok('--c3', 0.5);
+    ctx.fillRect(ox + 0.78 * sw, oy + 0.56 * sh, 0.14 * sw, 0.22 * sh);
+    ctx.strokeStyle = maskSet && maskSet.has(4) ? TOK('--c1') : TOK('--line-2'); ctx.lineWidth = maskSet && maskSet.has(4) ? 2 : 1;
+    ctx.strokeRect(ox + 0.78 * sw, oy + 0.56 * sh, 0.14 * sw, 0.22 * sh);
+  }
+
+  let mGeo = null, cBoxes = [];
+  const drawM = V4U.canvas(cvM, (w) => Math.round(Math.min(270, Math.max(205, w * 0.72))), (ctx, w, h) => {
+    const { top3, active } = rankCandidates();
+    const pad = 10, sw = w - 2 * pad, sh = h - 2 * pad;
+    mGeo = { ox: pad, oy: pad, sw, sh };
+    paintScene(ctx, pad, pad, sw, sh, pts.length ? top3[active].set : null);
+    ctx.strokeStyle = TOK('--line-2'); ctx.lineWidth = 1; ctx.strokeRect(pad + 0.5, pad + 0.5, sw - 1, sh - 1);
+    // Draw prompt points
+    pts.forEach((p) => {
+      const px = pad + p.u * sw, py = pad + p.v * sh;
+      ctx.fillStyle = p.pos ? TOK('--ok') : TOK('--bad');
+      ctx.beginPath(); ctx.arc(px, py, 6.5, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = TOK('--surface'); ctx.lineWidth = 1.6; ctx.stroke();
+      ctx.fillStyle = TOK('--on-accent'); ctx.font = monoFont(10, true); ctx.textAlign = 'center';
+      ctx.fillText(p.pos ? '+' : '−', px, py + 3.5);
+    });
+    ctx.textAlign = 'left';
+  });
+
+  const drawC = V4U.canvas(cvC, (w) => Math.round(Math.min(270, Math.max(205, w * 0.72))), (ctx, w, h) => {
+    const { top3, active } = rankCandidates();
+    const pad = 8, gap = 8, rh = (h - 2 * pad - 2 * gap) / 3;
+    cBoxes = [];
+    top3.forEach((c, i) => {
+      const y = pad + i * (rh + gap);
+      cBoxes.push({ x: pad, y, w: w - 2 * pad, h: rh, i });
+      const sel = i === active;
+      ctx.fillStyle = sel ? alphaTok('--c1', 0.10) : TOK('--surface');
+      roundRect(ctx, pad, y, w - 2 * pad, rh, 6); ctx.fill();
+      ctx.strokeStyle = sel ? TOK('--c1') : TOK('--line'); ctx.lineWidth = sel ? 2 : 1; ctx.stroke();
+      const tw = Math.min(96, rh * 1.32), th = rh - 10;
+      paintScene(ctx, pad + 6, y + 5, tw, th, pts.length ? c.set : null);
+      const tx = pad + tw + 14;
+      ctx.fillStyle = TOK('--ink'); ctx.font = bodyFont(12, sel);
+      ctx.fillText(`M${i + 1}: ${c.name}`, tx, y + rh * 0.42);
+      ctx.fillStyle = sel ? TOK('--c1') : TOK('--ink-2'); ctx.font = monoFont(11.5, sel);
+      ctx.fillText(`IoÛ = ${V4U.fmt(c.score, 2)}  (${Math.round(c.area / (W * H) * 100)}%)`, tx, y + rh * 0.76);
+    });
+
+    const posN = pts.filter((p) => p.pos).length, negN = pts.length - posN;
+    rd.innerHTML =
+      `<span>提示：<b>+${posN} / −${negN}</b></span>` +
+      `<span>M1 <b>${V4U.fmt(top3[0].score, 2)}</b></span>` +
+      `<span>M2 <b>${V4U.fmt(top3[1].score, 2)}</b></span>` +
+      `<span>M3 <b>${V4U.fmt(top3[2].score, 2)}</b></span>` +
+      `<span>当前输出：<b>${pts.length ? top3[active].name : '无提示'}</b></span>`;
+  });
+
+  const redraw = () => { drawM(); drawC(); };
+  V4U.seg($('sg-sam-pt'), (v) => { ptType = v; });
+  cvM.addEventListener('click', (e) => {
+    if (!mGeo) return;
+    const r = cvM.getBoundingClientRect();
+    const u = V4U.clamp((e.clientX - r.left - mGeo.ox) / mGeo.sw, 0.02, 0.98);
+    const v = V4U.clamp((e.clientY - r.top - mGeo.oy) / mGeo.sh, 0.02, 0.98);
+    const isPos = e.shiftKey ? false : ptType === 'pos';
+    pts.push({ u, v, pos: isPos });
+    manualPick = -1;
+    redraw();
+  });
+  cvC.addEventListener('click', (e) => {
+    const r = cvC.getBoundingClientRect(), x = e.clientX - r.left, y = e.clientY - r.top;
+    const hit = cBoxes.find((b) => x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h);
+    if (hit) { manualPick = hit.i; redraw(); }
+  });
+  $('bt-sam-p1').addEventListener('click', () => { pts = [{ u: 0.63, v: 0.48, pos: true }]; manualPick = -1; redraw(); });
+  $('bt-sam-p2').addEventListener('click', () => { pts = [{ u: 0.42, v: 0.50, pos: true }, { u: 0.22, v: 0.74, pos: false }]; manualPick = -1; redraw(); });
+  $('bt-sam-clr').addEventListener('click', () => { pts = []; manualPick = -1; redraw(); });
+});
+</script>
+
+<script>
+/* ---------- 8. Grounded-SAM-2 step-by-step propagation ---------- */
+V4U.ready(() => {
+  const cv = $('cv-gsam'), ckFp = $('ck-gsam-fp'), rd = $('rd-gsam');
+  let stage = 3, playing = false, loop = null;
+  const stageMeta = [
+    { name: '0 · 输入 t=0 + 提示 "red mug ."', mugX: 0.24, occ: false, iou: '—' },
+    { name: '1 · Grounding DINO 输出检测框', mugX: 0.24, occ: false, iou: '框 mIoU 0.88' },
+    { name: '2 · SAM 将框转为首帧像素掩码', mugX: 0.24, occ: false, iou: '掩码 IoU 0.95' },
+    { name: '3 · SAM 2 跟踪 t=15（瓶后半遮挡）', mugX: 0.48, occ: true, iou: '可见部 IoU 0.91' },
+    { name: '4 · SAM 2 跟踪 t=30（穿出复现）', mugX: 0.72, occ: false, iou: '掩码 IoU 0.94' },
+  ];
+
+  const redraw = V4U.canvas(cv, (w) => Math.round(Math.min(265, Math.max(200, w * 0.42))), (ctx, w, h) => {
+    const st = stageMeta[stage], fp = ckFp.checked;
+    const pad = 12, iw = w - 2 * pad, ih = h - 2 * pad;
+    // Tabletop background
+    ctx.fillStyle = TOK('--surface-2'); ctx.fillRect(pad, pad, iw, ih);
+    ctx.fillStyle = alphaTok('--line-2', 0.34); ctx.fillRect(pad, pad + ih * 0.58, iw, ih * 0.42);
+
+    // Subtle motion track line for frames 3-4
+    if (stage >= 3) {
+      ctx.strokeStyle = alphaTok('--c2', 0.45); ctx.lineWidth = 1.5; ctx.setLineDash([4, 4]);
+      ctx.beginPath(); ctx.moveTo(pad + 0.24 * iw, pad + 0.52 * ih); ctx.lineTo(pad + st.mugX * iw, pad + 0.52 * ih); ctx.stroke(); ctx.setLineDash([]);
+    }
+
+    // Helper: draw red mug at x ratio
+    const mw = Math.min(72, iw * 0.14), mh = Math.min(82, ih * 0.38);
+    const mx = pad + st.mugX * iw - mw / 2, my = pad + ih * 0.68 - mh;
+    const drawMugShape = (fill, stroke, lw) => {
+      ctx.save();
+      ctx.fillStyle = fill;
+      roundRect(ctx, mx, my, mw * 0.78, mh, 6); ctx.fill();
+      if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = lw; ctx.stroke(); }
+      ctx.strokeStyle = stroke || fill; ctx.lineWidth = Math.max(4, mw * 0.11);
+      ctx.beginPath(); ctx.arc(mx + mw * 0.78, my + mh * 0.5, mh * 0.22, -1.35, 1.35); ctx.stroke();
+      ctx.restore();
+    };
+    drawMugShape(alphaTok('--c2', 0.62), null, 0);
+
+    // Reddish reflection patch on far right (false positive target)
+    const fx = pad + iw * 0.84, fy = pad + ih * 0.72, frx = iw * 0.065, fry = ih * 0.095;
+    ctx.fillStyle = alphaTok('--c2', 0.20);
+    ctx.beginPath(); ctx.ellipse(fx, fy, frx, fry, 0, 0, Math.PI * 2); ctx.fill();
+
+    // Occluder: tall opaque bottle in foreground center
+    const bx = pad + iw * 0.50 - mw * 0.46, by = pad + ih * 0.22, bw = mw * 0.92, bh = ih * 0.56;
+    ctx.fillStyle = mixTok('--surface', '--muted', 0.55);
+    roundRect(ctx, bx, by + bh * 0.22, bw, bh * 0.78, 8); ctx.fill();
+    roundRect(ctx, bx + bw * 0.26, by, bw * 0.48, bh * 0.26, 4); ctx.fill();
+    ctx.strokeStyle = TOK('--line-2'); ctx.lineWidth = 1.2;
+    roundRect(ctx, bx, by + bh * 0.22, bw, bh * 0.78, 8); ctx.stroke();
+
+    // Stage overlays
+    if (stage === 1) {
+      // Grounding DINO boxes
+      ctx.strokeStyle = TOK('--c2'); ctx.lineWidth = 2.4;
+      ctx.strokeRect(mx - 4, my - 4, mw + 10, mh + 8);
+      ctx.fillStyle = TOK('--c2'); ctx.font = monoFont(11, true);
+      ctx.fillText('red mug 0.82', mx - 4, my - 9);
+      if (fp) {
+        ctx.strokeStyle = TOK('--bad'); ctx.lineWidth = 2; ctx.setLineDash([5, 3]);
+        ctx.strokeRect(fx - frx - 4, fy - fry - 4, 2 * frx + 8, 2 * fry + 8); ctx.setLineDash([]);
+        ctx.fillStyle = TOK('--bad'); ctx.fillText('red mug 0.21 (误检)', fx - frx - 30, fy - fry - 9);
+      }
+    } else if (stage >= 2) {
+      // SAM / SAM 2 mask (clipped around occluder at stage 3)
+      ctx.save();
+      if (st.occ) {
+        // Clip out foreground bottle
+        ctx.beginPath(); ctx.rect(pad, pad, iw, ih);
+        ctx.rect(bx, by, bw, bh);
+        ctx.clip('evenodd');
+      }
+      drawMugShape(alphaTok('--c2', 0.34), TOK('--c2'), 2.4);
+      ctx.restore();
+      ctx.fillStyle = TOK('--c2'); ctx.font = monoFont(11, true);
+      ctx.fillText(stage === 2 ? 'ID#1 掩码' : `ID#1 跟踪${st.occ ? ' (遮挡)' : ''}`, mx - 6, my - 9);
+
+      if (fp) {
+        ctx.fillStyle = alphaTok('--bad', 0.32); ctx.strokeStyle = TOK('--bad'); ctx.lineWidth = 2.2;
+        ctx.beginPath(); ctx.ellipse(fx, fy, frx, fry, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+        ctx.fillStyle = TOK('--bad'); ctx.font = monoFont(11, true);
+        ctx.fillText(stage === 2 ? 'ID#2 假掩码' : 'ID#2 假跟踪', fx - frx - 16, fy - fry - 9);
+      }
+    }
+
+    ctx.strokeStyle = TOK('--line-2'); ctx.lineWidth = 1; ctx.strokeRect(pad + 0.5, pad + 0.5, iw - 1, ih - 1);
+    const activeCnt = stage === 0 ? 0 : (fp ? 2 : 1);
+    rd.innerHTML =
+      `<span><b>${st.name}</b></span>` +
+      `<span>活跃对象 <b>${activeCnt}</b></span>` +
+      `<span>示意精度 <b>${st.iou}</b></span>` +
+      `<span>误差传播：<b>${fp && stage >= 1 ? '假框已污染下游' : '正常'}</b></span>`;
+  });
+
+  const setSeg = V4U.seg($('sg-gsam'), (v) => { stage = +v; redraw(); });
+  ckFp.addEventListener('change', redraw);
+  const stop = () => { playing = false; $('bt-gsam-play').textContent = '播放'; if (loop) { loop.stop(); loop = null; } };
+  $('bt-gsam-play').addEventListener('click', () => {
+    if (playing) { stop(); return; }
+    playing = true; $('bt-gsam-play').textContent = '暂停';
+    let acc = 0;
+    loop = V4U.loop(cv, (tt, dt) => {
+      if (tt === 0 && dt === 0) { stage = 4; setSeg('4'); stop(); return; }
+      acc += dt;
+      if (acc >= 1.1) { acc = 0; stage = (stage + 1) % 5; setSeg(String(stage)); }
+    });
+  });
+});
+</script>
+
+<script>
+/* ---------- 9. Depth Anything scanline label comparison (schematic) ---------- */
+V4U.ready(() => {
+  const cv = $('cv-depth'), slH = $('sl-dep-h'), rd = $('rd-depth');
+  const N = 140;
+  let src = 'real';
+  const xs = Array.from({ length: N }, (_, i) => i / (N - 1));
+  // Ground-truth disparity profile along scanline:
+  // [0..0.24]: foreground table edge (~0.72), [0.24..0.37]: far wall (~0.18),
+  // [0.37..0.415]: thin metal rod (~0.62), [0.415..0.56]: far wall (~0.18),
+  // [0.56..0.77]: transparent glass cup (~0.56 with curved depth), [0.77..1.0]: far wall (~0.18)
+  const gt = xs.map((x) => {
+    if (x < 0.24) return 0.72;
+    if (x >= 0.37 && x <= 0.415) return 0.62;
+    if (x >= 0.56 && x <= 0.77) {
+      const u = (x - 0.665) / 0.105;
+      return 0.46 + 0.14 * Math.sqrt(Math.max(0, 1 - u * u));
+    }
+    return 0.18;
+  });
+  const rnd = mulberry(31);
+  const nz = xs.map(() => (rnd() - 0.5) * 2);
+
+  function buildPred() {
+    const h = +slH.value;
+    return xs.map((x, i) => {
+      if (src === 'real') {
+        // Real depth sensor: missing holes on glass, misses thin rod, flying spikes at table edge
+        if (x >= 0.58 && x <= 0.75 && (h > 0.35 || i % 2 === 0)) return null; // NaN hole on transparent glass
+        if (Math.abs(x - 0.24) < 0.025) return 0.44 + 0.22 * h * nz[i]; // edge flying pixels
+        if (x >= 0.36 && x <= 0.43) return 0.18 + (0.44 * (1 - 0.85 * h)) + 0.03 * nz[i]; // thin rod mostly lost
+        return V4U.clamp(gt[i] + 0.035 * h * nz[i], 0.02, 0.96);
+      }
+      if (src === 'syn') {
+        // Pure synthetic small model directly applied to real photo: sharp geometry on simple shapes,
+        // but texture/lighting domain drift on real table & glass reflection
+        const drift = x < 0.24 ? -0.14 * h : (x >= 0.56 && x <= 0.77 ? -0.16 * h : 0.07 * h * Math.sin(10 * x));
+        return V4U.clamp(gt[i] + drift + 0.02 * nz[i], 0.02, 0.96);
+      }
+      // V2 synthetic-trained ViT-G teacher pseudo-labeling real image: no holes, crisp thin rod & edges
+      const smallErr = (x >= 0.56 && x <= 0.77 ? 0.028 : 0.015) * h * nz[i];
+      return V4U.clamp(gt[i] + smallErr, 0.02, 0.96);
+    });
+  }
+
+  const redraw = V4U.canvas(cv, (w) => Math.round(Math.min(315, Math.max(240, w * 0.46))), (ctx, w, h) => {
+    const pred = buildPred();
+    const L = 42, R = 14, stripH = 44, gap = 16, T = 10 + stripH + gap, B = 28;
+    const X = (x) => L + x * (w - L - R);
+    const Y = (v) => T + (1 - v) * (h - T - B);
+
+    // Top material strip showing what the scanline crosses
+    const segs = [
+      { a: 0, b: 0.24, name: '前景桌沿', short: '桌沿', col: '--c5' },
+      { a: 0.24, b: 0.37, name: '墙', short: '墙', col: '--surface-2' },
+      { a: 0.37, b: 0.415, name: '细杆', short: '杆', col: '--c3' },
+      { a: 0.415, b: 0.56, name: '墙', short: '墙', col: '--surface-2' },
+      { a: 0.56, b: 0.77, name: '透明玻璃杯', short: '玻璃杯', col: '--c4' },
+      { a: 0.77, b: 1.0, name: '远背景墙', short: '背景墙', col: '--surface-2' },
+    ];
+    segs.forEach((s) => {
+      const xa = X(s.a), xb = X(s.b), sw = xb - xa;
+      ctx.fillStyle = s.col === '--surface-2' ? TOK('--surface-2') : alphaTok(s.col, 0.32);
+      ctx.fillRect(xa, 10, sw, stripH);
+      ctx.strokeStyle = TOK('--line'); ctx.strokeRect(xa, 10, sw, stripH);
+      ctx.fillStyle = TOK('--ink-2'); ctx.font = bodyFont(sw < 20 ? 10 : 10.5); ctx.textAlign = 'center';
+      const lbl = sw >= 62 ? s.name : s.short;
+      ctx.fillText(lbl, (xa + xb) / 2, 10 + stripH * 0.62);
+    });
+    ctx.textAlign = 'left';
+
+    // Plot box
+    ctx.strokeStyle = TOK('--line'); ctx.lineWidth = 1;
+    ctx.strokeRect(L + 0.5, T + 0.5, w - L - R - 1, h - T - B - 1);
+    ctx.fillStyle = TOK('--muted'); ctx.font = monoFont(10);
+    [0, 0.5, 1].forEach((v) => {
+      ctx.fillText(V4U.fmt(v, 1), 8, Y(v) + 3);
+      if (v === 0.5) { ctx.beginPath(); ctx.moveTo(L, Y(v)); ctx.lineTo(w - R, Y(v)); ctx.stroke(); }
+    });
+
+    // Highlight NaN holes in red band
+    for (let i = 0; i < N; i++) {
+      if (pred[i] === null) {
+        const x0 = X(xs[i]), cw = (w - L - R) / N + 0.8;
+        ctx.fillStyle = alphaTok('--bad', 0.22);
+        ctx.fillRect(x0, T + 1, cw, h - T - B - 2);
+      }
+    }
+    if (src === 'real') {
+      ctx.fillStyle = TOK('--bad'); ctx.font = monoFont(10, true); ctx.textAlign = 'center';
+      ctx.fillText('NaN 空洞', X(0.665), T + 16);
+      ctx.textAlign = 'left';
+    }
+
+    // Ground truth curve
+    ctx.strokeStyle = TOK('--c1'); ctx.lineWidth = 2.2; ctx.setLineDash([6, 4]);
+    ctx.beginPath();
+    xs.forEach((x, i) => { const px = X(x), py = Y(gt[i]); i ? ctx.lineTo(px, py) : ctx.moveTo(px, py); });
+    ctx.stroke(); ctx.setLineDash([]);
+
+    // Predicted / label curve (break path on null)
+    ctx.strokeStyle = TOK('--c2'); ctx.lineWidth = 2.4;
+    let pen = false;
+    ctx.beginPath();
+    xs.forEach((x, i) => {
+      if (pred[i] === null) { pen = false; return; }
+      const px = X(x), py = Y(pred[i]);
+      if (!pen) { ctx.moveTo(px, py); pen = true; } else ctx.lineTo(px, py);
+    });
+    ctx.stroke();
+
+    // Metrics
+    let valid = 0, edgeErr = 0, edgeN = 0, glassTot = 0, glassMiss = 0, rodPeak = 0;
+    xs.forEach((x, i) => {
+      if (pred[i] !== null) valid++;
+      if (Math.abs(x - 0.24) < 0.03 || Math.abs(x - 0.39) < 0.03) {
+        edgeN++; edgeErr += pred[i] === null ? 0.5 : Math.abs(pred[i] - gt[i]);
+      }
+      if (x >= 0.56 && x <= 0.77) { glassTot++; if (pred[i] === null) glassMiss++; }
+      if (x >= 0.37 && x <= 0.415 && pred[i] !== null) rodPeak = Math.max(rodPeak, pred[i]);
+    });
+    const rodRecall = V4U.clamp((rodPeak - 0.18) / (0.62 - 0.18), 0, 1);
+    $('o-dep-h').textContent = V4U.fmt(+slH.value, 2);
+    rd.innerHTML =
+      `<span>有效像素 <b>${Math.round(valid / N * 100)}%</b></span>` +
+      `<span>玻璃区空洞 <b>${Math.round(glassMiss / glassTot * 100)}%</b></span>` +
+      `<span>细杆轮廓保留 <b>${Math.round(rodRecall * 100)}%</b></span>` +
+      `<span>边缘平均误差 <b>${V4U.fmt(edgeErr / edgeN, 3)}</b></span>`;
+  });
+
+  V4U.seg($('sg-depth'), (v) => { src = v; redraw(); });
+  slH.addEventListener('input', redraw);
+});
+</script>
+</body>
+</html>
