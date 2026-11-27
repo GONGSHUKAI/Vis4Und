@@ -172,6 +172,7 @@
 <section id="axis-angle">
   <h2 data-toc="轴角与 exp/log">轴角、旋转向量与 exp / log</h2>
   <p class="def"><b>轴角</b>：任何三维旋转都等于绕某根单位轴 $\hat{\boldsymbol\omega}$ 转角 $\theta$（欧拉旋转定理）。<b>旋转向量</b> $\mathbf r=\theta\hat{\boldsymbol\omega}\in\mathbb{R}^3$ 把两者压成 3 个数。</p>
+  <p>拿到旋转向量 $\mathbf r$：转角 $\theta=\|\mathbf r\|$，转轴 $\hat{\boldsymbol\omega}=\mathbf r/\theta$，代入下面的 Rodrigues 公式得到 $R$，点就转成 $\mathbf p'=R\,\mathbf p$。反过来，已知 $R$ 时用本节最后的 log 求 $\theta$ 和 $\hat{\boldsymbol\omega}$；已知四元数时，$\hat{\boldsymbol\omega}$ 就是 $(x,y,z)$ 归一化。</p>
   <p><b>hat 算子</b>把向量变成反对称矩阵，使矩阵乘法等于叉积；所有 $3\times3$ 反对称矩阵构成李代数 $\mathfrak{so}(3)$，逆运算记作 $(\cdot)^\vee$：</p>
   <div class="eq">$$[\boldsymbol\omega]_\times=\begin{bmatrix}0&-\omega_z&\omega_y\\\omega_z&0&-\omega_x\\-\omega_y&\omega_x&0\end{bmatrix},\qquad [\boldsymbol\omega]_\times\mathbf v=\boldsymbol\omega\times\mathbf v$$</div>
 
@@ -194,8 +195,8 @@
       <label for="sl-rod-th">θ <input type="range" id="sl-rod-th" min="-180" max="180" step="1" value="120"><output id="o-rod-th">120°</output></label>
     </div>
     <div class="viz-read" id="rd-rod"></div>
-    <ul class="chips"><li><i style="background:var(--c4)"></i>转轴 ω̂</li><li><i style="background:var(--muted)"></i>v</li><li><i style="background:var(--c5)"></i>v∥</li><li><i style="background:var(--c1)"></i>cosθ · v⊥</li><li><i style="background:var(--c2)"></i>sinθ · ω̂×v⊥</li><li><i style="background:var(--c3)"></i>v′ = R v</li></ul>
-    <figcaption>v′ = v∥ + cosθ·v⊥ + sinθ·ω̂×v⊥，就是推导第 2 步；读数里用 log 从矩阵 R 反解出 θ 和 ω̂。θ 过 ±180° 时反解出的轴会翻成 −ω̂。</figcaption>
+    <ul class="chips"><li><i style="background:var(--c4)"></i>转轴 ω̂</li><li><i style="background:var(--muted)"></i>v；虚线 v⊥</li><li><i style="background:var(--c5)"></i>v∥</li><li><i style="background:var(--c1)"></i>cosθ · v⊥</li><li><i style="background:var(--c2)"></i>sinθ · ω̂×v⊥</li><li><i style="background:var(--c3)"></i>v′ = R v</li></ul>
+    <figcaption>紫色虚线是转轴，灰色 v 是要转的向量。v 拆成两段：沿轴的 v∥（黄）转动时不动；剩下的 v⊥（灰色虚线，从 v∥ 末端指向 v）垂直于轴，绕轴扫出灰色的圆。转 θ 后 v⊥ 变成 cosθ·v⊥（蓝）加 sinθ·ω̂×v⊥（红），终点就是 v′（绿），绿弧是 v 走过的路径。读数里用 log 从 R 反解出 θ 和 ω̂，θ 过 ±180° 时轴会翻成 −ω̂。</figcaption>
   </figure>
 
   <h3>exp 与 log</h3>
@@ -676,7 +677,7 @@ V4U.ready(() => {
   // ================= 4. Rodrigues =================
   {
     const saz = $('sl-rod-az'), sel = $('sl-rod-el'), sth = $('sl-rod-th'), rd = $('rd-rod');
-    const v = [0.95, -0.35, 0.25];
+    const v = [0.25, 0.95, 0.2];
     const V = V4U.orbit3d($('cv-rod'), { height: 360, dist: 3.0, yaw: -0.25, pitch: 0.3, target: [0.25, 0, 0.35] }, (ctx, P) => {
       const az = +saz.value * D, el = +sel.value * D, th = +sth.value * D;
       $('o-rod-az').textContent = saz.value + '°'; $('o-rod-el').textContent = sel.value + '°'; $('o-rod-th').textContent = sth.value + '°';
@@ -690,8 +691,10 @@ V4U.ready(() => {
       ring(P, vpar, vperp, wv, 1, C('--line-2'), 1.2);
       let prev = v;
       for (let i = 1; i <= 48; i++) { const a = (th * i) / 48, q = add(vpar, add(sc(vperp, cos(a)), sc(wv, sin(a)))); P.line(prev, q, C('--c3'), 2); prev = q; }
-      dashed(ctx, () => P.line(vpar, v, C('--muted'), 1.2), [3, 3]);
       arrow3(ctx, P, [0, 0, 0], v, C('--muted'), 2.5);
+      arrow3(ctx, P, vpar, v, C('--muted'), 2, [5, 4]);
+      P.point(vpar, 4, C('--c5'));
+      P.text(add(vpar, sc(vperp, 0.5)), 'v⊥', C('--muted')); P.text(sc(vpar, 0.55), 'v∥', C('--c5'));
       arrow3(ctx, P, [0, 0, 0], vpar, C('--c5'), 3);
       arrow3(ctx, P, vpar, add(vpar, cpart), C('--c1'), 3);
       arrow3(ctx, P, add(vpar, cpart), vp, C('--c2'), 3);
