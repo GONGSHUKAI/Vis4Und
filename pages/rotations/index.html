@@ -20,6 +20,7 @@
 .pane-t{font:700 13px/1.4 var(--f-body);color:var(--ink-2);margin:0 0 6px}
 .viz-stage canvas{touch-action:pan-y}
 .mono-tbl td{font-family:var(--f-mono);font-size:13.5px}
+.eq.trio{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));column-gap:12px}
 </style>
 </head>
 <body>
@@ -34,6 +35,7 @@
   <p class="asks-h">读完能回答</p>
   <ul class="asks">
     <li>左乘一个旋转和右乘一个旋转，分别绕的是哪根轴？</li>
+    <li>roll、pitch、yaw 各自的旋转矩阵长什么样，四元数的 w、x、y、z 分别是什么？</li>
     <li>欧拉角的万向锁是怎样丢掉一个自由度的？</li>
     <li>四元数 q 和 −q 为什么是同一个旋转，插值时要注意什么？</li>
     <li>为什么 4 维及以下的旋转表示都不连续，6D 表示怎么还原成旋转矩阵？</li>
@@ -56,7 +58,7 @@
       <tr><td>$R,\ {}^{A}R_{B}$</td><td>旋转矩阵；B 系的姿态在 A 系下的表示</td><td>$3\times3$</td></tr>
       <tr><td>$\mathbf p,\ {}^{A}\mathbf p$</td><td>点或向量；它在 A 系下的坐标</td><td>$\mathbb{R}^3$</td></tr>
       <tr><td>$\mathbf e_x,\mathbf e_y,\mathbf e_z$</td><td>标准基向量</td><td>$\mathbb{R}^3$</td></tr>
-      <tr><td>$R_x(\phi),R_y(\theta),R_z(\psi)$</td><td>绕 x / y / z 轴的基本旋转</td><td>$3\times3$</td></tr>
+      <tr><td>$R_x(\phi),R_y(\theta),R_z(\psi)$</td><td>绕 x / y / z 轴的基本旋转（矩阵见 <a href="#euler-basic">欧拉角</a> 一节）</td><td>$3\times3$</td></tr>
       <tr><td>$\hat{\boldsymbol\omega},\ \theta$</td><td>单位转轴、转角（右手定则，逆时针为正）</td><td>$\|\hat{\boldsymbol\omega}\|=1$；rad</td></tr>
       <tr><td>$[\mathbf v]_\times$</td><td>由向量构成的反对称矩阵（hat 算子）</td><td>$3\times3$</td></tr>
       <tr><td>$q=(w,x,y,z)$</td><td>单位四元数，本页标量在前</td><td>$\mathbb{R}^4$，$\|q\|=1$</td></tr>
@@ -75,7 +77,7 @@
     <div class="viz-h"><b>R 的三列就是转过去的三根轴</b><span>单位：度 / 无量纲</span></div>
     <div class="viz-stage"><canvas id="cv-mat" aria-label="世界坐标系、旋转后的坐标系和一个点"></canvas></div>
     <div class="viz-ctrl">
-      <div class="seg" id="sg-mat-ax" role="group" aria-label="转轴"><button type="button" data-v="z" aria-pressed="true">绕 z</button><button type="button" data-v="x">绕 x</button><button type="button" data-v="d">绕 (1,1,1)</button></div>
+      <div class="seg" id="sg-mat-ax" role="group" aria-label="转轴"><button type="button" data-v="z" aria-pressed="true">绕 z</button><button type="button" data-v="x">绕 x</button><button type="button" data-v="y">绕 y</button><button type="button" data-v="d">绕 (1,1,1)</button></div>
       <label for="sl-mat">θ <input type="range" id="sl-mat" min="-180" max="180" step="1" value="50"><output id="o-mat">50°</output></label>
       <div class="seg" id="sg-mat-mode" role="group" aria-label="读法"><button type="button" data-v="act" aria-pressed="true">主动 p′ = R p</button><button type="button" data-v="pas">被动 ᴮp = Rᵀ ᴬp</button></div>
     </div>
@@ -120,18 +122,35 @@
 <section id="euler">
   <h2>欧拉角</h2>
   <p class="def"><b>欧拉角</b>用依次绕三根坐标轴的三个转角表示旋转。必须同时说清两件事：轴的顺序；每次绕的是固定的世界轴（<b>外旋</b>，extrinsic）还是转动后的新轴（<b>内旋</b>，intrinsic）。</p>
+
+  <h3 id="euler-basic">三个基本旋转：roll、pitch、yaw</h3>
+  <p>以 x 朝前、y 朝左、z 朝上的机体或末端坐标系为例（ROS REP 103 的约定）：</p>
+  <ul>
+    <li><b>roll</b> $\phi$：绕前向轴 x 转，横滚（左右侧倾）；</li>
+    <li><b>pitch</b> $\theta$：绕横向轴 y 转，俯仰（抬头、低头）；</li>
+    <li><b>yaw</b> $\psi$：绕竖直轴 z 转，偏航（左右转向）。</li>
+  </ul>
+  <p>绕哪根轴转，那根轴上的坐标就不变，矩阵里对应的行和列只有一个 1；另外两根轴在与它垂直的平面里做二维旋转 $\begin{bmatrix}\cos&-\sin\\\sin&\cos\end{bmatrix}$。按第一节的读法，每一列是对应坐标轴转过去以后的方向：</p>
+  <div class="eq trio">$$R_x(\phi)=\begin{bmatrix}1&0&0\\0&\cos\phi&-\sin\phi\\0&\sin\phi&\cos\phi\end{bmatrix}$$ $$R_y(\theta)=\begin{bmatrix}\cos\theta&0&\sin\theta\\0&1&0\\-\sin\theta&0&\cos\theta\end{bmatrix}$$ $$R_z(\psi)=\begin{bmatrix}\cos\psi&-\sin\psi&0\\\sin\psi&\cos\psi&0\\0&0&1\end{bmatrix}$$</div>
+  <ul>
+    <li><b>$R_y$ 的正负号</b>：$-\sin$ 在左下角，和另外两个正好相反，这不是笔误。按 $x\to y\to z\to x$ 的循环顺序，绕 x 的正向把 y 转向 z，绕 z 的正向把 x 转向 y，绕 y 的正向则是把 <b>z 转向 x</b>。所以 $R_y$ 的第 3 列（z 轴转过去）是 $(\sin\theta,0,\cos\theta)$，第 1 列（x 轴转过去）是 $(\cos\theta,0,-\sin\theta)$。</li>
+    <li><b>转角的正方向</b>按右手定则：拇指指向轴的正方向，四指弯曲的方向为正。在上面的坐标系里，yaw 为正是向左转（x 轴转向 +y）；pitch 为正是<b>低头</b>（x 轴转向 −z）；roll 为正是向右侧倾（y 轴转向 +z，左侧抬高）。航空常用 x 前、y 右、z 下，同一个 $R_y$ 下 pitch 为正就变成抬头。</li>
+  </ul>
+  <p>在第一节的图里选「绕 y」，读数就是 $R_y(\theta)$ 的三列。</p>
+
+  <h3>轴序、内旋与外旋</h3>
   <ul>
     <li><b>12 种顺序</b>：相邻两次不能绕同一根轴，$3\times2\times2=12$。6 种 Tait–Bryan（xyz, xzy, yxz, yzx, zxy, zyx，三轴各一次）+ 6 种 proper Euler（xyx, xzx, yxy, yzy, zxz, zyz，首尾同轴）。每种再分内旋、外旋。</li>
     <li><b>内旋 = 倒序外旋</b>：由上一节，内旋 Z→Y′→X″ 依次右乘，外旋 x→y→z 依次左乘，结果是同一个矩阵：$$R=R_z(\psi)\,R_y(\theta)\,R_x(\phi)$$</li>
-    <li><b>RPY</b>：roll $\phi$ 绕 x、pitch $\theta$ 绕 y、yaw $\psi$ 绕 z，最常见的就是上式。URDF 的 <code>&lt;origin rpy&gt;</code> 规定为绕固定轴先 roll、再 pitch、最后 yaw，即上式。</li>
+    <li><b>RPY</b>：roll $\phi$ 绕 x、pitch $\theta$ 绕 y、yaw $\psi$ 绕 z，最常见的就是上式。URDF 的 <code>&lt;origin rpy&gt;</code> 规定为绕固定轴先 roll、再 pitch、最后 yaw，即上式。把三个基本旋转乘出来（$c_\psi=\cos\psi$，$s_\psi=\sin\psi$，其余同理）：$$R_z(\psi)R_y(\theta)R_x(\phi)=\begin{bmatrix}c_\psi c_\theta&c_\psi s_\theta s_\phi-s_\psi c_\phi&c_\psi s_\theta c_\phi+s_\psi s_\phi\\s_\psi c_\theta&s_\psi s_\theta s_\phi+c_\psi c_\phi&s_\psi s_\theta c_\phi-c_\psi s_\phi\\-s_\theta&c_\theta s_\phi&c_\theta c_\phi\end{bmatrix}$$</li>
     <li><b>SciPy</b>：<code>Rotation.from_euler(seq, angles)</code> 小写 <code>'xyz'</code> 是外旋，大写 <code>'XYZ'</code> 是内旋；<code>from_euler('xyz', [φ,θ,ψ])</code> 与 <code>from_euler('ZYX', [ψ,θ,φ])</code> 相等。</li>
-    <li><b>反解</b>（上式）：$\theta=-\arcsin R_{31}\in[-90^\circ,90^\circ]$，$\psi=\operatorname{atan2}(R_{21},R_{11})$，$\phi=\operatorname{atan2}(R_{32},R_{33})$。$\cos\theta=0$ 时后两式的分子分母都为 0。</li>
+    <li><b>反解</b>（读展开式的第 1 列和第 3 行）：$R_{31}=-s_\theta$，所以 $\theta=-\arcsin R_{31}\in[-90^\circ,90^\circ]$；$R_{21}/R_{11}=s_\psi/c_\psi$，所以 $\psi=\operatorname{atan2}(R_{21},R_{11})$；$R_{32}/R_{33}=s_\phi/c_\phi$，所以 $\phi=\operatorname{atan2}(R_{32},R_{33})$。$\theta$ 在这个范围内 $c_\theta\ge0$，约掉它不改变象限；$\cos\theta=0$ 时后两式的分子分母都为 0。</li>
   </ul>
 
   <h3>万向锁</h3>
   <ol class="derive">
-    <li><p>令 pitch $\theta=90^\circ$：</p>$$R_y(90^\circ)=\begin{bmatrix}0&0&1\\0&1&0\\-1&0&0\end{bmatrix}$$</li>
-    <li><p>展开三连乘，记 $\delta=\phi-\psi$：</p>$$R_z(\psi)R_y(90^\circ)R_x(\phi)=\begin{bmatrix}0&\sin\delta&\cos\delta\\0&\cos\delta&-\sin\delta\\-1&0&0\end{bmatrix}$$</li>
+    <li><p>在 $R_y(\theta)$ 里令 pitch $\theta=90^\circ$（$\cos\theta=0$，$\sin\theta=1$）：</p>$$R_y(90^\circ)=\begin{bmatrix}0&0&1\\0&1&0\\-1&0&0\end{bmatrix}$$</li>
+    <li><p>代入上面的展开式，用和差角公式合并，记 $\delta=\phi-\psi$：</p>$$R_z(\psi)R_y(90^\circ)R_x(\phi)=\begin{bmatrix}0&\sin\delta&\cos\delta\\0&\cos\delta&-\sin\delta\\-1&0&0\end{bmatrix}$$</li>
     <li><p>只依赖 $\delta=\phi-\psi$：$\psi,\phi$ 同时加同一个量，姿态不变，三个角只剩 2 个有效自由度。</p></li>
     <li><p>用角速度看：yaw 轴是世界 $\mathbf e_z$，pitch 轴是 $R_z(\psi)\mathbf e_y$，roll 轴是 $R_z(\psi)R_y(\theta)\mathbf e_x$，</p>$$\boldsymbol\omega=\underbrace{\begin{bmatrix}c_\psi c_\theta&-s_\psi&0\\s_\psi c_\theta&c_\psi&0\\-s_\theta&0&1\end{bmatrix}}_{E(\psi,\theta)}\begin{bmatrix}\dot\phi\\\dot\theta\\\dot\psi\end{bmatrix}$$</li>
     <li><p>按第 3 列展开得 $\det E=c_\psi^2c_\theta+s_\psi^2c_\theta=\cos\theta$。$\theta=\pm90^\circ$ 时 $E$ 降秩：roll 轴和 yaw 轴重合，有一个方向的角速度用任何欧拉角速率都产生不了；在它附近，要产生这个方向的小角速度需要很大的 $\dot\phi,\dot\psi$。</p></li>
@@ -201,6 +220,30 @@
   <div class="eq">$$q_1q_2=\big(w_1w_2-\mathbf v_1\cdot\mathbf v_2,\ \ w_1\mathbf v_2+w_2\mathbf v_1+\mathbf v_1\times\mathbf v_2\big),\qquad q^*=(w,-\mathbf v)=q^{-1}$$</div>
   <p>叉积项使乘法不可交换；组合顺序和矩阵一致：$q_2q_1\leftrightarrow R_2R_1$。旋转一个向量：把它写成纯四元数 $(0,\mathbf p)$，两边各乘一次：</p>
   <div class="eq">$$(0,\ \mathbf p')=q\,(0,\mathbf p)\,q^*$$</div>
+
+  <h3>四个分量各是什么</h3>
+  <p>$(w,x,y,z)$ 是四元数的 4 个系数，不是欧拉角：$x,y,z$ 既不是位置，也不是绕 x、y、z 轴各转的角度。和上面的定义逐项对照：</p>
+  <div class="tbl"><table>
+    <thead><tr><th>分量</th><th>等于</th><th>含义</th></tr></thead>
+    <tbody>
+      <tr><td>$w$</td><td>$\cos\frac\theta2$</td><td>实部（标量部分），只由转角决定。$w=1$ 是不转，$w=0$ 是转 $180^\circ$；$|w|$ 越接近 1，转得越少</td></tr>
+      <tr><td>$x,\ y,\ z$</td><td>$\sin\frac\theta2\cdot(\hat\omega_x,\ \hat\omega_y,\ \hat\omega_z)$</td><td>虚部（向量部分）：$(x,y,z)$ 的方向就是转轴，长度是 $\sin\frac\theta2$</td></tr>
+      <tr><td>$\mathbf i,\ \mathbf j,\ \mathbf k$</td><td>—</td><td>三个虚数单位，只用来规定乘法；存储时只存 $w,x,y,z$ 四个系数</td></tr>
+    </tbody>
+  </table></div>
+  <p>四个数满足 $w^2+x^2+y^2+z^2=\cos^2\tfrac\theta2+\sin^2\tfrac\theta2=1$，所以只有 3 个自由度。拿到一个四元数，这样读出转角和转轴：</p>
+  <div class="eq trio">$$\theta=2\operatorname{atan2}\!\Big(\sqrt{x^2+y^2+z^2},\ w\Big)$$ $$\hat{\boldsymbol\omega}=\frac{(x,\,y,\,z)}{\sqrt{x^2+y^2+z^2}}$$</div>
+  <div class="tbl"><table>
+    <thead><tr><th>旋转</th><th>(w, x, y, z)</th><th>怎么来的</th></tr></thead>
+    <tbody>
+      <tr><td>不转</td><td class="num">(1, 0, 0, 0)</td><td>$\theta=0$：$\cos0=1$，$\sin0=0$</td></tr>
+      <tr><td>绕 z 转 90°</td><td class="num">(0.707, 0, 0, 0.707)</td><td>$(\cos45^\circ,\,0,\,0,\,\sin45^\circ)$</td></tr>
+      <tr><td>绕 x 转 180°</td><td class="num">(0, 1, 0, 0)</td><td>$w=\cos90^\circ=0$，轴 $(1,0,0)$</td></tr>
+      <tr><td>绕 y 转 −60°</td><td class="num">(0.866, 0, −0.5, 0)</td><td>$(\cos(-30^\circ),\,0,\,\sin(-30^\circ),\,0)$，也就是绕 −y 转 60°</td></tr>
+      <tr><td>绕 (1, 1, 1)/√3 转 120°</td><td class="num">(0.5, 0.5, 0.5, 0.5)</td><td>$\cos60^\circ=0.5$，$\sin60^\circ/\sqrt3=0.5$</td></tr>
+    </tbody>
+  </table></div>
+  <p>$w$ 为负的四元数和把四个数全部取反的那个是同一个旋转，见下面的「双重覆盖」。</p>
 
   <h3>为什么是半角</h3>
   <p>记 $c=\cos\frac\theta2$，$s=\sin\frac\theta2$，$q=(c,\,s\hat{\boldsymbol\omega})$。</p>
@@ -388,6 +431,8 @@
   <details class="q"><summary>${}^{W}R_{E}$ 的第 3 列是什么？</summary><div><p>末端坐标系的 z 轴在世界系下的方向。夹爪常把 z 定义成接近方向，所以第 3 列就是「夹爪指向哪」。</p></div></details>
   <details class="q"><summary>「从单位姿态出发，先绕世界 z 转 30°，再绕自身 x 转 20°」写成矩阵是什么？</summary><div><p>第一步得 $R_z(30^\circ)$；绕自身轴是右乘，所以 $R=R_z(30^\circ)R_x(20^\circ)$。等价读法：先绕世界 x 转 20°，再绕世界 z 转 30°。</p></div></details>
   <details class="q"><summary>SciPy 的 <code>from_euler('xyz', [φ,θ,ψ])</code> 与 <code>from_euler('ZYX', [ψ,θ,φ])</code> 一样吗？</summary><div><p>一样，都是 $R_z(\psi)R_y(\theta)R_x(\phi)$：前者外旋（依次左乘），后者内旋（依次右乘），轴序和角度顺序都倒过来。</p></div></details>
+  <details class="q"><summary>x 朝前、y 朝左、z 朝上的末端坐标系里，pitch = +10° 是抬头还是低头？</summary><div><p>低头。$R_y(10^\circ)$ 的第 1 列（x 轴转过去）是 $(\cos10^\circ,0,-\sin10^\circ)\approx(0.985,0,-0.174)$，z 分量为负，朝前的轴往下偏。</p></div></details>
+  <details class="q"><summary>按 wxyz 存的四元数 (0.707, 0, 0, 0.707) 是什么旋转？</summary><div><p>$w=\cos\frac\theta2=0.707$，所以 $\theta=90^\circ$；$(x,y,z)=(0,0,0.707)$ 指向 +z。绕 z 轴转 90°。</p></div></details>
   <details class="q"><summary>一个按 xyzw 存的单位旋转 <code>[0,0,0,1]</code> 被当成 wxyz 读，会得到什么？</summary><div><p>w = 0、z = 1：绕 z 轴转 180°。代码不会报错，只是姿态整个转了半圈。</p></div></details>
   <details class="q"><summary>为什么直接用 L2 回归四元数会出问题，怎么改？</summary><div><p>q 与 −q 是同一个旋转。标签不规范化时同一姿态有两个目标；规范化到 w ≥ 0 后在 180° 附近跳变。改用 $1-|q\cdot\hat q|$ 这类符号无关的损失，或改用 6D / 9D 输出。</p></div></details>
   <details class="q"><summary>OpenCV 外参 $[R\,|\,\mathbf t]$ 满足 $\mathbf x_{cam}=R\mathbf X_{world}+\mathbf t$，它是 ${}^{W}T_{C}$ 还是 ${}^{C}T_{W}$？相机在世界系下的位置是多少？</summary><div><p>把世界坐标变成相机坐标，所以是 ${}^{C}T_{W}$。相机中心在世界系下是 ${}^{W}T_{C}$ 的平移，即 $-R^\top\mathbf t$。</p></div></details>
@@ -528,7 +573,7 @@ V4U.ready(() => {
   // ================= 1. rotation matrix: columns, active / passive =================
   {
     const sl = $('sl-mat'), o = $('o-mat'), rd = $('rd-mat');
-    const AX = { x: [1, 0, 0], z: [0, 0, 1], d: [1, 1, 1] };
+    const AX = { x: [1, 0, 0], y: [0, 1, 0], z: [0, 0, 1], d: [1, 1, 1] };
     let axis = 'z', mode = 'act';
     const p0 = [0.8, 0.15, 0.55];
     const V = V4U.orbit3d($('cv-mat'), { height: 340, dist: 3.3, yaw: -0.55, pitch: 0.4, target: [0.1, 0, 0.3] }, (ctx, P) => {
