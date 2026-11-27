@@ -274,7 +274,7 @@
 
   <h3>插值：slerp 与 nlerp</h3>
   <ul>
-    <li><b>slerp</b>：$\cos\Omega=q_0\cdot q_1$，沿 $S^3$ 上的大圆匀速走：$$\operatorname{slerp}(q_0,q_1;t)=\frac{\sin((1-t)\Omega)}{\sin\Omega}\,q_0+\frac{\sin(t\Omega)}{\sin\Omega}\,q_1=q_0\,(q_0^*q_1)^t$$ 两个姿态之间的转角是 $2\Omega$，角速度恒定。</li>
+    <li><b>slerp</b>：$t\in[0,1]$ 是插值进度，$t=0$ 得 $q_0$，$t=1$ 得 $q_1$；$\Omega$ 是 $q_0,q_1$ 作为 4 维单位向量的夹角，$\cos\Omega=q_0\cdot q_1$（4 个分量对应相乘再相加）。沿 $S^3$ 上的大圆匀速走：$$\operatorname{slerp}(q_0,q_1;t)=\frac{\sin((1-t)\Omega)}{\sin\Omega}\,q_0+\frac{\sin(t\Omega)}{\sin\Omega}\,q_1=q_0\,(q_0^*q_1)^t$$ 两个姿态之间的转角是 $2\Omega$，角速度恒定。</li>
     <li><b>最短路径</b>：若 $q_0\cdot q_1\lt0$，先把 $q_1$ 换成 $-q_1$（同一个旋转），否则会绕远路转 $360^\circ-2\Omega$ 的另一侧。</li>
     <li><b>nlerp</b>：$\dfrac{(1-t)q_0+tq_1}{\|(1-t)q_0+tq_1\|}$，路径和 slerp 是同一条弧，速度不均匀：中间快、两头慢；$\Omega$ 小时差别可以忽略。</li>
     <li>对欧拉角线性插值走的不是最短弧；对矩阵元素线性插值得到的根本不是旋转矩阵。</li>
@@ -283,7 +283,7 @@
   <figure class="viz" id="viz-slerp">
     <div class="viz-h"><b>slerp 在弧上等距，nlerp 在弦上等距</b><span>单位：度</span></div>
     <div class="viz-grid">
-      <div class="viz-stage"><p class="pane-t">$q_0,q_1$ 张成的平面（四元数空间）</p><canvas id="cv-slerp" aria-label="单位圆上的插值点"></canvas></div>
+      <div class="viz-stage"><p class="pane-t">$q_0,q_1$ 所在的平面（横轴 w，纵轴沿转轴的分量）</p><canvas id="cv-slerp" aria-label="单位圆上的插值点"></canvas></div>
       <div class="viz-stage"><p class="pane-t">实际转过的角度 vs t</p><canvas id="cv-slerp-p" aria-label="转过角度随 t 变化的曲线"></canvas></div>
     </div>
     <div class="viz-ctrl">
@@ -293,7 +293,7 @@
     </div>
     <div class="viz-read" id="rd-slerp"></div>
     <ul class="chips"><li><i style="background:var(--c1)"></i>slerp</li><li><i style="background:var(--c2)"></i>nlerp</li><li><i style="background:var(--muted)"></i>q₀、q₁、−q₁</li></ul>
-    <figcaption>q₀ 是单位旋转，q₁ 是绕同一根轴转「两姿态夹角」，所以四元数平面里两点相隔一半的角。夹角超过 180° 时点积为负：取 −q₁ 走短路，不处理就绕长路。夹角接近 360° 且不处理时，弦几乎穿过圆心，nlerp 在中间几乎瞬间转完。</figcaption>
+    <figcaption>左图是二维的：过原点和 q₀、q₁ 的平面切开 S³，截出一个单位圆，插值点都在这个圆上。q₀ 是单位旋转，q₁ 是绕同一根轴转「两姿态夹角」，两点在圆上的夹角 Ω 是它的一半。夹角超过 180° 时点积为负：取 −q₁ 走短路，不处理就绕长路。夹角接近 360° 且不处理时，弦几乎穿过圆心，nlerp 在中间几乎瞬间转完。</figcaption>
   </figure>
 
   <h3>各库的存储顺序</h3>
@@ -792,6 +792,10 @@ V4U.ready(() => {
       ctx.font = mono(12); ctx.fillStyle = C('--ink-2');
       const lab = (a, s, off = 16) => { const [x, y] = P(a, r + off); ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(s, x, y); };
       lab(0, 'q₀', 18); lab(G.half, 'q₁'); lab(G.half - PI, '−q₁');
+      ctx.strokeStyle = C('--ink-2'); ctx.lineWidth = 1;
+      [0, G.tgt].forEach((a) => { const [x, y] = P(a); ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(x, y); ctx.stroke(); });
+      ctx.beginPath(); ctx.arc(cx, cy, 24, 0, -G.tgt, G.tgt > 0); ctx.stroke();
+      { const [x, y] = P(G.tgt / 2, 38); ctx.fillStyle = C('--ink'); ctx.font = mono(13); ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText('Ω', x, y); }
       ctx.fillStyle = C('--muted');
       [[G.half, 4], [G.half - PI, 4]].forEach(([a, rr]) => { const [x, y] = P(a); ctx.beginPath(); ctx.arc(x, y, rr, 0, 2 * PI); ctx.fill(); });
       ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
@@ -805,7 +809,7 @@ V4U.ready(() => {
       curve(G.slerpA, C('--c1')); curve(G.nlerpA, C('--c2'));
       dashed(ctx, () => { ctx.strokeStyle = C('--ink-2'); ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(F.X(t), 12); ctx.lineTo(F.X(t), h - 30); ctx.stroke(); });
       const ds = 2 * G.tgt, dn = (2 * (G.nlerpA(0.51) - G.nlerpA(0.49))) / 0.02;
-      rd.innerHTML = `<span>q₀·q₁ = <b>${f2(cos(G.half))}</b>${G.flipped ? '（已取 −q₁）' : ''}</span><span>总转角 <b>${f2(Math.abs(tot), 0)}°</b></span><span>t 时 slerp <b>${f2((2 * G.slerpA(t)) / D, 1)}°</b>，nlerp <b>${f2((2 * G.nlerpA(t)) / D, 1)}°</b></span><span>t = 0.5 处 nlerp 角速度 / slerp = <b>${f2(dn / ds)}</b></span>`;
+      rd.innerHTML = `<span>q₀·q₁ = <b>${f2(cos(G.half))}</b>${G.flipped ? '（已取 −q₁）' : ''}</span><span>Ω = <b>${f2(Math.abs(G.tgt) / D, 1)}°</b></span><span>总转角 <b>${f2(Math.abs(tot), 0)}°</b></span><span>t 时 slerp <b>${f2((2 * G.slerpA(t)) / D, 1)}°</b>，nlerp <b>${f2((2 * G.nlerpA(t)) / D, 1)}°</b></span><span>t = 0.5 处 nlerp 角速度 / slerp = <b>${f2(dn / ds)}</b></span>`;
     });
     const both = () => { left(); right(); };
     [sa, stt].forEach((s) => s.addEventListener('input', both));
